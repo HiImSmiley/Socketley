@@ -292,6 +292,8 @@ struct alignas(64) proxy_client_connection
     bool splice_small{false};
     // Our FIN is out, sent before the armed read comes back so the client is not the one to close.
     bool wr_shutdown{false};
+    // The read ended at the client's own FIN while it drained, so nothing is left unread for a close to reset.
+    bool eof_read{false};
     uint32_t write_batch_count{0};
     uint32_t drained_bytes{0};
     io_request read_req;

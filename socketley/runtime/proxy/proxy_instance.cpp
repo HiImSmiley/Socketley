@@ -309,6 +309,7 @@ void proxy_client_connection::reset(int new_fd)
     full_reads = 0;
     splice_small = false;
     wr_shutdown = false;
+    eof_read = false;
     drained_reads = 0;
     write_batch_count = 0;
     drained_bytes = 0;
@@ -3542,6 +3543,10 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     {
         SKL_TRACE_SET(conn, last_read_res, cqe->res);
         SKL_TRACE_SET(conn, last_read_flags, cqe->flags);
+        // Only a drain's read ends at zero by the client's FIN alone: every shutdown(SHUT_RD) of ours on a client
+        // clears drain_on_close first.
+        if (cqe->res == 0 && conn->ex.drain_on_close)
+            conn->eof_read = true;
 
         // Return provided buffer if kernel allocated one before error
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
@@ -8220,7 +8225,10 @@ void proxy_instance::end_client_read(proxy_client_connection* conn)
     if (m_loop->submit_cancel_request(&conn->read_req))
         conn->recv_withdrawing = true;
     else
+    {
+        conn->ex.drain_on_close = false;
         shutdown(conn->fd, SHUT_RD);
+    }
 }
 
 // The client's descriptor given back: reset when what it was owed stopped moving, and otherwise through orderly_close,
@@ -8236,6 +8244,12 @@ void proxy_instance::close_client_fd(proxy_client_connection* conn, int fd)
             if (::setsockopt(fd, SOL_SOCKET, SO_LINGER, &now_reset, sizeof now_reset) < 0) {}
         }
         close_tracked(fd);
+        return;
+    }
+    // Everything the client sent is read and its FIN with it, which is the end orderly_close would wait and look for.
+    if (conn->eof_read && conn->ssl == nullptr)
+    {
+        lp->close_fd(fd);
         return;
     }
     lp->close_fd_orderly(fd, kernel_sends_end(conn));
@@ -9070,6 +9084,16 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     if (SOCKETLEY_UNLIKELY(cconn->client_eof || cconn->ex.client_conn_close || body_owing) &&
         cconn->fd >= 0)
     {
+        // A client that asked to close closes once it has its answer, and its armed read takes that FIN: withdrawn
+        // instead, every connection paid a cancel, a second shutdown, a TCP_INFO and a timed wait in orderly_close.
+        // Bounded as a drain is, by the sweep, for a client that keeps its end open.
+        if (m_protocol == protocol_http && cconn->ex.client_conn_close && !cconn->client_eof && !body_owing &&
+            cconn->read_pending && !cconn->recv_withdrawing && cconn->ssl == nullptr && !cconn->ex.drain_on_close)
+        {
+            cconn->ex.drain_on_close = true;
+            cconn->ex.header_deadline = std::chrono::steady_clock::now() + socketley::orderly_close::quiet;
+            arm_response_deadline_sweep();
+        }
         cconn->closing = true;
         close_pair(cconn->fd, cconn->ex.backend_fd);
         return;
