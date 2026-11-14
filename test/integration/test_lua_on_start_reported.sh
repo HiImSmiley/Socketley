@@ -113,8 +113,8 @@ if [ "$RC" = "1" ]; then pass; else
          "reload-lua has answered 1 with the reason since it began re-running" \
          "on_start; the same raise through create -s answered 0 and said nothing"
 fi
-if printf '%s' "$OUT" | grep -qa "on_start error" &&
-   printf '%s' "$OUT" | grep -qa "on_start blew up on purpose"; then pass; else
+if grep -qa "on_start error" <<<"$OUT" &&
+   grep -qa "on_start blew up on purpose" <<<"$OUT"; then pass; else
     fail "create -s names the callback and the reason" \
          "output: ${OUT:-<nothing>}" \
          "the callback's name and the script's own message are what make this" \
@@ -166,7 +166,7 @@ if [ "$RC" = "1" ]; then pass; else
          "frame says running and await_startup answers 'serving': without a" \
          "frame carrying the reason this side cannot know anything went wrong"
 fi
-if printf '%s' "$OUT" | grep -qa "on_start blew up on purpose"; then pass; else
+if grep -qa "on_start blew up on purpose" <<<"$OUT"; then pass; else
     fail "create -s in a worker names the reason" "output: ${OUT:-<nothing>}"
 fi
 if [ "$(state os_wboom)" = "Up" ]; then pass; else
@@ -194,7 +194,7 @@ if [ "$RC" = "1" ]; then pass; else
     fail "start exits 1 when on_start raises" \
          "exit was $RC, wanted 1" "output: ${OUT:-<nothing>}"
 fi
-if printf '%s' "$OUT" | grep -qa "on_start blew up on purpose"; then pass; else
+if grep -qa "on_start blew up on purpose" <<<"$OUT"; then pass; else
     fail "start names the reason" "output: ${OUT:-<nothing>}"
 fi
 if [ "$(state os_restart)" = "Up" ]; then pass; else
@@ -230,7 +230,7 @@ if [ "$RC" = "1" ]; then pass; else
     fail "start of a pair exits 1 when one of them raised" \
          "exit was $RC, wanted 1" "output: ${OUT:-<nothing>}"
 fi
-if printf '%s' "$OUT" | grep -qa "os_pair1"; then pass; else
+if grep -qa "os_pair1" <<<"$OUT"; then pass; else
     fail "the failing one is named" "output: ${OUT:-<nothing>}" \
          "'start a b c' has to say which of them it is talking about"
 fi
@@ -250,7 +250,7 @@ set +e
 OUT=$("$BIN" reload os_restart 2>&1)
 RC=$?
 set -e
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -qa "on_start blew up on purpose"; then pass; else
+if [ "$RC" = "1" ] && grep -qa "on_start blew up on purpose" <<<"$OUT"; then pass; else
     fail "reload reports an on_start raise too" \
          "exit $RC, output: ${OUT:-<nothing>}"
 fi
@@ -278,7 +278,7 @@ set +e
 OUT=$("$BIN" reload-lua os_boom 2>&1)
 RC=$?
 set -e
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -qa "on_start error"; then pass; else
+if [ "$RC" = "1" ] && grep -qa "on_start error" <<<"$OUT"; then pass; else
     fail "control: reload-lua still reports an on_start raise" \
          "exit $RC, output: ${OUT:-<nothing>}"
 fi

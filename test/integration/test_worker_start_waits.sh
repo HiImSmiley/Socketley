@@ -152,7 +152,7 @@ create_ok "raising-on_start runtime created" "$BIN" create server wks_boom \
 set +e
 OUT=$("$BIN" start wks_boom 2>&1); RC=$?
 set -e
-if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -qa "on_start blew up on purpose"; then pass; else
+if [ "$RC" = "1" ] && grep -qa "on_start blew up on purpose" <<<"$OUT"; then pass; else
     fail "start carries an on_start raise out of the worker" \
          "exit $RC, output: ${OUT:-<nothing>}" \
          "the child does not fail its start on a raise either, so its state" \
