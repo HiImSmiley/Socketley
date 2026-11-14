@@ -112,11 +112,16 @@ private:
     static constexpr uint32_t p_quarter = 0x3FFFFFFFu;   // 1/4 of the 32-bit range
 
     struct node;
+    // A link carries its node's score rounded to a float, in the half of the
+    // span word a 32-bit count leaves free, so a step compares without reading
+    // a node it may not move onto; rounding is monotonic, so only a tie does.
     struct link
     {
-        node*  fwd{nullptr};
-        size_t span{0};        // nodes this pointer jumps over, 1 for adjacent
+        node*    fwd{nullptr};
+        uint32_t span{0};        // nodes this pointer jumps over, 1 for adjacent
+        float    next{0.0f};     // fwd's score, rounded
     };
+    static_assert(sizeof(link) == 16);
     // The links sit in front of the node in the same block, level 0 nearest,
     // so a step down the list reads the score it compares and the link it
     // takes next from one line or two adjacent ones.
@@ -400,26 +405,74 @@ private:
     void insert_big(double score, std::string_view member)
     {
         // The index grows before anything is linked, so a failed allocation leaves the list as it was.
-        {
-            member_index* x = ix();
-            if (!ix_room(x->cap, x->size, x->tombs))
-                ix_rebuild(ix_cap_after_insert(x->cap, x->size, x->tombs));
-        }
+        grow_index();
+        node* n = make_node(random_level(), score, member);
         node*  update[max_level];
         size_t rank[max_level];
+        walk(score, member, update, rank);
+        link_at(n, update, rank);
+        ix_insert(n);
+    }
+
+    // Room in the index for one more member.
+    void grow_index()
+    {
+        member_index* x = ix();
+        if (!ix_room(x->cap, x->size, x->tombs))
+            ix_rebuild(ix_cap_after_insert(x->cap, x->size, x->tombs));
+    }
+
+    // The last node before (score, member) on every level, and its rank
+    // counting the head as 0.
+    void walk(double score, std::string_view member, node** update, size_t* rank) const
+    {
         node*  x = m_big.head;
+        size_t r = 0;
         for (int i = m_level - 1; i >= 0; --i)
         {
-            rank[i] = (i == m_level - 1) ? 0 : rank[i + 1];
-            while (x->L(i).fwd && less(x->L(i).fwd, score, member))
+            while (x->L(i).fwd && before(x->L(i), score, member))
             {
-                rank[i] += x->L(i).span;
+                r += x->L(i).span;
                 x = x->L(i).fwd;
             }
             update[i] = x;
+            rank[i]   = r;
         }
+    }
 
-        const int lvl = random_level();
+    // walk() for two positions at once: neither chain of loads waits on the
+    // other, so their cache misses overlap where one after the other they add.
+    void walk2(double sa, double sb, std::string_view member,
+               node** ua, size_t* ra, node** ub, size_t* rb) const
+    {
+        node*  a = m_big.head;
+        node*  b = m_big.head;
+        size_t na = 0, nb = 0;
+        for (int i = m_level - 1; i >= 0; --i)
+        {
+            for (;;)
+            {
+                const link& la = a->L(i);
+                const link& lb = b->L(i);
+                const bool ga = la.fwd && before(la, sa, member);
+                const bool gb = lb.fwd && before(lb, sb, member);
+                if (!ga && !gb) break;
+                if (ga) { na += la.span; a = la.fwd; }
+                if (gb) { nb += lb.span; b = lb.fwd; }
+            }
+            ua[i] = a; ra[i] = na;
+            ub[i] = b; rb[i] = nb;
+        }
+        // The caller writes the back link of the node after b.
+        __builtin_prefetch(b->L(0).fwd, 1);
+    }
+
+    // Puts `n`, linked nowhere, after update[] as walk() left it for n's score
+    // and member, and counts it.
+    void link_at(node* n, node** update, size_t* rank)
+    {
+        const double score = n->score;
+        const int lvl = n->level;
         if (lvl > m_level)
         {
             for (int i = m_level; i < lvl; ++i)
@@ -431,13 +484,11 @@ private:
             m_level = static_cast<uint8_t>(lvl);
         }
 
-        node* n = make_node(lvl, score, member);
         for (int i = 0; i < lvl; ++i)
         {
-            n->L(i).fwd         = update[i]->L(i).fwd;
-            update[i]->L(i).fwd = n;
-            n->L(i).span         = update[i]->L(i).span - (rank[0] - rank[i]);
-            update[i]->L(i).span = (rank[0] - rank[i]) + 1;
+            link& u = update[i]->L(i);
+            n->L(i) = { u.fwd, static_cast<uint32_t>(u.span - (rank[0] - rank[i])), u.next };
+            u       = { n, static_cast<uint32_t>(rank[0] - rank[i] + 1), static_cast<float>(score) };
         }
         // Every level ABOVE the new node's still jumps one more node than it did.
         for (int i = lvl; i < m_level; ++i)
@@ -447,7 +498,6 @@ private:
         if (n->L(0).fwd) n->L(0).fwd->back = n;
         else              m_big.head->back = n;
         ++m_count;
-        ix_insert(n);
     }
 
     // The node holding (score, member), with the last node before it on every
@@ -457,7 +507,7 @@ private:
         node* x = m_big.head;
         for (int i = m_level - 1; i >= 0; --i)
         {
-            while (x->L(i).fwd && less(x->L(i).fwd, score, member))
+            while (x->L(i).fwd && before(x->L(i), score, member))
                 x = x->L(i).fwd;
             update[i] = x;
         }
@@ -474,6 +524,7 @@ private:
             {
                 update[i]->L(i).span += x->L(i).span - 1;
                 update[i]->L(i).fwd   = x->L(i).fwd;
+                update[i]->L(i).next  = x->L(i).next;
             }
             else
             {
@@ -529,25 +580,54 @@ public:
             small_insert(small_lower(score, m).second, score, m);
             return true;
         }
-        node* update[max_level];
-        node* x = find(old, member, update);
-        if (!x) return false;
+        // The node from the index, which says before any walk whether it moves.
+        const size_t slot = ix_locate(member, mhash(member));
+        if (slot == npos) return false;
+        node* const x = ix_node(ix()->slots[slot]);
+        if (x->score != old) return false;
+        // The next node's back link is written whichever way this goes.
+        __builtin_prefetch(x->L(0).fwd, 1);
         const std::string_view m = x->member();
-        if ((x->back && !less(x->back, score, m)) || (x->L(0).fwd && less_eq(x->L(0).fwd, score, m)))
+        node* update[max_level];
+        if ((!x->back || less(x->back, score, m)) && (!x->L(0).fwd || !not_after(x->L(0), score, m)))
         {
-            // The name is held here because the node holding it goes first.
-            char held[256];
-            std::string spill;
-            std::string_view name = m;
-            if (m.size() <= sizeof(held)) { std::memcpy(held, m.data(), m.size()); name = { held, m.size() }; }
-            else                          { spill.assign(m); name = spill; }
-            link_out(x, update);
-            ix_erase(m);
-            destroy(x);
-            insert_big(score, name);
-        }
-        else
+            // In place: the links reaching x carry its score, and only a taller
+            // node needs a walk to find them, made while x still holds the old one.
+            if (x->level == 1)
+                (x->back ? x->back : m_big.head)->L(0).next = static_cast<float>(score);
+            else
+            {
+                find(old, m, update);
+                for (int i = 0; i < x->level; ++i)
+                    update[i]->L(i).next = static_cast<float>(score);
+            }
             x->score = score;
+            return true;
+        }
+        // Both places walked at once with x still listed, so a new place at x
+        // is x's predecessor and a rank past x is one less once x is out.
+        size_t rank_old[max_level], rank[max_level];
+        node*  at[max_level];
+        walk2(old, score, m, update, rank_old, at, rank);
+        const size_t rank_x = rank_old[0] + 1;
+        for (int i = 0; i < m_level; ++i)
+        {
+            if (at[i] == x)              { at[i] = update[i]; rank[i] = rank_old[i]; }
+            else if (rank[i] > rank_x)   --rank[i];
+        }
+        // The name is held here because the node holding it goes first.
+        char held[256];
+        std::string spill;
+        std::string_view name = m;
+        if (m.size() <= sizeof(held)) { std::memcpy(held, m.data(), m.size()); name = { held, m.size() }; }
+        else                          { spill.assign(m); name = spill; }
+        link_out(x, update);
+        ix_erase(m);
+        destroy(x);
+        grow_index();
+        node* n = make_node(random_level(), score, name);
+        link_at(n, at, rank);
+        ix_insert(n);
         return true;
     }
 
@@ -568,7 +648,7 @@ public:
         const node* x = m_big.head;
         for (int i = m_level - 1; i >= 0; --i)
         {
-            while (x->L(i).fwd && less_eq(x->L(i).fwd, score, member))
+            while (x->L(i).fwd && not_after(x->L(i), score, member))
             {
                 r += x->L(i).span;
                 x = x->L(i).fwd;
@@ -628,12 +708,17 @@ public:
             }
             return const_iterator(i, off, this);
         }
+        // The rounded score decides unless it ties, as before() below.
+        const float k = static_cast<float>(min);
+        const auto past = [&](const link& l)
+        {
+            if (l.next != k) return l.next < k;
+            return inclusive ? l.fwd->score < min : l.fwd->score <= min;
+        };
         const node* x = m_big.head;
         for (int i = m_level - 1; i >= 0; --i)
         {
-            while (x->L(i).fwd &&
-                   (inclusive ? x->L(i).fwd->score <  min
-                              : x->L(i).fwd->score <= min))
+            while (x->L(i).fwd && past(x->L(i)))
                 x = x->L(i).fwd;
         }
         return const_iterator(x->L(0).fwd, this);
@@ -651,6 +736,19 @@ private:
     {
         if (a->score != score) return a->score < score;
         return a->member() <= member;
+    }
+    // less() and less_eq() for a link's node, read from the node only on a tie.
+    static bool before(const link& l, double score, std::string_view member)
+    {
+        const float k = static_cast<float>(score);
+        if (l.next != k) return l.next < k;
+        return less(l.fwd, score, member);
+    }
+    static bool not_after(const link& l, double score, std::string_view member)
+    {
+        const float k = static_cast<float>(score);
+        if (l.next != k) return l.next < k;
+        return less_eq(l.fwd, score, member);
     }
 
     // ─── The packed form, per member: [tag][score][length][member][size].

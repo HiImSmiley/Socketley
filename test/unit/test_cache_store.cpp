@@ -2438,6 +2438,67 @@ TEST_CASE("zskiplist agrees with an ordered set through inserts, moves and remov
     CHECK(moved.size() == z.size());
 }
 
+TEST_CASE("zskiplist orders scores a float cannot tell apart")
+{
+    // Every group rounds to one float, so only the double itself orders it.
+    const double near[] = { 16777216.0, 16777217.0, 16777218.0, 1.0, 1.0 + 1e-12, 1.0 + 2e-12,
+                            1e300, 1e301, INFINITY, -1e300, -INFINITY, 0.0, -0.0, 1e-300, 1e-310, -1e-300 };
+    zskiplist z;
+    std::set<std::pair<double, std::string>> ref;
+    std::map<std::string, double> score;
+    uint32_t r = 4242;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    for (int step = 0; step < 40000; ++step)
+    {
+        const std::string m = "m" + std::to_string(rnd() % 1500);
+        const double sc = near[rnd() % std::size(near)];
+        auto it = score.find(m);
+        if (rnd() % 5 == 0 && it != score.end())
+        {
+            CHECK(z.erase(it->second, m) == 1);
+            ref.erase({ it->second, m });
+            score.erase(it);
+        }
+        else if (it != score.end())
+        {
+            REQUIRE(z.rescore(it->second, m, sc));
+            ref.erase({ it->second, m });
+            ref.insert({ sc, m });
+            it->second = sc;
+        }
+        else
+        {
+            z.emplace(sc, m);
+            ref.insert({ sc, m });
+            score[m] = sc;
+        }
+        if (step % 4000 == 3999)
+        {
+            REQUIRE(z.big());
+            REQUIRE(z.size() == ref.size());
+            size_t i = 0;
+            auto rit = ref.begin();
+            for (auto zit = z.begin(); zit != z.end(); ++zit, ++rit, ++i)
+            {
+                REQUIRE(same_entry(*zit, *rit));
+                // -0.0 and 0.0 are one score, as Redis has them; the sign is kept.
+                CHECK(std::signbit(zit->first) == std::signbit(rit->first));
+                CHECK(z.rank(rit->first, rit->second) == i);
+            }
+            for (const double b : near)
+                for (const bool incl : { true, false })
+                {
+                    auto want = std::find_if(ref.begin(), ref.end(),
+                                             [&](const auto& e) { return incl ? e.first >= b : e.first > b; });
+                    auto got = z.lower_bound_score(b, incl);
+                    REQUIRE((got == z.end()) == (want == ref.end()));
+                    if (want != ref.end())
+                        CHECK(same_entry(*got, *want));
+                }
+        }
+    }
+}
+
 TEST_CASE("field_map agrees with a map, packed and after it moves to the table")
 {
     uint32_t r = 777;
