@@ -157,7 +157,7 @@ The most messages kept for one session while its client is away or slow. Default
 
 ### `--retained-max size`
 
-The most bytes that retained messages may take, their topics, payloads and properties together. Default: 64M. A new retained message past it is not kept, and is counted.
+The most bytes that retained messages may take, their topics, payloads and properties together, each counted as at least 256 bytes, since keeping one takes about that much beside them. Default: 64M. A new retained message past it is not kept, and is counted.
 
 ### `--queue-max size`
 
