@@ -2568,6 +2568,13 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
         answer(c, *hot.meta, -1, 0, *hot.body, true);
         return;
     }
+    // A client whose copy is current is answered 304 from the index, with no file opened; the grants, the customer key
+    // and the condition are judged by the path an opened object takes, which a 304 leaves before it reads anything.
+    if (mem && q.query.empty() && !q.website && !c->website_status && evaluate(q, *mem) == cond::not_modified)
+    {
+        answer(c, *mem, -1, 0, std::string{}, false);
+        return;
+    }
     // A large object of this shard's whose file is kept open is answered from it, with no open and no header read.
     if (mem && mem->size > object_store::hot_max_object)
     {
