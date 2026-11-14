@@ -16197,14 +16197,19 @@ looks like
 .B {"set":{"a.b":1},"unset":["c"],"inc":{"n":1},
 .B \ "push":{"tags":"x"},"pull":{"tags":"y"}}
 .fi
-and works on dotted paths.
+and works on dotted paths, at most 256 of them in one patch.
 .PP
 .BI POST " /c/" collection /_query
 takes a query such as
 .na
 .BR {"where":{"level":{"gte":5},\:"name":"x"},\:"sort":"\-level",\:"limit":50,\:"skip":0} .
 .ad
-The conditions are eq, ne, gt, gte, lt, lte, in, prefix and exists.
+The conditions are eq, ne, gt, gte, lt, lte, in, prefix and exists, at most 64
+in a query. An
+.B in
+list may be as long as the body allows: a document's value is looked up in it,
+not compared with each item, and at most 64 of its items may be arrays or
+objects.
 .B "count":true
 answers the number alone. The answer is
 .BR {"docs":[...]} ,

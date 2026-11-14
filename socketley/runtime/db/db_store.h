@@ -91,6 +91,9 @@ struct query
         jvalue value;
         // The value as an index orders it, made once rather than once a document.
         ikey key;
+        // An in's scalar values as keys, sorted and once each, and where its arrays and objects are in value.items.
+        std::vector<ikey>     in_keys;
+        std::vector<uint32_t> in_others;
     };
     std::vector<cond> where;
     std::string sort;
@@ -140,6 +143,10 @@ public:
     static constexpr size_t   max_doc        = 1u << 20;
     static constexpr size_t   max_write      = 32u << 20;
     static constexpr size_t   max_ops        = 256;
+    // A query's conditions, an in's arrays and objects, and a patch's fields, each compared once a document or member.
+    static constexpr size_t   max_conditions = 64;
+    static constexpr size_t   max_in_objects = 64;
+    static constexpr size_t   max_patch_paths = 256;
     static constexpr size_t   max_limit      = 1000;
     // The document bytes a query not asked by a key reads for conditions and a sort no index answers.
     static constexpr size_t   max_scan_bytes = 8u << 20;

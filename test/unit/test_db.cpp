@@ -3,6 +3,9 @@
 // journal and snapshot a restart reads.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
+#include "thread_cpu.h"
+
+#include <chrono>
 
 #include <ctime>
 #include <filesystem>
@@ -599,6 +602,53 @@ TEST_CASE("a query not asked by a key reads a bounded amount of documents for wh
     // Without a sort the ids' order is the answer's, so a page stops reading once it has its documents.
     CHECK(ids_of(find(st, nobody, "pub", R"({"where":{"tag":"x"},"limit":1})")) == "d0 next=1");
     CHECK(ids_of(find(st, nobody, "pub", R"({"limit":2})")) == "d0 d1 next=2");
+}
+
+TEST_CASE("an in costs a lookup a document, and a query's conditions and a patch's fields are bounded")
+{
+    tmpdir t;
+    store st;
+    std::string why;
+    REQUIRE(st.open(t.path, schema{}, why));
+    REQUIRE(st.set_schema(make_schema("pub public score\n"), why));
+    for (int i = 0; i < 2000; ++i)
+        REQUIRE(put(st, key, "pub", ("d" + std::to_string(i)).c_str(),
+                    "{\"score\":" + std::to_string(i % 10) + ",\"n\":" + std::to_string(i) + "}") == 0);
+    // 200,000 numbers against a system field no index answers and no body read bounds: a lookup each, not a walk.
+    std::string many = "{\"where\":{\"_v\":{\"in\":[0";
+    std::string scores = "{\"where\":{\"score\":{\"in\":[3";
+    for (int i = 0; i < 200000; ++i)
+    {
+        many += ",0";
+        scores += ",3";
+    }
+    many += "]}},\"count\":true}";
+    scores += "]}},\"count\":true}";
+    const auto t0 = thread_cpu_now();
+    CHECK(find(st, nobody, "pub", many) == R"({"count":0})");
+    // The same value 200,000 times on an index reads its run once.
+    CHECK(find(st, nobody, "pub", scores) == R"({"count":200})");
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    // The lookup is the comparison it replaces: a number by its value, null for a field that is not there.
+    CHECK(find(st, nobody, "pub", R"({"where":{"n":{"in":[7.0,"7",1e400]}},"count":true})") == R"({"count":1})");
+    CHECK(find(st, nobody, "pub", R"({"where":{"missing":{"in":[null]}},"count":true})") == R"({"count":2000})");
+    CHECK(find(st, nobody, "pub", R"({"where":{"n":{"eq":12.0}},"count":true})") == R"({"count":1})");
+    CHECK(find(st, nobody, "pub", R"({"where":{"n":{"ne":12}},"count":true})") == R"({"count":1999})");
+
+    std::string conds = "{\"where\":{";
+    for (int i = 0; i < 65; ++i)
+        conds += std::string(i ? "," : "") + "\"f" + std::to_string(i) + "\":{\"exists\":false}";
+    CHECK(find(st, nobody, "pub", conds + "}}").starts_with("bad a query takes at most 64 conditions"));
+    std::string objects = "{\"where\":{\"n\":{\"in\":[[0]";
+    for (int i = 0; i < 64; ++i)
+        objects += ",[" + std::to_string(i) + "]";
+    CHECK(find(st, nobody, "pub", objects + "]}}}").starts_with("bad an in takes at most 64 arrays and objects"));
+
+    std::string fields = "{\"set\":{";
+    for (int i = 0; i < 257; ++i)
+        fields += std::string(i ? "," : "") + "\"a" + std::to_string(i) + "\":0";
+    CHECK(patch(st, key, "pub", "d1", fields + "}}") == 400);
+    CHECK(patch(st, key, "pub", "d1", R"({"set":{"a":1},"unset":["n"]})") == 0);
 }
 
 TEST_CASE("queries: an index answers what a scan answers, over random documents and conditions")

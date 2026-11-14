@@ -166,17 +166,32 @@ index_entries::const_iterator run_end(const index_entries& s, const query::cond&
     }
 }
 
+bool scalar(const jvalue& v);
+
+// Whether a scalar's key is among an in's, which is same() for scalars: a number by its value when it has one.
+bool in_keys_hold(const query::cond& c, const ikey& k)
+{
+    return std::binary_search(c.in_keys.begin(), c.in_keys.end(), k);
+}
+
 bool meets(const query::cond& c, const jvalue* v)
 {
     switch (c.op)
     {
+        // A scalar compares by the key made once for the query, so a long number is not read again each document.
         case query::cond::eq:
-            return c.value.k == jvalue::kind::null ? (!v || v->k == jvalue::kind::null) : v && same(*v, c.value);
+            if (c.value.k == jvalue::kind::null)
+                return !v || v->k == jvalue::kind::null;
+            return v && (scalar(c.value) && scalar(*v) ? key_of(v) == c.key : same(*v, c.value));
         case query::cond::ne:
-            return c.value.k == jvalue::kind::null ? (v && v->k != jvalue::kind::null) : !v || !same(*v, c.value);
+            if (c.value.k == jvalue::kind::null)
+                return v && v->k != jvalue::kind::null;
+            return !v || !(scalar(c.value) && scalar(*v) ? key_of(v) == c.key : same(*v, c.value));
         case query::cond::in:
-            for (const auto& i : c.value.items)
-                if (v ? same(*v, i) : i.k == jvalue::kind::null)
+            if (!v || scalar(*v))
+                return in_keys_hold(c, key_of(v));
+            for (const uint32_t i : c.in_others)
+                if (same(*v, c.value.items[i]))
                     return true;
             return false;
         case query::cond::exists:
@@ -209,11 +224,7 @@ bool meets_key(const query::cond& c, const ikey& k)
     {
         case query::cond::eq: return k == c.key;
         case query::cond::ne: return !(k == c.key);
-        case query::cond::in:
-            for (const auto& i : c.value.items)
-                if (k == key_of(&i))
-                    return true;
-            return false;
+        case query::cond::in: return in_keys_hold(c, k);
         default: return key_meets(c, k);
     }
 }
@@ -434,6 +445,15 @@ bool apply_patch(jvalue& body, const jvalue& changes, error& err)
         return false;
     }
     std::string why;
+    // Each field a patch names is looked for among its object's members, so their number is bounded as /tx's changes are.
+    size_t paths = 0;
+    for (const auto& [verb, arg] : changes.members)
+        paths += arg.k == jvalue::kind::array ? arg.items.size() : arg.members.size();
+    if (paths > store::max_patch_paths)
+    {
+        err = fail(400, "bad_patch", "a patch names at most " + std::to_string(store::max_patch_paths) + " fields");
+        return false;
+    }
     const auto path_ok = [&](std::string_view p) {
         if (valid_path(p) && p.front() != '_')
             return true;
@@ -1498,7 +1518,7 @@ bool store::parse_query(const jvalue& in, query& q, error& err)
                     conditions = conditions && op_of(name, o);
                 if (!conditions)
                 {
-                    q.where.push_back({field, query::cond::eq, cond, key_of(&cond)});
+                    q.where.push_back({field, query::cond::eq, cond, key_of(&cond), {}, {}});
                     continue;
                 }
                 for (const auto& [name, arg] : cond.members)
@@ -1514,7 +1534,7 @@ bool store::parse_query(const jvalue& in, query& q, error& err)
                                                                                      : "true or false"));
                         return false;
                     }
-                    q.where.push_back({field, o, arg, key_of(&arg)});
+                    q.where.push_back({field, o, arg, key_of(&arg), {}, {}});
                 }
             }
         }
@@ -1560,6 +1580,31 @@ bool store::parse_query(const jvalue& in, query& q, error& err)
             err = fail(400, "bad_query", "a query takes where, sort, limit, skip and count, not " + k);
             return false;
         }
+    }
+    if (q.where.size() > max_conditions)
+    {
+        err = fail(400, "bad_query", "a query takes at most " + std::to_string(max_conditions) + " conditions");
+        return false;
+    }
+    for (auto& c : q.where)
+    {
+        if (c.op != query::cond::in)
+            continue;
+        for (uint32_t i = 0; i < c.value.items.size(); ++i)
+        {
+            const jvalue& v = c.value.items[i];
+            if (scalar(v))
+                c.in_keys.push_back(key_of(&v));
+            else
+                c.in_others.push_back(i);
+        }
+        if (c.in_others.size() > max_in_objects)
+        {
+            err = fail(400, "bad_query", "an in takes at most " + std::to_string(max_in_objects) + " arrays and objects");
+            return false;
+        }
+        std::sort(c.in_keys.begin(), c.in_keys.end());
+        c.in_keys.erase(std::unique(c.in_keys.begin(), c.in_keys.end()), c.in_keys.end());
     }
     return true;
 }
@@ -1726,10 +1771,10 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
         planned = true;
         if (cond.op == query::cond::in)
         {
-            for (const auto& v : cond.value.items)
+            for (const ikey& k : cond.in_keys)
             {
                 query::cond one;
-                one.key = key_of(&v);
+                one.key = k;
                 take_run(ix.entries, one);
             }
             continue;
