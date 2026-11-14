@@ -1063,6 +1063,21 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
     }
     // Sent on once the copies kept are in, so a retry of them sends nothing twice and a refusal sends nothing on.
     const std::string edited = out.header ? *out.header : std::string();
+    // A From the script wrote in is the user's word, so it goes on only as one they could submit.
+    if (!redirects.empty() && !edited.empty())
+    {
+        std::string was, now;
+        const size_t n_was = from_headers(header_block(bytes), &was), n_now = from_headers(edited, &now);
+        if ((n_was != n_now || was != now) && !m_run.sends_on_as_own(user, own, edited))
+        {
+            LOG_WARN(("mail: " + own + "'s filter wrote a From of another address of this runtime's into a message it "
+                      "sends on, so it is kept rather than sent")
+                         .c_str());
+            redirects.clear();
+            if (puts.empty())
+                puts.push_back({inbox, 0});
+        }
+    }
     const auto then = [this, e, own, redirects, settle, edited, kept = !puts.empty()](int code, const std::string& text) {
         if (redirects.empty() || code / 100 != 2)
         {

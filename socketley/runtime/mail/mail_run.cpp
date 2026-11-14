@@ -2595,7 +2595,12 @@ std::string mail_run::conn::address_of(const std::string& user)
 
 std::vector<std::string> mail_run::conn::addresses_of(const std::string& user)
 {
-    std::vector<std::string> out{address_of(user)};
+    return run->own_addresses(user, address_of(user));
+}
+
+std::vector<std::string> mail_run::own_addresses(const std::string& user, const std::string& own) const
+{
+    std::vector<std::string> out{own};
     const auto add = [&out](std::string a) {
         socketley::ascii::lower_in_place(a);
         if (std::none_of(out.begin(), out.end(), [&](const std::string& x) { return socketley::ascii::iequals(x, a); }) &&
@@ -2603,15 +2608,29 @@ std::vector<std::string> mail_run::conn::addresses_of(const std::string& user)
             out.push_back(std::move(a));
     };
     const std::string local = user.substr(0, user.find('@'));
-    for (const auto& d : run->m_domains)
+    for (const auto& d : m_domains)
         add(local + "@" + d);
-    for (const auto& [key, targets] : run->aliases().map)
+    for (const auto& [key, targets] : aliases().map)
         if (!key.starts_with("*@") && std::any_of(targets.begin(), targets.end(), [&](const std::string& t) {
                 return socketley::ascii::iequals(t, out.front()) || socketley::ascii::iequals(t, user) ||
                        socketley::ascii::iequals(t, local);
             }))
             add(key);
     return out;
+}
+
+bool mail_run::sends_on_as_own(const std::string& user, const std::string& own, std::string_view head) const
+{
+    const std::vector<std::string> mine = own_addresses(user, own);
+    // Another domain's author is that domain's to vouch for, as a forward of a stranger's mail is; one of ours only
+    // the user's, as SMTP submission and JMAP hold them to, since this runtime's address on the envelope aligns it.
+    return authors_owned(head, [&](const address& a) {
+        std::string d = a.domain;
+        socketley::ascii::lower_in_place(d);
+        const std::string t = a.text();
+        return !is_local_domain(d) ||
+               std::any_of(mine.begin(), mine.end(), [&](const std::string& m) { return socketley::ascii::iequals(t, m); });
+    });
 }
 
 void mail_run::conn::submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts,

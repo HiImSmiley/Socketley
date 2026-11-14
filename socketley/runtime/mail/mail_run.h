@@ -104,6 +104,10 @@ public:
     const std::string& hostname() const { return m_hostname; }
     const std::vector<std::string>& domains() const { return m_domains; }
     bool is_local_domain(std::string_view d) const;
+    // The addresses `user`, whose own is `own`, sends as: that one, its local part at each domain, and its aliases.
+    std::vector<std::string> own_addresses(const std::string& user, const std::string& own) const;
+    // Whether a message `user` sends on names no author of this runtime's domains but the user's own addresses.
+    bool sends_on_as_own(const std::string& user, const std::string& own, std::string_view head) const;
     const alias_table& aliases() const { return m_aliases.value(); }
     // An address a bounce said is dead, which mail is not sent to again until it is forgiven.
     bool suppressed(std::string_view addr) const;

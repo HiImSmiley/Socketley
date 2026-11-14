@@ -8,6 +8,7 @@
 #include <set>
 
 #include "imap_store.h"
+#include "mail_compose.h"
 #include "mail_sieve.h"
 #include "mail_sieve_store.h"
 #include "../../shared/util/ascii.h"
@@ -180,6 +181,15 @@ void mail_run::imap_sieve_apply(const std::string& user, const std::shared_ptr<i
                     kept = true;   // A fileinto that files nowhere leaves the message where it is.
                 break;
             case sieve::action::kind::redirect:
+                // A message here may be the user's own writing, so it goes on only as one they could submit.
+                if (!sends_on_as_own(user, own, header_block(bytes)))
+                {
+                    LOG_WARN(("mail: the imapsieve script of " + user + "'s " + f->name +
+                              " sends on a message whose From is another address of this runtime's, so it is kept")
+                                 .c_str());
+                    kept = true;
+                    break;
+                }
                 queue_message(own, {a.arg}, "Delivered-To: " + own + "\r\n" + std::string(bytes), false, {},
                               [](bool, std::string) {});
                 break;

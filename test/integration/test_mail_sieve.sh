@@ -412,6 +412,40 @@ r=$(printf 'CAPABILITY\r\nLOGOUT\r\n' | timeout 3 nc -q1 127.0.0.1 "$SV" 2>/dev/
 case "$r" in *imapsieve*) ok "and ManageSieve lists imapsieve among its extensions" ;;
     *) bad "and ManageSieve lists imapsieve among its extensions" "$r" ;; esac
 
+# A message sent on by a filter goes as one the user could submit: a From of this runtime's domain that is not
+# theirs is kept, as SMTP submission and JMAP refuse it, while a stranger's is forwarded as before.
+printf 'redirect "onward@remote.test";\n' > "$T/onward.sieve"
+"$BIN" mail m sieve alice put onward "$T/onward.sieve" >/dev/null 2>&1
+r=$(python3 - "$IM" <<'PY'
+import imaplib, sys, time
+imaplib.Commands["SETMETADATA"] = ("AUTH", "SELECTED")
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1])); M.login("alice", "alicepassword1")
+M.create("Onward"); M._simple_command("SETMETADATA", "Onward", '(/shared/imapsieve/script "onward")')
+for frm, subj in (("Bob <bob@example.test>", "forged colleague"), ("news@else.test", "a stranger's onward")):
+    M.append("Onward", None, None, ("From: %s\r\nTo: alice@example.test\r\nSubject: %s\r\n\r\nbody\r\n" % (frm, subj)).encode())
+time.sleep(2)
+M.select("Onward"); typ, d = M.search(None, "ALL"); print(len(d[0].split()))
+PY
+)
+f=$(at_sink "a stranger's onward") && ok "imapsieve sends on a stranger's message" || bad "imapsieve sends on a stranger's message" "-"
+[ -z "$(grep -l -- "forged colleague" "$T"/sink/*.eml 2>/dev/null)" ] && [ "$r" = 1 ] \
+    && ok "but keeps one whose From is another address of this runtime's" \
+    || bad "but keeps one whose From is another address of this runtime's" "kept $r; $(grep -l -- 'forged colleague' "$T"/sink/*.eml 2>/dev/null)"
+printf 'require ["editheader"];\ndeleteheader "From";\naddheader "From" "Bob <bob@example.test>";\nredirect "edited@remote.test";\n' \
+    > "$T/edit.sieve"
+"$BIN" mail m sieve alice put edit "$T/edit.sieve" >/dev/null 2>&1
+"$BIN" mail m sieve alice activate edit >/dev/null 2>&1
+python3 - "$P" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
+s.sendmail("dora@remote.test", ["alice@example.test"], "From: dora@remote.test\r\nSubject: rewritten as bob\r\n\r\nhi\r\n")
+s.quit()
+PY
+sleep 2
+[ -z "$(grep -l -- "rewritten as bob" "$T"/sink/*.eml 2>/dev/null)" ] \
+    && ok "a delivery's filter that writes such a From keeps the message rather than send it on" \
+    || bad "a delivery's filter that writes such a From keeps the message rather than send it on" "$(grep -h '^From:' $(grep -l -- 'rewritten as bob' "$T"/sink/*.eml))"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
