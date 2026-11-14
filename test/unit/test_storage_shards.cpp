@@ -493,7 +493,7 @@ struct cluster : shard_transport
     {
         std::vector<wire::upload_stub> out;
         bool fired = false;
-        m[s]->node->mpu_list(bucket, [&](st r, std::vector<wire::upload_stub> v) { REQUIRE(r == st::ok); out = std::move(v); fired = true; });
+        m[s]->node->mpu_list(bucket, upload_page_query{}, [&](st r, std::vector<wire::upload_stub> v) { REQUIRE(r == st::ok); out = std::move(v); fired = true; });
         REQUIRE(until([&] { return fired; }));
         return out;
     }

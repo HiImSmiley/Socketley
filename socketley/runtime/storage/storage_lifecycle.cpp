@@ -246,7 +246,7 @@ bool storage_run::lifecycle_walk(lifecycle_pass& p)
         }
         // A version is noncurrent from the moment the one after it was made, and a marker with nothing behind it is spent.
         const std::string more = m_store.walk_versioned_keys(name, rule.prefix, p.has_resume ? p.resume : std::string{},
-            lc_page, [&](const std::string& key, const object_meta* latest, const std::vector<object_meta>& versions)
+            lc_page, [&](const std::string& key, const object_meta* latest, const version_list& versions)
             {
                 p.scanned += versions.size() + 1;
                 const bool marker_latest = !latest && !versions.empty() && is_delete_marker(versions.front());

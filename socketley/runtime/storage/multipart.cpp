@@ -322,6 +322,80 @@ std::vector<const mpu_upload*> multipart_store::uploads_of(std::string_view buck
     return out;
 }
 
+void multipart_store::place(std::unique_ptr<mpu_upload> up, std::string_view bucket)
+{
+    m_order.emplace(std::string(bucket), up->key, up->initiated_ms, up->id);
+    const std::string k = key_of(bucket, up->id);
+    m_uploads.emplace(k, std::move(up));
+}
+
+std::vector<const mpu_upload*> multipart_store::uploads_page(std::string_view bucket, const upload_page_query& q) const
+{
+    std::vector<const mpu_upload*> out;
+    const std::string b(bucket);
+    const auto at = [&](std::string key) { return m_order.lower_bound(order_t{b, std::move(key), INT64_MIN, {}}); };
+    const auto live = [&](const order_t& o) {
+        const mpu_upload* u = find(bucket, std::get<3>(o));
+        return u && u->state != mpu_state::removing ? u : nullptr;
+    };
+    // The folder a key is in past the prefix, empty for none.
+    const auto folder = [&](std::string_view key) {
+        if (q.delimiter.empty() || !key.starts_with(q.prefix))
+            return std::string();
+        const size_t d = key.find(q.delimiter, q.prefix.size());
+        return d == std::string::npos ? std::string() : std::string(key.substr(0, d + q.delimiter.size()));
+    };
+
+    // A marker that is a folder stands for all of it; a marker key without its upload for all of that key's.
+    auto it = at(q.prefix);
+    if (!q.key_marker.empty())
+    {
+        auto from = it;
+        if (const std::string g = folder(q.key_marker); !g.empty())
+        {
+            const std::string after = prefix_successor(g);
+            if (after.empty())
+                return out;
+            from = at(after);
+        }
+        else if (const mpu_upload* m = q.id_marker.empty() ? nullptr : find(bucket, q.id_marker);
+                 m && m->key == q.key_marker)
+            from = m_order.upper_bound(order_t{b, m->key, m->initiated_ms, m->id});
+        else
+            from = at(q.key_marker + '\0');
+        if (from == m_order.end() || (it != m_order.end() && *it < *from))
+            it = from;
+    }
+
+    const size_t want = size_t{q.max} + 1;
+    while (it != m_order.end() && out.size() < want)
+    {
+        const std::string& key = std::get<1>(*it);
+        if (std::get<0>(*it) != b || !key.starts_with(q.prefix))
+            break;
+        const std::string g = folder(key);
+        if (g.empty())
+        {
+            if (const mpu_upload* u = live(*it))
+                out.push_back(u);
+            ++it;
+            continue;
+        }
+        // A folder is one entry, its first upload that is not being closed, and the walk goes on past it.
+        for (; it != m_order.end() && std::get<0>(*it) == b && std::get<1>(*it).starts_with(g); ++it)
+            if (const mpu_upload* u = live(*it))
+            {
+                out.push_back(u);
+                break;
+            }
+        const std::string after = prefix_successor(g);
+        if (after.empty())
+            break;
+        it = at(after);
+    }
+    return out;
+}
+
 bool multipart_store::bucket_uploads_busy(std::string_view bucket) const
 {
     const std::string prefix = std::string(bucket) + "/";
@@ -516,7 +590,7 @@ bool multipart_store::recover_bucket(const std::string& bucket, std::string& err
             up->parts.emplace(n, std::move(part));
         }
         m_store->hold_bytes(up->held);
-        m_uploads.emplace(key_of(bucket, id), std::move(up));
+        place(std::move(up), bucket);
     }
     return true;
 }
@@ -689,7 +763,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
         up->algo         = s->algo;
         up->place_base   = place_base_of(s->key, s->meta, s->algo);
         up->dir_fd       = up_dir;
-        m_uploads.emplace(key_of(s->bucket, s->id), std::move(up));
+        place(std::move(up), s->bucket);
         s->cb(st::ok, s->id);
     });
 }
@@ -1698,6 +1772,7 @@ void multipart_store::forget(const std::string& bucket, const std::string& id)
         return;
     std::unique_ptr<mpu_upload> up = std::move(it->second);
     m_uploads.erase(it);
+    m_order.erase(order_t{bucket, up->key, up->initiated_ms, up->id});
     m_store->release_bytes(up->held);
     if (up->dir_fd >= 0)
         m_loop->close_fd(up->dir_fd);

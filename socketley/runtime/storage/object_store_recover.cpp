@@ -1415,7 +1415,7 @@ void object_store::load_versions(recovering& r, recovery_report& rep, bool& chan
 {
     bucket& b = *r.b;
     const std::string base = m_opts.dir + "/" + b.name + "/";
-    std::map<std::string, std::vector<object_meta>, std::less<>> fresh;
+    std::map<std::string, version_list, std::less<>> fresh;
     // A delete marker at a key's usual path is its latest version, and no object.
     for (auto& [key, meta] : r.markers)
     {

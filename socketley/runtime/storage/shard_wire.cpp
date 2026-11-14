@@ -925,6 +925,30 @@ bool decode_parts_page(std::string_view reply, parts_page& pg)
     return r.bytes(pg.owner, name_cap) && r.bytes(pg.storage_class, 64);
 }
 
+std::string encode_upload_query(std::string_view bucket, const upload_page_query& q)
+{
+    bytes::writer w = begin(op::mpu_list);
+    w.bytes(bucket);
+    w.bytes(q.prefix);
+    w.bytes(q.delimiter);
+    w.bytes(q.key_marker);
+    w.bytes(q.id_marker);
+    w.u32(q.max);
+    return w.take();
+}
+
+bool decode_upload_query(std::string_view payload, std::string& bucket, upload_page_query& q)
+{
+    bytes::reader r(payload);
+    uint32_t max = 0;
+    if (!open_request(r, op::mpu_list) || !r.bytes(bucket, name_cap) || !r.bytes(q.prefix, query_cap) ||
+        !r.bytes(q.delimiter, query_cap) || !r.bytes(q.key_marker, query_cap) || !r.bytes(q.id_marker, id_cap) ||
+        !r.u32(max))
+        return false;
+    q.max = std::min<uint32_t>(max, 1000);
+    return true;
+}
+
 std::string encode_upload_list(const std::vector<upload_stub>& uploads)
 {
     bytes::writer w;

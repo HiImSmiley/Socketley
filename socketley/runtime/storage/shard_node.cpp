@@ -994,7 +994,8 @@ void shard_node::mpu_parts(std::string bucket, std::string key, std::string id, 
         });
 }
 
-void shard_node::mpu_list(std::string bucket, std::function<void(st, std::vector<wire::upload_stub>)> cb)
+void shard_node::mpu_list(std::string bucket, upload_page_query q,
+                          std::function<void(st, std::vector<wire::upload_stub>)> cb)
 {
     struct gather
     {
@@ -1003,10 +1004,10 @@ void shard_node::mpu_list(std::string bucket, std::function<void(st, std::vector
     };
     auto g = std::make_shared<gather>();
     if (m_mpu)
-        for (const mpu_upload* u : m_mpu->uploads_of(bucket))
+        for (const mpu_upload* u : m_mpu->uploads_page(bucket, q))
             g->all.push_back({u->key, u->id, u->initiated_ms, std::string(storage_class_of(u->meta))});
     m_c.mpu_out += m_store.shards() - 1;
-    each_peer([bucket](uint32_t) { return wire::encode_bucket(wire::op::mpu_list, bucket); },
+    each_peer([payload = wire::encode_upload_query(bucket, q)](uint32_t) { return payload; },
               [g](uint32_t, bool ok, std::string_view reply)
               {
                   st ps = st::io_error;
@@ -1145,14 +1146,14 @@ void shard_node::serve_mpu(wire::op o, std::string_view payload, std::function<v
         case wire::op::mpu_list:
         {
             std::string bucket;
-            int64_t ms = 0;
-            if (!wire::decode_bucket(payload, bucket, ms))
+            upload_page_query q;
+            if (!wire::decode_upload_query(payload, bucket, q))
             {
                 reply(false, {});
                 return;
             }
             std::vector<wire::upload_stub> all;
-            for (const mpu_upload* u : m_mpu->uploads_of(bucket))
+            for (const mpu_upload* u : m_mpu->uploads_page(bucket, q))
                 all.push_back({u->key, u->id, u->initiated_ms, std::string(storage_class_of(u->meta))});
             reply(true, wire::encode_status(st::ok) + wire::encode_upload_list(all));
             return;

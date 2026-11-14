@@ -627,9 +627,10 @@ void storage_run::op_list_uploads(const std::shared_ptr<conn>& c)
     const std::string key_marker = std::string(r.get_query("key-marker"));
     const std::string id_marker  = std::string(r.get_query("upload-id-marker"));
 
-    // Every shard holds the uploads of the keys it owns, so the listing is theirs together.
+    // Every shard holds the uploads of the keys it owns, so the listing is their pages together, merged here.
     std::weak_ptr<conn> weak = c;
-    m_node.mpu_list(r.bucket, [this, weak, max_uploads, url_enc, prefix, delimiter, key_marker, id_marker]
+    upload_page_query pq{prefix, delimiter, key_marker, id_marker, max_uploads};
+    m_node.mpu_list(r.bucket, std::move(pq), [this, weak, max_uploads, url_enc, prefix, delimiter, key_marker, id_marker]
                               (st ls, std::vector<wire::upload_stub> all)
     {
     auto cc = weak.lock();

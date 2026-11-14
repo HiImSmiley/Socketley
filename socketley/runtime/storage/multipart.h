@@ -32,6 +32,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "checksum.h"
@@ -185,6 +186,16 @@ struct mpu_totals
     uint64_t bytes{0};
 };
 
+// What a page of ListMultipartUploads asks for.
+struct upload_page_query
+{
+    std::string prefix;
+    std::string delimiter;
+    std::string key_marker;
+    std::string id_marker;
+    uint32_t    max{1000};
+};
+
 struct assemble_state;
 struct part_commit;
 
@@ -204,6 +215,9 @@ public:
     const mpu_upload* find(std::string_view bucket, std::string_view id) const;
     // The uploads of a bucket that are not being closed, in no particular order.
     std::vector<const mpu_upload*> uploads_of(std::string_view bucket) const;
+    // At most max + 1 entries of a listing page after its markers, in its order, a folder past the prefix by its first
+    // upload, so a page costs what it shows and not what the bucket holds.
+    std::vector<const mpu_upload*> uploads_page(std::string_view bucket, const upload_page_query& q) const;
     // Whether an upload of a bucket is being written, completed or removed, which stops it being deleted.
     bool bucket_uploads_busy(std::string_view bucket) const;
     // Runs `then` once no upload of `bucket` that was completed or aborted is still removing its files, at once
@@ -307,6 +321,10 @@ private:
     file_io*     m_io;
     object_store* m_store;
     std::map<key_t, std::unique_ptr<mpu_upload>> m_uploads;
+    // Every upload as a listing orders them: bucket, key, start, id.
+    using order_t = std::tuple<std::string, std::string, int64_t, std::string>;
+    std::set<order_t> m_order;
+    void place(std::unique_ptr<mpu_upload> up, std::string_view bucket);
     // What waits, by bucket, for its removing uploads to be gone.
     std::map<std::string, std::vector<std::function<void()>>, std::less<>> m_removal_waiters;
     std::shared_ptr<bool> m_alive;

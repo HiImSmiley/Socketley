@@ -150,9 +150,8 @@ const object_meta* object_store::find_version(std::string_view bucket_name, std:
     if (const auto o = b->objects.find(key); o != b->objects.end() && version_id_of(o->second) == version_id)
         return &o->second;
     if (const auto v = b->versions.find(key); v != b->versions.end())
-        for (const object_meta& m : v->second)
-            if (version_id_of(m) == version_id)
-                return &m;
+        if (const auto at = version_in(v->second, version_id); at != v->second.end())
+            return &*at;
     return nullptr;
 }
 
@@ -201,34 +200,46 @@ bool object_store::stamp_holds(const bucket& b, const std::string& key, const ob
     return kind && !t.marker && t.seq > newest_seq(b, key);
 }
 
-bool object_store::place_version(std::vector<object_meta>& list, const object_meta& m, uint64_t* replaced_size)
+version_list::const_iterator object_store::version_in(const version_list& list, std::string_view id)
+{
+    version_tag t;
+    if (!version_of_id(id, false, t))
+        return std::find_if(list.begin(), list.end(), [&](const object_meta& m) { return version_id_of(m) == id; });
+    // Newest first, so the versions of the id's order follow every newer one.
+    auto it = std::partition_point(list.begin(), list.end(),
+                                   [&](const object_meta& m) { return version_seq_of(m) > t.seq; });
+    for (; it != list.end() && version_seq_of(*it) == t.seq; ++it)
+        if (version_id_of(*it) == id)
+            return it;
+    return list.end();
+}
+
+bool object_store::place_version(version_list& list, const object_meta& m, uint64_t* replaced_size)
 {
     const version_tag t = version_of(m);
     // A new latest, newer than every version the key has, cannot share an id with one, since an id begins with its
     // order; only the null version, the same version placed again or an older one looks through the list.
     if (t.id != "null" && (list.empty() || version_seq_of(list.front()) < t.seq))
     {
-        list.insert(list.begin(), m);
+        list.push_front(m);
         return false;
     }
     const bool replaced = erase_version(list, t.id, replaced_size);
-    const auto at = std::find_if(list.begin(), list.end(),
-                                 [&](const object_meta& o) { return version_seq_of(o) < t.seq; });
+    const auto at = std::partition_point(list.begin(), list.end(),
+                                         [&](const object_meta& o) { return version_seq_of(o) >= t.seq; });
     list.insert(at, m);
     return replaced;
 }
 
-bool object_store::erase_version(std::vector<object_meta>& list, std::string_view id, uint64_t* size)
+bool object_store::erase_version(version_list& list, std::string_view id, uint64_t* size)
 {
-    for (auto it = list.begin(); it != list.end(); ++it)
-        if (version_id_of(*it) == id)
-        {
-            if (size)
-                *size = it->size;
-            list.erase(it);
-            return true;
-        }
-    return false;
+    const auto it = version_in(list, id);
+    if (it == list.end())
+        return false;
+    if (size)
+        *size = it->size;
+    list.erase(it);
+    return true;
 }
 
 void object_store::version_bytes(bucket& b, int64_t delta)
@@ -1319,7 +1330,6 @@ st object_store::list_versions(std::string_view bucket_name, const version_query
     auto oi = b->objects.lower_bound(lower);
     auto vi = b->versions.lower_bound(lower);
     size_t count = 0;
-    std::vector<const object_meta*> metas;
     for (;;)
     {
         const std::string* next = oi != oend ? &oi->first : nullptr;
@@ -1350,27 +1360,25 @@ st object_store::list_versions(std::string_view bucket_name, const version_query
                 continue;
             }
         }
-        metas.clear();
+        // The key's latest object first, then its other versions, from just after the marker's version when it is this
+        // key's: found by its order, so a page costs what it lists and not every version the key has.
         const bool here_o = oi != oend && oi->first == key;
         const bool here_v = vi != vend && vi->first == key;
-        if (here_o)
-            metas.push_back(&oi->second);
-        if (here_v)
-            for (const object_meta& m : vi->second)
-                metas.push_back(&m);
-        size_t i = 0;
+        static const version_list none;
+        const version_list& older = here_v ? vi->second : none;
+        bool latest = here_o;
+        auto vit = older.begin();
         if (key == q.key_marker && !q.version_marker.empty())
         {
-            i = metas.size();
-            for (size_t j = 0; j < metas.size(); ++j)
-                if (version_id_of(*metas[j]) == q.version_marker)
-                {
-                    i = j + 1;
-                    break;
-                }
+            latest = false;
+            vit    = older.end();
+            if (here_o && version_id_of(oi->second) == q.version_marker)
+                vit = older.begin();
+            else if (const auto at = version_in(older, q.version_marker); at != older.end())
+                vit = std::next(at);
         }
         bool full = false;
-        for (; i < metas.size(); ++i)
+        for (bool first = true; latest || vit != older.end(); first = false)
         {
             if (count >= q.max_keys)
             {
@@ -1378,7 +1386,12 @@ st object_store::list_versions(std::string_view bucket_name, const version_query
                 full = true;
                 break;
             }
-            out.items.push_back({key, *metas[i], i == 0, false});
+            const bool head = first && (latest || (!here_o && vit == older.begin()));
+            out.items.push_back({key, latest ? oi->second : *vit, head, false});
+            if (latest)
+                latest = false;
+            else
+                ++vit;
             ++count;
         }
         if (full)

@@ -157,6 +157,9 @@ st key_name_status(std::string_view key);
 // when there is none because `s` is all 0xFF bytes.
 std::string prefix_successor(std::string s);
 
+// A key's versions, newest first: a deque, since a new latest goes in at the front.
+using version_list = std::deque<object_meta>;
+
 struct bucket_info
 {
     std::string name;
@@ -984,7 +987,7 @@ public:
     // with its latest object (null when that is a marker) and its other versions newest first, at most `max_keys`;
     // the key to go on at, empty when there are no more.
     using version_walk = std::function<void(const std::string& key, const object_meta* latest,
-                                            const std::vector<object_meta>& versions)>;
+                                            const version_list& versions)>;
     std::string walk_versioned_keys(std::string_view bucket, std::string_view prefix, std::string_view from,
                                     size_t max_keys, const version_walk& fn) const;
 
@@ -1094,7 +1097,7 @@ private:
         versioning  vstate{versioning::off};
         // Per key, every version but a latest that is not a delete marker, newest first: the key's
         // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.
-        std::map<std::string, std::vector<object_meta>, std::less<>> versions;
+        std::map<std::string, version_list, std::less<>> versions;
         // The documents, a bit per kind, this shard may hold an old copy of, and the change each is waiting on.
         uint16_t    doc_doubt{0};
         uint64_t    doc_doubt_seq[std::size(all_bucket_docs)]{};
@@ -1230,8 +1233,10 @@ private:
     void version_add(bucket& b, const std::string& key, const object_meta& m);
     void version_drop(bucket& b, const std::string& key, std::string_view id);
     // The same on a list alone, for the journal's replay: the version of `m`'s id replaced, or false when it was not there.
-    static bool place_version(std::vector<object_meta>& list, const object_meta& m, uint64_t* replaced_size = nullptr);
-    static bool erase_version(std::vector<object_meta>& list, std::string_view id, uint64_t* size = nullptr);
+    static bool place_version(version_list& list, const object_meta& m, uint64_t* replaced_size = nullptr);
+    static bool erase_version(version_list& list, std::string_view id, uint64_t* size = nullptr);
+    // Where version `id` is in a list, by the order its id begins with; the null version, which has none, by a walk.
+    static version_list::const_iterator version_in(const version_list& list, std::string_view id);
     // `restamp` writes the header again for the version `meta` now holds; `release(made)` is told whether the key
     // changed, before the answer.
     void commit_versioned(std::string bucket, std::string key, std::string tmp, bool pooled, object_meta meta,

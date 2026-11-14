@@ -129,7 +129,8 @@ public:
     void mpu_abort(std::string bucket, std::string key, std::string id, std::function<void(bool)> cb);
     void mpu_parts(std::string bucket, std::string key, std::string id, uint32_t marker, uint32_t max_parts,
                    std::function<void(parts_page)> cb);
-    void mpu_list(std::string bucket, std::function<void(st, std::vector<wire::upload_stub>)> cb);
+    // Each shard's page of the listing `q` asks for, together at most shards * (q.max + 1) uploads.
+    void mpu_list(std::string bucket, upload_page_query q, std::function<void(st, std::vector<wire::upload_stub>)> cb);
 
     // Answers a request a sibling sent, once, with `ok` false for a payload that
     // is not one of ours.

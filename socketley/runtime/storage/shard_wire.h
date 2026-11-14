@@ -176,6 +176,9 @@ std::string encode_mpu_plan(const s3_error& err, const assemble_plan& plan);
 bool        decode_mpu_plan(std::string_view reply, s3_error& err, assemble_plan& plan);
 std::string encode_parts_page(const parts_page& pg);
 bool        decode_parts_page(std::string_view reply, parts_page& pg);
+// A page of a bucket's uploads asked of a sibling, which answers no more than q.max + 1 of them.
+std::string encode_upload_query(std::string_view bucket, const upload_page_query& q);
+bool        decode_upload_query(std::string_view payload, std::string& bucket, upload_page_query& q);
 std::string encode_upload_list(const std::vector<upload_stub>& uploads);
 bool        decode_upload_list(std::string_view reply, std::vector<upload_stub>& uploads);
 
