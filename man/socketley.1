@@ -16552,7 +16552,10 @@ A session holds at most 10,000 filters of at most 1 MiB together. A SUBSCRIBE
 past that is refused for the filters that do not fit (0x97, quota exceeded, or
 0x80 to 3.1.1). Retained messages are sent once for each filter a SUBSCRIBE
 names, and at QoS 0 none past the subscriber's write limit, which they would be
-dropped by.
+dropped by. The filters of one SUBSCRIBE walk the retained messages at most
+four times over together; the filters after that are granted and sent no
+retained messages, counted as
+.BR retained_cut .
 .IP \(bu 2
 Wills. A will is sent when a connection is lost, or when a 5.0 client
 disconnects and asks for it. It is not sent when the client disconnects

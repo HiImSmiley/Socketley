@@ -387,6 +387,9 @@ void mqtt_run::shards_start()
     m_sharing.assign(n, {});
     m_seen.assign(n, {});
     m_moved.clear();
+    m_moved_of.clear();
+    m_moved_tree = std::make_unique<subscription_tree>();
+    m_moved_refs.clear();
     m_unsaid.clear();
     m_adopted.clear();
     m_unheard.clear();
@@ -593,7 +596,7 @@ void mqtt_run::filter_removed(const std::string& filter)
     if (!sharded() || m_peers.empty())
         return;
     // A session given up lately still takes this filter's messages here, to hand them on.
-    if (std::any_of(m_moved.begin(), m_moved.end(), [&](const moved_session& s) { return s.subs.contains(filter); }))
+    if (m_moved_refs.contains(filter))
     {
         m_unsaid.insert(filter);
         return;
@@ -608,14 +611,49 @@ std::vector<std::string> mqtt_run::told_filters() const
     return out;
 }
 
-void mqtt_run::drop_moved(size_t i)
+void mqtt_run::keep_moved(moved_session s)
 {
-    moved_session gone = std::move(m_moved[i]);
-    m_moved.erase(m_moved.begin() + static_cast<std::ptrdiff_t>(i));
-    for (const auto& [filter, o] : gone.subs)
+    s.tag = m_moved_next++;
+    s.filters.reserve(s.subs.size());
+    // Places past 16 bits do not fit the number a tree entry carries; a session holds at most 10,000 filters.
+    for (const auto& [filter, o] : s.subs)
     {
-        if (!m_unsaid.contains(filter) ||
-            std::any_of(m_moved.begin(), m_moved.end(), [&](const moved_session& s) { return s.subs.contains(filter); }))
+        if (s.filters.size() == (1u << 16))
+            break;
+        std::string_view group, inner = filter;
+        split_shared(filter, group, inner);
+        m_moved_tree->add(inner, {}, s.tag << 16 | s.filters.size(), o);
+        ++m_moved_refs[filter];
+        s.filters.push_back(filter);
+    }
+    m_moved_of[s.client] = s.tag;
+    const uint64_t tag = s.tag;
+    m_moved.emplace(tag, std::move(s));
+}
+
+void mqtt_run::drop_moved(const std::string& client)
+{
+    const auto of = m_moved_of.find(client);
+    if (of == m_moved_of.end())
+        return;
+    const auto it = m_moved.find(of->second);
+    m_moved_of.erase(of);
+    if (it == m_moved.end())
+        return;
+    moved_session gone = std::move(it->second);
+    m_moved.erase(it);
+    for (size_t i = 0; i < gone.filters.size(); ++i)
+    {
+        const std::string& filter = gone.filters[i];
+        std::string_view group, inner = filter;
+        split_shared(filter, group, inner);
+        m_moved_tree->remove(inner, {}, gone.tag << 16 | i);
+        const auto r = m_moved_refs.find(filter);
+        if (r != m_moved_refs.end() && --r->second == 0)
+            m_moved_refs.erase(r);
+        else
+            continue;
+        if (!m_unsaid.contains(filter))
             continue;
         m_unsaid.erase(filter);
         share_interest(static_cast<uint8_t>(sverb::interest_del), {filter});
@@ -625,19 +663,35 @@ void mqtt_run::drop_moved(size_t i)
 void mqtt_run::forward_moved(const message_ptr& m, uint32_t origin, uint64_t epoch, uint64_t seq, uint64_t taken,
                              const std::vector<std::string>* groups)
 {
+    // The filters of the sessions given up that the topic matches, found in one walk of their tree, by session.
+    std::vector<uint64_t>& hits = m_moved_hits;
+    hits.clear();
+    m_moved_tree->match(m->topic, [&](uint64_t id, const sub_options&) { hits.push_back(id); },
+                        [](std::string_view, uint64_t, const sub_options&) {});
+    if (hits.empty())
+        return;
+    std::sort(hits.begin(), hits.end());
     const int64_t now = now_ms();
-    for (const moved_session& s : m_moved)
+    for (size_t i = 0; i < hits.size();)
     {
-        if (now >= s.until)
+        const uint64_t tag = hits[i] >> 16;
+        size_t end = i;
+        while (end < hits.size() && hits[end] >> 16 == tag)
+            ++end;
+        const auto it = m_moved.find(tag);
+        if (it == m_moved.end() || now >= it->second.until)
+        {
+            i = end;
             continue;
+        }
+        const moved_session& s = it->second;
         std::vector<std::string> filters;
         bool plain = false;
-        for (const auto& [filter, o] : s.subs)
+        for (; i < end; ++i)
         {
+            const std::string& filter = s.filters.at(hits[i] & 0xffff);
             std::string_view group, inner = filter;
             const bool shared = split_shared(filter, group, inner);
-            if (!topic_matches(inner, m->topic))
-                continue;
             // A group's message is the session's only where this shard was chosen for the group and has no member
             // of it left.
             if (shared && (m_broker->has_filter(filter) ||
@@ -719,10 +773,11 @@ void mqtt_run::take_forward(std::string_view frame)
     {
         bool on = false;
         const message_ptr held_m = m;
-        for (const moved_session& s : m_moved)
+        const auto of = m_moved_of.find(client);
+        if (const auto it = of == m_moved_of.end() ? m_moved.end() : m_moved.find(of->second);
+            it != m_moved.end() && now_ms() < it->second.until)
         {
-            if (s.client != client || now_ms() >= s.until)
-                continue;
+            const moved_session& s = it->second;
             std::vector<std::string> theirs;
             bool plain = false;
             for (const auto& f : filters)
@@ -1099,9 +1154,7 @@ void mqtt_run::finish_claim(uint64_t id)
         return;
     }
     // The client is this shard's now, so what it gave up of it before is handed on no longer.
-    for (size_t i = m_moved.size(); i-- > 0;)
-        if (m_moved[i].client == pc.ask.client_id)
-            drop_moved(i);
+    drop_moved(pc.ask.client_id);
     if (!pc.session.empty())
     {
         m_broker->adopt(pc.session);
@@ -1154,9 +1207,7 @@ void mqtt_run::absorb(const std::string& client, std::string_view bytes, uint32_
         case broker::late_take::installed:
         case broker::late_take::merged:
             ++m_sessions_late;
-            for (size_t i = m_moved.size(); i-- > 0;)
-                if (m_moved[i].client == client)
-                    drop_moved(i);
+            drop_moved(client);
             if (!back)
             {
                 took_in(client);
@@ -1218,15 +1269,13 @@ std::string mqtt_run::give_up(const std::string& client, uint32_t to, bool clean
     std::map<std::string, sub_options> subs;
     if (!clean)
         subs = m_broker->session_subs(client);
-    for (size_t i = m_moved.size(); i-- > 0;)
-        if (m_moved[i].client == client)
-            drop_moved(i);
+    drop_moved(client);
     if (!subs.empty())
-        m_moved.push_back({client, to, std::move(subs), now_ms() + forward_keep_ms, {}});
+        keep_moved({client, to, std::move(subs), now_ms() + forward_keep_ms, {}, 0, {}});
     m_adopted.erase(client);
     std::string bytes = m_broker->surrender(client, clean).value_or(std::string());
-    if (bytes.empty() && !m_moved.empty() && m_moved.back().client == client)
-        drop_moved(m_moved.size() - 1);
+    if (bytes.empty())
+        drop_moved(client);
     return bytes;
 }
 
@@ -1298,9 +1347,12 @@ void mqtt_run::sweep_claims(int64_t now)
 {
     if (m_retained_ask_ms && now >= m_retained_ask_ms)
         ask_retained();
-    for (size_t i = m_moved.size(); i-- > 0;)
-        if (now >= m_moved[i].until)
-            drop_moved(i);
+    std::vector<std::string> due;
+    for (const auto& [tag, s] : m_moved)
+        if (now >= s.until)
+            due.push_back(s.client);
+    for (const std::string& c : due)
+        drop_moved(c);
     std::erase_if(m_adopted, [&](const auto& kv) { return now >= kv.second.until; });
     std::erase_if(m_pass_on, [&](const auto& kv) { return now >= kv.second.second; });
     // A filter let go here is no longer waited on; one still held is, until every shard has it.
@@ -1467,9 +1519,9 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t 
             for (auto& [e, s] : marks)
                 if (!r.u64(e) || !r.u64(s))
                     return;
-            for (auto& s : m_moved)
-                if (s.client == client && s.to == from)
-                    s.marks = marks;
+            if (const auto of = m_moved_of.find(client); of != m_moved_of.end())
+                if (const auto it = m_moved.find(of->second); it != m_moved.end() && it->second.to == from)
+                    it->second.marks = marks;
             break;
         }
         case sverb::retained:

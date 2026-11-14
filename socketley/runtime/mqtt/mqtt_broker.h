@@ -418,6 +418,8 @@ struct broker_stats
     uint64_t sessions_evicted{0};
     uint64_t protocol_errors{0};
     uint64_t retained_refused{0};
+    // SUBSCRIBEs whose filters had walked four times the retained tree, the rest of them sent nothing retained.
+    uint64_t retained_cut{0};
     uint64_t takeovers{0};
     uint64_t takeovers_refused{0};
 };
@@ -701,7 +703,8 @@ private:
     // Whether the message was routed; false for one the retained store refused, which the publisher is told of.
     bool store_retained(const message_ptr& m, bool notify);
     void deliver(session& s, const message_ptr& m, uint8_t qos, bool retain_flag, std::vector<uint32_t> sub_ids);
-    void send_retained(session& s, const std::string& filter, const sub_options& o);
+    // False once `left`, the levels of the retained tree the SUBSCRIBE may still enter, ran out.
+    bool send_retained(session& s, const std::string& filter, const sub_options& o, size_t& left);
     // QoS 1 and 2 messages written as far as the client's Receive Maximum and the write limit allow.
     void pump(session& s);
     // A QoS 1 or 2 message written now and held until it is answered; one too large for the client is dropped.

@@ -162,7 +162,10 @@ public:
         {
             auto& c = n->children[std::string(l)];
             if (!c)
+            {
                 c = std::make_unique<node>();
+                ++m_nodes;
+            }
             n = c.get();
         }
         if (!n->value)
@@ -186,8 +189,16 @@ public:
     // Every retained message a filter matches; topics starting with '$' only for a filter that names that level.
     void match(std::string_view filter, const std::function<void(const std::shared_ptr<V>&)>& f) const
     {
-        walk(m_root, split_levels(filter), 0, f);
+        size_t left = SIZE_MAX;
+        walk(m_root, split_levels(filter), 0, f, left);
     }
+    // The same, entering at most `left` levels of the tree, less what it entered; false when that ran out first.
+    bool match_within(std::string_view filter, size_t& left, const std::function<void(const std::shared_ptr<V>&)>& f) const
+    {
+        return walk(m_root, split_levels(filter), 0, f, left);
+    }
+    // The levels the tree holds, which one walk of all of it enters.
+    size_t nodes() const { return m_nodes; }
 
     // Every retained message, for a snapshot and a listing.
     void each(const std::function<void(const std::shared_ptr<V>&)>& f) const { all(m_root, f, false, true); }
@@ -217,32 +228,49 @@ private:
         if (it == n.children.end())
             return false;
         if (erase(*it->second, levels, i + 1) && !it->second->value)
+        {
             n.children.erase(it);
+            --m_nodes;
+        }
         return n.children.empty() && !n.value;
     }
 
     // Everything at and below `n`, the '$' topics of the root level left out unless asked.
-    static void all(const node& n, const std::function<void(const std::shared_ptr<V>&)>& f, bool root_skip_dollar,
-                    bool is_root)
+    static bool all(const node& n, const std::function<void(const std::shared_ptr<V>&)>& f, bool root_skip_dollar,
+                    bool is_root, size_t& left)
     {
+        if (left == 0)
+            return false;
+        --left;
         if (n.value)
             f(n.value);
         for (const auto& [k, c] : n.children)
         {
             if (is_root && root_skip_dollar && !k.empty() && k.front() == '$')
                 continue;
-            all(*c, f, false, false);
+            if (!all(*c, f, false, false, left))
+                return false;
         }
+        return true;
+    }
+    static void all(const node& n, const std::function<void(const std::shared_ptr<V>&)>& f, bool root_skip_dollar,
+                    bool is_root)
+    {
+        size_t left = SIZE_MAX;
+        all(n, f, root_skip_dollar, is_root, left);
     }
 
-    static void walk(const node& n, const std::vector<std::string_view>& levels, size_t i,
-                     const std::function<void(const std::shared_ptr<V>&)>& f)
+    static bool walk(const node& n, const std::vector<std::string_view>& levels, size_t i,
+                     const std::function<void(const std::shared_ptr<V>&)>& f, size_t& left)
     {
+        if (left == 0)
+            return false;
+        --left;
         if (i == levels.size())
         {
             if (n.value)
                 f(n.value);
-            return;
+            return true;
         }
         const bool root = i == 0;
         const std::string_view l = levels[i];
@@ -255,9 +283,10 @@ private:
             {
                 if (root && !k.empty() && k.front() == '$')
                     continue;
-                all(*c, f, false, false);
+                if (!all(*c, f, false, false, left))
+                    return false;
             }
-            return;
+            return true;
         }
         if (l == "+")
         {
@@ -265,17 +294,18 @@ private:
             {
                 if (root && !k.empty() && k.front() == '$')
                     continue;
-                walk(*c, levels, i + 1, f);
+                if (!walk(*c, levels, i + 1, f, left))
+                    return false;
             }
-            return;
+            return true;
         }
         const auto it = n.children.find(std::string(l));
-        if (it != n.children.end())
-            walk(*it->second, levels, i + 1, f);
+        return it == n.children.end() || walk(*it->second, levels, i + 1, f, left);
     }
 
     node   m_root;
     size_t m_count{0};
+    size_t m_nodes{0};
 };
 
 }   // namespace socketley::mqtt

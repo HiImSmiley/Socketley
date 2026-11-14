@@ -1326,10 +1326,11 @@ void broker::resend(session& s, connection& c)
     });
 }
 
-void broker::send_retained(session& s, const std::string& filter, const sub_options& o)
+bool broker::send_retained(session& s, const std::string& filter, const sub_options& o, size_t& left)
 {
     std::vector<message_ptr> found;
-    m_retained.match(filter, [&](const std::shared_ptr<const message>& m) { found.push_back(m); });
+    const bool whole =
+        m_retained.match_within(filter, left, [&](const std::shared_ptr<const message>& m) { found.push_back(m); });
     connection* c = s.conn ? conn_of(s.conn) : nullptr;
     for (const auto& m : found)
     {
@@ -1344,6 +1345,7 @@ void broker::send_retained(session& s, const std::string& filter, const sub_opti
             ids.push_back(o.subscription_id);
         deliver(s, m, std::min(m->qos, o.qos), true, std::move(ids));
     }
+    return whole;
 }
 
 // ── Acknowledgements ────────────────────────────────────────────────────────
@@ -1551,7 +1553,10 @@ void broker::subscribe_ack(uint64_t conn, uint64_t generation, const std::shared
     send_packet(*c, out);
     // Retained messages after the SUBACK, for every granted plain filter whose Retain Handling asks for them, each
     // filter once however often the packet names it: 60,000 copies of `#` walked every retained message 60,000 times.
+    // Together the filters walk at most four times the tree: distinct filters that each match every message, which a
+    // session may hold 10,000 of, walked it 10,000 times, and a message they share is sent once per filter anyway.
     std::unordered_set<std::string_view> served;
+    size_t left = 4 * (m_retained.nodes() + 1);
     for (size_t k = 0; k < p.entries.size(); ++k)
     {
         const subscription& e = p.entries[k];
@@ -1560,8 +1565,12 @@ void broker::subscribe_ack(uint64_t conn, uint64_t generation, const std::shared
         std::string_view group, inner = e.filter;
         if (split_shared(e.filter, group, inner) || !served.insert(e.filter).second)
             continue;
-        if (const auto it = s.subs.find(e.filter); it != s.subs.end())
-            send_retained(s, std::string(inner), it->second);
+        if (const auto it = s.subs.find(e.filter); it != s.subs.end() &&
+                                                   !send_retained(s, std::string(inner), it->second, left))
+        {
+            ++m_stats.retained_cut;
+            break;
+        }
     }
     c->busy = false;
     if (!c->processing)

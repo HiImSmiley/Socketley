@@ -280,7 +280,7 @@ private:
     std::vector<std::string> told_filters() const;
     // A message the shard a session came from handed on for it, the whole frame.
     void take_forward(std::string_view frame);
-    void drop_moved(size_t i);
+    void drop_moved(const std::string& client);
     void send_shard(uint32_t to);
     void send_shards();
     bool unreachable(const shard_queue& q) const;
@@ -502,8 +502,20 @@ private:
         int64_t     until{0};
         // What the shard it went to had been handed by each shard when it took it in, once it says.
         std::vector<std::pair<uint64_t, uint64_t>> marks;
+        // Its number in m_moved_tree, and its filters in the order of `subs`, which the tree names by place.
+        uint64_t tag{0};
+        std::vector<std::string> filters;
     };
-    std::vector<moved_session> m_moved;
+    // By number, the order sessions were given up in, and by client.
+    std::map<uint64_t, moved_session> m_moved;
+    std::unordered_map<std::string, uint64_t, string_hash, string_equal> m_moved_of;
+    // Every filter of every session given up, so a message finds the ones it matches with one walk of the tree, each
+    // as (number << 16 | place), and how many such sessions hold each filter.
+    std::unique_ptr<subscription_tree> m_moved_tree{std::make_unique<subscription_tree>()};
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> m_moved_refs;
+    uint64_t m_moved_next{1};
+    std::vector<uint64_t> m_moved_hits;
+    void keep_moved(moved_session s);
     std::unordered_set<std::string, string_hash, string_equal> m_unsaid;
     // Each message accepted here is numbered, under m_shard_epoch.
     uint64_t m_msg_seq{0};

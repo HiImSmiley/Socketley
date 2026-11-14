@@ -414,6 +414,8 @@ constexpr field mqtt_fields[] = {
     counter("sessions_evicted", "socketley_mqtt_sessions_evicted_total", "Sessions ended to stay under the limit."),
     counter("protocol_errors", "socketley_mqtt_protocol_errors_total", "Connections closed for a protocol error."),
     counter("retained_refused", "socketley_mqtt_retained_refused_total", "Retained messages refused past the limit."),
+    counter("retained_cut", "socketley_mqtt_retained_cut_total",
+            "SUBSCRIBEs whose filters walked four times the retained tree and were sent no more retained messages."),
     counter("tls_failures", "socketley_mqtt_tls_failures_total", "TLS handshakes that failed or never finished."),
     counter("websocket_refused", "socketley_mqtt_websocket_refused_total", "WebSocket upgrades a broker refused."),
     counter("snapshots", "socketley_mqtt_snapshots_total", "Snapshots of the broker's state written."),

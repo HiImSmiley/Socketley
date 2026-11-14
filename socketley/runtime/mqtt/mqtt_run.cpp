@@ -1913,6 +1913,7 @@ std::string mqtt_run::stats() const
     st::put(out, "sessions_evicted", s.sessions_evicted);
     st::put(out, "protocol_errors", s.protocol_errors);
     st::put(out, "retained_refused", s.retained_refused);
+    st::put(out, "retained_cut", s.retained_cut);
     st::put(out, "tls_failures", m_tls_failures);
     st::put(out, "websocket_refused", m_ws_refused);
     st::put(out, "snapshots", m_persists);
