@@ -13700,8 +13700,10 @@ bool cache_instance::send_full_dump(follower_conn& f)
     // them, so a follower that reconnects still holding data keeps every key
     // the leader dropped meanwhile and appends a second time to every list it
     // already had -- measured, a list of two came back as four.
-    std::string buf = "flushall\n";
-    buf.reserve(65536);
+    // Sized from what the store holds, its share of it for a shard's follower, so the dump is not copied as it grows.
+    std::string buf;
+    buf.reserve(m_store.get_memory_used() / std::max<uint32_t>(f.shard_n, 1) + 65536);
+    buf = "flushall\n";
     m_store.dump_commands(buf, f.shard_i, f.shard_n);
 
     buf.append(repl_sync_done);
