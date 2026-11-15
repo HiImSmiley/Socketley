@@ -820,12 +820,6 @@ uint8_t flag_bits(const std::vector<std::string>& flags)
     return out;
 }
 
-// Whether an automatic reply may answer `e`: spam is answered by nobody, which would tell its sender the address is read.
-bool answerable(const spool_entry& e)
-{
-    return !e.bounce && !e.from.empty() && e.folder != "Junk" && e.auth.find("x-spam=yes") == std::string::npos;
-}
-
 // Whether `e`'s sender may be told of a refusal: one signed in, this machine or this runtime, or a domain whose SPF
 // passed for the peer, so a bounce never goes to a third party that a stranger only named as the sender.
 bool sender_vouched(const spool_entry& e)
@@ -839,6 +833,41 @@ bool sender_vouched(const spool_entry& e)
         return false;
     const std::string_view rest = std::string_view(e.auth).substr(passed.size());
     return rest.substr(0, rest.find(';')) == socketley::idna::to_ascii(lower(std::string_view(e.from).substr(at + 1)));
+}
+
+// Whether `e`'s sender is the one who wrote it as far as this host's checks could tell: sender_vouched, or a DKIM
+// signature that passed for the sender's own organizational domain.
+bool sender_signed(const spool_entry& e)
+{
+    if (sender_vouched(e))
+        return true;
+    const size_t at = e.from.rfind('@');
+    if (at == std::string::npos)
+        return false;
+    const std::string org =
+        organizational_domain(socketley::idna::to_ascii(lower(std::string_view(e.from).substr(at + 1))));
+    if (org.empty())
+        return false;
+    // inbound_result::header() writes each signature as "; dkim=<result> header.d=<d>", d a name without ';' or space.
+    constexpr std::string_view passed = "; dkim=pass header.d=";
+    const std::string_view auth = e.auth;
+    for (size_t p = auth.find(passed); p != std::string_view::npos; p = auth.find(passed, p + 1))
+    {
+        std::string_view d = auth.substr(p + passed.size());
+        d = d.substr(0, d.find_first_of("; "));
+        if (!d.empty() && organizational_domain(lower(d)) == org)
+            return true;
+    }
+    return false;
+}
+
+// Whether an automatic reply may answer `e`: spam is answered by nobody, which would tell its sender the address is
+// read; nor a sender nothing vouches for, which a stranger may have named to have this domain's signed answer, its
+// Subject the stranger's, sent to a third party (backscatter, as reject's sender_vouched keeps from a refusal).
+bool answerable(const spool_entry& e)
+{
+    return !e.bounce && !e.from.empty() && e.folder != "Junk" && e.auth.find("x-spam=yes") == std::string::npos &&
+           sender_signed(e);
 }
 
 // A folder fileinto may name: printable, no step out of the user's mailboxes.

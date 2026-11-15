@@ -20,6 +20,7 @@
 #   * a vacation answered twice to one sender, or not at all, or from a sender a bounce could answer, or again after
 #     a restart; the active script forgotten by one
 #   * a script deactivated still run
+#   * a vacation answering a sender a stranger only named (backscatter, under this domain's signature)
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -245,6 +246,23 @@ send bob@remote.test "third plain"
 for _ in $(seq 1 60); do [ "$(keys Bills | wc -l)" -ge 2 ] && [ -z "$("$BIN" mail m queue 2>/dev/null)" ] && break; sleep 0.1; done
 check "after a restart the active script still files" "$(keys Bills | wc -l)" "2"
 check "and the vacation does not answer bob again" "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | wc -l)" "1"
+# A vacation answers a sender its domain vouches for, and not one a stranger only named: the answer would carry this
+# domain's signature and the stranger's Subject to a third party.
+python3 - "$P" <<'PY'
+import smtplib, sys
+for src, sender in (("127.0.0.2", "named@remote.test"), ("127.0.0.3", "pal@good.test")):
+    s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=(src, 0)); s.ehlo("x")
+    s.sendmail(sender, ["alice@example.test"], "From: %s\r\nTo: alice@example.test\r\nSubject: CHEAP PILLS\r\n"
+               "Message-ID: <%s.away@remote.test>\r\n\r\nbody\r\n" % (sender, src))
+    s.quit()
+PY
+for _ in $(seq 1 60); do
+    [ -n "$(grep -l '^rcpt pal@good.test' "$T"/sink/*.eml 2>/dev/null | xargs -r grep -l '^Subject: Away')" ] && break; sleep 0.1
+done
+[ -n "$(grep -l '^rcpt pal@good.test' "$T"/sink/*.eml 2>/dev/null | xargs -r grep -l '^Subject: Away')" ] \
+    && ok "a vacation answers a sender whose SPF passed" || bad "a vacation answers a sender whose SPF passed" "no answer to pal"
+sleep 0.5
+check "and not one a stranger only named" "$(grep -l '^rcpt named@remote.test' "$T"/sink/*.eml 2>/dev/null | wc -l)" "0"
 
 # ─── what is sent on ────────────────────────────────────────────────────────
 # Past a mebibyte the message is a file of its own, read back to be sent on before the spool lets it go.
