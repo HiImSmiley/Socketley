@@ -751,6 +751,10 @@ struct backend_sock
     uint32_t owed[8];
     uint8_t  owed_n{0};
     uint32_t last_id{0};
+    // Whose the message this end left unfinished is (resp_pending): the id it
+    // was answering, or 0 for one written blind over a request it had not read.
+    // What this end writes next continues that message, so it is that id's.
+    uint32_t unfinished_id{0};
 
     // How far this end has read, and how far the wire had already run when this
     // end last answered something it had not read.  A request lying unread at
@@ -1818,6 +1822,7 @@ void bsock_close(backend_sock& b)
     b.pool_seen = false;
     b.owed_n = 0;
     b.last_id = 0;
+    b.unfinished_id = 0;
     b.rx_bytes = 0;
     b.blind_horizon = 0;
     b.blind_pending = 0;
@@ -1928,6 +1933,7 @@ int backend_accept(world& w, int idx)
     b.pool_seen = false;
     b.owed_n = 0;
     b.last_id = 0;
+    b.unfinished_id = 0;
     b.rx_bytes = 0;
     b.blind_horizon = 0;
     b.blind_pending = 0;
@@ -2257,8 +2263,14 @@ void bsock_respond(world& w, int idx, int shape)
         // proxy for.  It goes out unmarked.
         //
         // Nor is it quiet with a request queued at the proxy's end, for the same reason one step earlier.
+        //
+        // Nor with a message of this end's left unfinished: the proxy reads
+        // what comes next as the rest of it, so it is that message's, and one
+        // written blind belongs to a request this end never read.  Marked with
+        // last_id it read as crosstalk when the proxy, rightly, gave the rest
+        // of a blind half header to the client whose request it answered.
         if (unread == 0 && !ahead)
-            id = b.last_id;
+            id = b.resp_pending ? b.unfinished_id : b.last_id;
     }
 
     static std::string buf;
@@ -2297,6 +2309,9 @@ void bsock_respond(world& w, int idx, int shape)
     }
     // A short write leaves the answer unfinished as surely as a shape that was
     // never going to finish it.
+    // A message already unfinished stays the one it was: this write is more of it.
+    if (!b.resp_pending)
+        b.unfinished_id = id;
     b.resp_pending = !complete || static_cast<size_t>(n) != buf.size();
     if (b.resp_pending)
         w.answer_left_unfinished = true;
