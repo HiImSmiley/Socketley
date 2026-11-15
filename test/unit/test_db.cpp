@@ -628,7 +628,7 @@ TEST_CASE("an in costs a lookup a document, and a query's conditions and a patch
     CHECK(find(st, nobody, "pub", many) == R"({"count":0})");
     // The same value 200,000 times on an index reads its run once.
     CHECK(find(st, nobody, "pub", scores) == R"({"count":200})");
-    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0 * build_cpu_factor);
     // The lookup is the comparison it replaces: a number by its value, null for a field that is not there.
     CHECK(find(st, nobody, "pub", R"({"where":{"n":{"in":[7.0,"7",1e400]}},"count":true})") == R"({"count":1})");
     CHECK(find(st, nobody, "pub", R"({"where":{"missing":{"in":[null]}},"count":true})") == R"({"count":2000})");
@@ -683,7 +683,7 @@ TEST_CASE("a page no index answers walks the ids in their order and stops, and a
           "d000005 d000006 next=7");
     const double took = std::chrono::duration<double>(thread_cpu_now() - t0).count();
     MESSAGE("21 pages of 100,000 documents no index answers: " << took << " s of CPU");
-    CHECK(took < 0.05);
+    CHECK(took < 0.05 * build_cpu_factor);
     // A sort no index answers puts only the page in order, the same page a whole sort gives.
     const auto t1 = thread_cpu_now();
     for (int k = 0; k < 5; ++k)

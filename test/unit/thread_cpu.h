@@ -2,6 +2,8 @@
 #include <chrono>
 #include <time.h>
 
+#include "shared/util/build_cost.h"
+
 // The CPU this thread has spent, so a bound on work holds on a machine busy with other work.
 inline std::chrono::nanoseconds thread_cpu_now()
 {

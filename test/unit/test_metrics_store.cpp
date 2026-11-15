@@ -25,6 +25,7 @@
 #include "runtime/metrics/metrics_promql_eval.h"
 #include "runtime/metrics/metrics_query.h"
 #include "runtime/metrics/metrics_store.h"
+#include "shared/util/build_cost.h"
 
 using namespace socketley::metrics;
 namespace fs = std::filesystem;
@@ -1308,7 +1309,7 @@ TEST_CASE("a selector's regexes over the label values are held to the query's ti
         REQUIRE(s.append(id, T0 + 1000, 1));
     }
     query_engine eng(s);
-    eng.limits().timeout_ms = 200;
+    eng.limits().timeout_ms = 200 * build_cpu_factor;
     // Each value keeps a thousand of the regex's threads alive to its end: the index ran all 600, 1.6 s, and the
     // query was answered past its deadline.
     query_result r;
@@ -1318,7 +1319,7 @@ TEST_CASE("a selector's regexes over the label values are held to the query's ti
     const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     MESSAGE("a selector's regex over 600 values of 1 KB: " << took << " s, " << err.type << ": " << err.message);
     CHECK(err.type == "timeout");
-    CHECK(took < 1.0);
+    CHECK(took < 1.0 * build_cpu_factor);
     // A cheap one is answered as before.
     REQUIRE(eng.eval_instant(R"(count(r{v=~"a+1.*"}))", T0 + 2000, r, err));
     CHECK(r.series.at(0).points.at(0).v == 111);

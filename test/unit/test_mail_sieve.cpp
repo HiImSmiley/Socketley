@@ -310,7 +310,7 @@ TEST_CASE("sieve: :matches is quadratic at worst, never exponential")
     const auto took = thread_cpu_now() - start;
     CHECK(o.error.empty());
     CHECK(summary(o) == "keep");
-    CHECK(took < std::chrono::seconds(2));
+    CHECK(took < std::chrono::seconds(2 * build_cpu_factor));
 }
 
 TEST_CASE("sieve: variables, RFC 5229's examples")
@@ -764,7 +764,7 @@ TEST_CASE("sieve: a regex costs time linear in the value, whatever the expressio
         INFO(re);
         CHECK(o.error.empty());
         CHECK(summary(o) == "keep");
-        CHECK(took < std::chrono::seconds(1));
+        CHECK(took < std::chrono::seconds(1 * build_cpu_factor));
     }
 }
 
@@ -980,7 +980,7 @@ TEST_CASE("sieve: deleteheader takes many headers out in one pass")
     REQUIRE(o.header);
     CHECK(o.header->find("X-Tag") == std::string::npos);
     CHECK(o.header->find("Subject: s") != std::string::npos);
-    CHECK(took < std::chrono::seconds(1));
+    CHECK(took < std::chrono::seconds(1 * build_cpu_factor));
 }
 
 TEST_CASE("sieve: a :matches pattern of many stars is charged its length on every value")
@@ -1002,7 +1002,7 @@ TEST_CASE("sieve: a :matches pattern of many stars is charged its length on ever
     const outcome o = run(script, message);
     const auto took = thread_cpu_now() - start;
     CHECK(summary(o) == "keep");
-    CHECK(took < std::chrono::seconds(1));
+    CHECK(took < std::chrono::seconds(1 * build_cpu_factor));
 }
 
 TEST_CASE("sieve: a regex compiled again and again is charged each time")
@@ -1077,7 +1077,7 @@ TEST_CASE("sieve: a string of many \"${\" and no \"}\" is put together in one pa
     const outcome o = s->run({bytes, "alice@example.org", "me@example.com"}, {});
     const auto took = thread_cpu_now() - start;
     CHECK(o.error.empty());
-    CHECK(took < std::chrono::seconds(1));
+    CHECK(took < std::chrono::seconds(1 * build_cpu_factor));
 }
 
 namespace
@@ -1135,7 +1135,7 @@ TEST_CASE("sieve: duplicate finds an ID the run saw already without walking ever
     const sieve::outcome many = many_duplicates(4, 10, 4096, took);
     MESSAGE("10,000 IDs behind a 4 KiB handle: " << std::chrono::duration<double>(took).count() << " s, kept "
                                                  << many.seen.size() << ", error \"" << many.error << "\"");
-    CHECK(took < std::chrono::milliseconds(500));
+    CHECK(took < std::chrono::milliseconds(500 * build_cpu_factor));
     // What one run may ask about is what the store remembers at all, 10,000 IDs, and 1 MiB of them.
     CHECK(many.error.find("more than 10,000 IDs, or 1 MiB") != std::string::npos);
     // 10,000 short ones are asked about and kept, quickly.
@@ -1143,7 +1143,7 @@ TEST_CASE("sieve: duplicate finds an ID the run saw already without walking ever
     MESSAGE("10,000 IDs behind a 64 byte handle: " << std::chrono::duration<double>(took).count() << " s");
     CHECK(kept.error.empty());
     CHECK(kept.seen.size() == 10000);
-    CHECK(took < std::chrono::milliseconds(500));
+    CHECK(took < std::chrono::milliseconds(500 * build_cpu_factor));
     // One more is past what may be asked.
     const sieve::outcome past = many_duplicates(3, 22, 8, took);
     CHECK(past.error.find("more than 10,000 IDs") != std::string::npos);
@@ -1165,7 +1165,7 @@ TEST_CASE("sieve: what one message's duplicate tests saw is kept without folding
         const auto took = thread_cpu_now() - start;
         MESSAGE("10,000 IDs kept one by one into a full memory: " << std::chrono::duration<double>(took).count()
                                                                  << " s");
-        CHECK(took < std::chrono::seconds(5));
+        CHECK(took < std::chrono::seconds(5 * build_cpu_factor));
         // The newest are remembered and the memory holds no more than it may.
         CHECK(store.seen("alice", std::string("h\0id-9999", 9), 20001));
         CHECK_FALSE(store.seen("alice", std::string("h\0old-0", 7), 20001));
@@ -1177,7 +1177,7 @@ TEST_CASE("sieve: what one message's duplicate tests saw is kept without folding
         store.keep_seen("alice", run, 20000);
         const auto once = thread_cpu_now() - at;
         MESSAGE("10,000 IDs kept in one go: " << std::chrono::duration<double>(once).count() << " s");
-        CHECK(once < std::chrono::milliseconds(150));
+        CHECK(once < std::chrono::milliseconds(150 * build_cpu_factor));
         CHECK(store.seen("alice", std::string("h\0run-0", 7), 20001));
     }
     std::filesystem::remove_all(dir);
