@@ -9,22 +9,28 @@
 //   3  an ACL: an AccessControlPolicy document up to the first NUL, then grant headers, one a line
 //   4  a token: a JWK Set up to the first NUL, then a JWT
 //   5  a photo's first bytes (JPEG, TIFF, HEIF), and the same read as a HEIF's Exif item
+// and a first byte of 0xF8 or more (which the six above never took from the corpus) picks a bucket configuration:
+//      a LifecycleConfiguration (even byte) or a ReplicationConfiguration (odd)
 //
 // Properties checked, beyond "did it crash":
 //   * any bytes compressed open back to themselves, and a block opens to no more than the room it is given;
 //   * a select fed its object whole gives the records it gives fed a byte at a time, and the records it gives
 //     paused at every look at the clock and fed the rest again;
 //   * an ACL that parses encodes and decodes back to itself, and grants nothing a grantee it does not name;
-//   * a photo's facts are a time or a place on the globe, and a HEIF's boxes end however large they say they are.
+//   * a photo's facts are a time or a place on the globe, and a HEIF's boxes end however large they say they are;
+//   * a bucket configuration that parses is written as one that parses to the same text, a lifecycle rule names at
+//     most 10 tags, and neither is read in more than a second (PUT ?lifecycle runs on the storage's loop).
 
 #include <chrono>
 
 #include "fuzz_common.h"
 #include "runtime/storage/compression.h"
 #include "runtime/storage/exif.h"
+#include "runtime/storage/lifecycle.h"
 #include "runtime/storage/lz4_block.h"
 #include "runtime/storage/s3_acl.h"
 #include "runtime/storage/s3_federation.h"
+#include "runtime/storage/s3_replication.h"
 #include "runtime/storage/s3_select.h"
 
 #include <string>
@@ -184,6 +190,38 @@ void photo(std::string_view in)
     if (exif_item_facts(in, g)) {}
 }
 
+void bucket_config(std::string_view in, bool replication)
+{
+    s3_error err;
+    const auto start = std::chrono::steady_clock::now();
+    if (replication)
+    {
+        replication_config c;
+        if (parse_replication_config(in, c, err))
+        {
+            const std::string x = replication_config_xml(c);
+            replication_config again;
+            FUZZ_CHECK(parse_replication_config(x, again, err), "a replication configuration written does not read back");
+            FUZZ_CHECK(replication_config_xml(again) == x, "a replication configuration read back is written otherwise");
+        }
+    }
+    else
+    {
+        lifecycle_config c;
+        if (parse_lifecycle(in, c, err))
+        {
+            for (const auto& r : c.rules)
+                FUZZ_CHECK(r.tags.size() <= 10, "a lifecycle rule naming more tags than an object can carry");
+            const std::string x = lifecycle_xml(c);
+            lifecycle_config again;
+            FUZZ_CHECK(parse_lifecycle(x, again, err), "a lifecycle configuration written does not read back");
+            FUZZ_CHECK(lifecycle_xml(again) == x, "a lifecycle configuration read back is written otherwise");
+        }
+    }
+    FUZZ_CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(1),
+               "a bucket configuration took more than a second to read");
+}
+
 }   // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -192,6 +230,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size == 0)
         return 0;
     const std::string_view in(reinterpret_cast<const char*>(data) + 1, size - 1);
+    if (data[0] >= 0xF8)
+    {
+        bucket_config(in, data[0] & 1);
+        return 0;
+    }
     switch (data[0] % 6)
     {
         case 0: lz4(in); break;
