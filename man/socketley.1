@@ -25526,6 +25526,16 @@ minutes.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_MAIL_BAYES_HOLD_MS
+A test aid that sets how many milliseconds a shard of a mail runtime, other than
+the first, waits before it writes a learned line to a spam filter journal that
+already holds lines.
+It writes as soon as the first shard has folded that journal and removed it, so
+the line goes into a journal the fold has already read, and must be written
+again into the new one. Default: 0, no wait.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_MAIL_LET_GO_MS
 A test aid that sets how many milliseconds a shard of a mail runtime, other than
 the first, keeps a user's index in memory after nothing on that shard asked for
