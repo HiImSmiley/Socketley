@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp fuzz_http_codecs fuzz_fastcgi fuzz_lua_json fuzz_storage_parsers fuzz_mail_sessions fuzz_h2_session fuzz_sieve_budget fuzz_state_json fuzz_ws_reassembly fuzz_resp_dispatch fuzz_decoders"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp fuzz_http_codecs fuzz_fastcgi fuzz_lua_json fuzz_storage_parsers fuzz_mail_sessions fuzz_h2_session fuzz_sieve_budget fuzz_state_json fuzz_edit_merge fuzz_ws_reassembly fuzz_resp_dispatch fuzz_decoders"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -192,7 +192,7 @@ want fuzz_event_loop && build fuzz_event_loop \
 # reachability checks compile to nothing without it and are half of what these
 # targets exist to assert.
 if want fuzz_http_request || want fuzz_server_ops || want fuzz_client_ops || \
-   want fuzz_proxy_ops || want fuzz_storage_parsers || want fuzz_state_json || want fuzz_ws_reassembly || \
+   want fuzz_proxy_ops || want fuzz_storage_parsers || want fuzz_state_json || want fuzz_edit_merge || want fuzz_ws_reassembly || \
    want fuzz_resp_dispatch; then
 SDK_OBJ="$OUT/sdk-obj"
 mkdir -p "$SDK_OBJ"
@@ -284,6 +284,8 @@ else
                 "$ROOT/test/fuzz/fuzz_storage_parsers.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
             want fuzz_state_json && build fuzz_state_json \
                 "$ROOT/test/fuzz/fuzz_state_json.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
+            want fuzz_edit_merge && build fuzz_edit_merge \
+                "$ROOT/test/fuzz/fuzz_edit_merge.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
             want fuzz_ws_reassembly && build fuzz_ws_reassembly \
                 "$ROOT/test/fuzz/fuzz_ws_reassembly.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
             want fuzz_resp_dispatch && build fuzz_resp_dispatch \
