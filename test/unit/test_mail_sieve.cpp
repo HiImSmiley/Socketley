@@ -1,6 +1,7 @@
 #include "doctest.h"
 #include "thread_cpu.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <map>
@@ -13,6 +14,7 @@
 #include "runtime/mail/mail_mime.h"
 #include "runtime/mail/mail_sieve.h"
 #include "runtime/mail/mail_sieve_store.h"
+#include "shared/util/regex.h"
 
 using namespace socketley::mail;
 using sieve::action;
@@ -1008,19 +1010,45 @@ TEST_CASE("sieve: a regex compiled again and again is charged each time")
     // 65 expressions of 4 KiB, one more than the cache holds, against a value each: every one was compiled again for
     // every value, uncounted.
     std::string script = "require \"regex\";\nif header :regex \"x\" [";
+    std::vector<std::string> keys;
     for (int i = 0; i < 65; ++i)
-        script += std::string(i ? ", " : "") + "\"([a-y]|[b-z]|(ab)){900}c" + std::to_string(i) + "\"";
+    {
+        keys.push_back("([a-y]|[b-z]|(ab)){900}c" + std::to_string(i));
+        script += std::string(i ? ", " : "") + "\"" + keys.back() + "\"";
+    }
     script += "] { discard; }\n";
     std::string message;
     for (int i = 0; i < 3000; ++i)
         message += "X: a\n";
     message += "\nbody\n";
-    const auto start = thread_cpu_now();
-    const outcome o = run(script, message);
-    const auto took = thread_cpu_now() - start;
+    // What is measured is the property, not the box: a run of its 1,000,000 steps pays for at most so many compiles
+    // at 1 + program / 32 steps each, so it may cost little more than that many compiles made here, now, under
+    // whatever else the machine runs.  Uncharged, the run compiled on until its matching alone spent the steps --
+    // 10.9 s against 0.47 s, a wall a CPU bound of a second stood for, and one a loaded box crossed with the fix.
+    socketley::regex probe;
+    std::string why;
+    REQUIRE(probe.compile(keys[0], why, socketley::regex::syntax::posix_extended, true, true));
+    const uint64_t paid = 1000000 / (1 + probe.program_size() / 32);
+    std::chrono::nanoseconds run_cpu = std::chrono::hours(1), compile_cpu = std::chrono::hours(1);
+    outcome o;
+    for (int round = 0; round < 2; ++round)
+    {
+        auto start = thread_cpu_now();
+        o = run(script, message);
+        run_cpu = std::min(run_cpu, thread_cpu_now() - start);
+        start = thread_cpu_now();
+        for (uint64_t i = 0; i < paid; ++i)
+        {
+            socketley::regex re;
+            CHECK(re.compile(keys[i % keys.size()], why, socketley::regex::syntax::posix_extended, true, true));
+        }
+        compile_cpu = std::min(compile_cpu, thread_cpu_now() - start);
+    }
     INFO(o.error);
+    MESSAGE("65 regexes over 3,000 values: " << std::chrono::duration<double>(run_cpu).count() << " s of CPU, the "
+            << paid << " compiles its steps pay for " << std::chrono::duration<double>(compile_cpu).count() << " s");
     CHECK(summary(o) == "keep");
-    CHECK(took < std::chrono::seconds(1));
+    CHECK(run_cpu < 2 * compile_cpu);
 }
 
 TEST_CASE("sieve: a string of many \"${\" and no \"}\" is put together in one pass")

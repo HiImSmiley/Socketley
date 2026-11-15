@@ -1331,38 +1331,65 @@ TEST_CASE("THREAD REFERENCES: a parent of many children lets each go at once, an
         io::read(e, head + "\r\n");
         return e;
     };
+    // The CPU of threading `hostile` against that of `plain`, a mailbox of its size and nearly its shape that asks
+    // nothing quadratic of the old code, each the least of three taken in turn: a ratio of two runs side by side
+    // under the same load, where a bound of seconds measured the box (0.24 s here quiet, 0.47-0.64 s with eight
+    // busy loops beside it, red at 0.75 in 2 of 4 runs).
+    const auto ratio = [](const std::vector<io::entry>& hostile, const std::vector<io::entry>& plain, const char* what) {
+        double h = 1e9, p = 1e9;
+        std::string a, b;
+        for (int round = 0; round < 3; ++round)
+        {
+            auto t0 = thread_cpu_now();
+            a = io::references(hostile);
+            h = std::min(h, std::chrono::duration<double>(thread_cpu_now() - t0).count());
+            t0 = thread_cpu_now();
+            b = io::references(plain);
+            p = std::min(p, std::chrono::duration<double>(thread_cpu_now() - t0).count());
+        }
+        MESSAGE(std::string(what) << ": " << h << " s of CPU, " << p << " s for a mailbox of its size that moves nothing");
+        CHECK(std::count(a.begin(), a.end(), '(') == std::count(a.begin(), a.end(), ')'));
+        CHECK(std::count(b.begin(), b.end(), '(') == std::count(b.begin(), b.end(), ')'));
+        return std::make_pair(h / p, a);
+    };
     // 100,000 placeholders under one parent, then each the message it stood for, under another: each move searched
-    // the parent's 100,000 children, 5e9 comparisons.
+    // the parent's 100,000 children, 5e9 comparisons (1.7-1.9 s against 0.24-0.26 s quiet).  Beside it the same
+    // messages, the second 100,000 under the other parent by ids no reference names, so nothing moves.
     constexpr uint32_t k = 100000;
-    std::vector<io::entry> v;
+    std::vector<io::entry> v, still;
     v.reserve(2 * k);
+    still.reserve(2 * k);
     for (uint32_t i = 1; i <= k; ++i)
+    {
         v.push_back(make(i, "Subject: p\r\nMessage-ID: <m" + std::to_string(i) + "@t>\r\nReferences: <p@t> <c" +
                                 std::to_string(i) + "@t>\r\n"));
+        still.push_back(v.back());
+    }
     for (uint32_t i = 1; i <= k; ++i)
+    {
         v.push_back(make(k + i, "Subject: q\r\nMessage-ID: <c" + std::to_string(i) + "@t>\r\nReferences: <q@t>\r\n"));
-    auto t0 = thread_cpu_now();
-    const std::string t = io::references(v);
-    const double moved = std::chrono::duration<double>(thread_cpu_now() - t0).count();
-    MESSAGE("THREAD of 100,000 children moved off one parent: " << moved << " s of CPU");
-    CHECK(moved < 0.75);
-    CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
+        still.push_back(make(k + i, "Subject: q\r\nMessage-ID: <d" + std::to_string(i) + "@t>\r\nReferences: <q@t>\r\n"));
+    }
+    const auto [moved, t] = ratio(v, still, "THREAD of 100,000 children moved off one parent");
+    CHECK(moved < 3);
     // The parent q holds every c, each its m: none is left under p, which is then no thread of its own.
     CHECK(t.find("(" + std::to_string(k + 1) + " " + "1)") != std::string::npos);
     CHECK(t.find(" " + std::to_string(k + 1) + " ") == std::string::npos);
 
-    // 100,000 subjects of two messages each: each pair's thread replaced its first in a list searched whole.
-    std::vector<io::entry> w;
+    // 100,000 subjects of two messages each: each pair's thread replaced its first in a list searched whole (1.6-1.8 s
+    // against 0.28-0.30 s quiet).  Beside it 200,000 subjects of one.
+    std::vector<io::entry> w, single;
     w.reserve(200000);
+    single.reserve(200000);
     for (uint32_t i = 1; i <= 100000; ++i)
         for (uint32_t j = 0; j < 2; ++j)
-            w.push_back(make(2 * i - 1 + j, "Subject: s" + std::to_string(i) + "\r\nMessage-ID: <s" + std::to_string(i) +
-                                                "-" + std::to_string(j) + "@t>\r\n"));
-    t0 = thread_cpu_now();
-    const std::string u = io::references(w);
-    const double gathered = std::chrono::duration<double>(thread_cpu_now() - t0).count();
-    MESSAGE("THREAD of 100,000 subjects of two: " << gathered << " s of CPU");
-    CHECK(gathered < 0.75);
+        {
+            const std::string id = std::to_string(i) + "-" + std::to_string(j);
+            w.push_back(make(2 * i - 1 + j, "Subject: s" + std::to_string(i) + "\r\nMessage-ID: <s" + id + "@t>\r\n"));
+            single.push_back(make(2 * i - 1 + j, "Subject: s" + id + "\r\nMessage-ID: <s" + id + "@t>\r\n"));
+        }
+    const auto [gathered, u] = ratio(w, single, "THREAD of 100,000 subjects of two");
+    CHECK(gathered < 3);
     CHECK(u.starts_with("((1)(2))((3)(4))"));
 }
 
