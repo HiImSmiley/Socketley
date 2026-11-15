@@ -20,6 +20,8 @@
 //     and DATA only on a stream the client opened.
 //   * What the client's frames make this side queue of its own (acks, resets, updates, GOAWAY) is bounded by how
 //     many frames it sent, so a peer that does not read cannot grow the queue faster than it writes.
+//   * Nothing of a stream is written after a GOAWAY for an error: the connection is over (RFC 9113 5.4.1), and the
+//     storage went on sending a file behind one.
 
 #include <algorithm>
 #include <memory>
@@ -233,6 +235,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
     // Whole frames a server sends, DATA within the client's windows and on its streams alone.
     uint64_t data_out = 0;
+    bool over = false;
     for (std::string_view w = wire; !w.empty();)
     {
         FUZZ_CHECK(w.size() >= h2::head_len, "a frame written with no whole head");
@@ -246,6 +249,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
             FUZZ_CHECK(h.opened.count(f.sid) == 1, "an answer on a stream the client never opened");
         if (f.type == h2::DATA)
             data_out += f.len;
+        if (f.type == h2::DATA || f.type == h2::HEADERS || f.type == h2::CONTINUATION)
+            FUZZ_CHECK(!over, "a stream's frame written after a GOAWAY for an error");
+        if (f.type == h2::GOAWAY && f.len >= 8 && h2::rd32(w.data() + h2::head_len + 4) != h2::NO_ERROR)
+            over = true;
         w.remove_prefix(h2::head_len + f.len);
     }
     FUZZ_CHECK(data_out <= client.credit, "more DATA sent than the windows the client gave");
