@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <charconv>
+#include <chrono>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -4069,6 +4070,42 @@ bool mail_run::learn(const std::string& user, const std::string& key, uint64_t s
     return true;
 }
 
+// One write a line, so the lines of shards writing at once are each whole.  The journal is opened for each line,
+// and the first shard's fold renames it to .folding and reads that at once: a line written to a journal opened
+// before the rename and written after the read would be in a file already read, lost from the table and, once the
+// fold removed that file, from disk as well.  So the file written to is checked to be the one still at the path
+// once the line is in it, and where it is not, the line goes again into the journal there now: in the same file,
+// any rename comes after the write and the fold reads the line; in another, it may have read it or not, and a line
+// learned twice is learned once.
+static bool append_learned(const std::string& path, std::string_view line, bool other_shard)
+{
+    for (int tries = 0; tries < 8; ++tries)
+    {
+        const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0)
+            return false;
+        struct stat mine{}, now{};
+        // A test aid: a shard other than the first, the journal it opened holding lines already, writes only once
+        // the first shard folded that journal and removed it.
+        static const int64_t hold_ms = settings::number<int64_t>("SOCKETLEY_MAIL_BAYES_HOLD_MS").value_or(0);
+        if (hold_ms > 0 && other_shard && tries == 0 && ::fstat(fd, &mine) == 0 && mine.st_size > 0)
+        {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms);
+            while (::fstat(fd, &mine) == 0 && mine.st_nlink > 0 && std::chrono::steady_clock::now() < end)
+                ::usleep(1000);
+            LOG_INFO(mine.st_nlink ? "mail: a learned line held past its deadline"
+                                   : "mail: a learned line held until its journal was folded");
+        }
+        const bool written = socketley::write_all(fd, line.data(), line.size());
+        const bool moved = written && ::fstat(fd, &mine) == 0 &&
+                           (::stat(path.c_str(), &now) != 0 || now.st_ino != mine.st_ino || now.st_dev != mine.st_dev);
+        ::close(fd);
+        if (!moved)
+            return written;
+    }
+    return true;
+}
+
 void mail_run::pump_learning()
 {
     while (m_imap && m_learning < 8 && !m_learn_queue.empty())
@@ -4092,13 +4129,9 @@ void mail_run::pump_learning()
                               if (!*alive)
                                   return;
                               --m_learning;
-                              // One write a line, so the lines of shards writing at once are each whole.
-                              const std::string path = mail_bayes_path(m_owner.get_name()) + ".journal";
-                              const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
-                              if (fd >= 0 && socketley::write_all(fd, line->data(), line->size()))
+                              if (append_learned(mail_bayes_path(m_owner.get_name()) + ".journal", *line,
+                                                 m_owner.get_shard_index() != 0))
                                   ++m_bayes_learned;
-                              if (fd >= 0)
-                                  ::close(fd);
                               pump_learning();
                           });
         }, false);

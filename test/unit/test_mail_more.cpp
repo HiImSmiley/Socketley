@@ -603,6 +603,28 @@ TEST_CASE("bayes: the table survives its file and its journal's lines, a line cu
     CHECK(none.words() == 0);
 }
 
+TEST_CASE("bayes: a restart reads the file, the folding file and the journal, a line in two of them learned once")
+{
+    // A line a shard wrote again into the new journal, the one it wrote first having gone into the folding file, and
+    // the folding file a fold before got into the file: the table as a restart reads it counts each message once, and
+    // a message said otherwise later as said last.
+    const auto t = spam_tokens(sample_mail("offer", "cheap pills"));
+    bayes b;
+    b.apply(bayes::line(1, true, t));
+    const std::string path = std::filesystem::temp_directory_path() / ("bayes-restart-" + std::to_string(::getpid()));
+    std::string why;
+    REQUIRE(b.save(path, why));
+    const std::string folding = bayes::line(1, true, t) + bayes::line(2, true, t) + bayes::line(3, true, t);
+    const std::string journal = bayes::line(2, true, t) + bayes::line(3, false, t) + bayes::line(4, true, t);
+    bayes back;
+    REQUIRE(back.load(path, why));
+    back.apply(folding);
+    back.apply(journal);
+    CHECK(back.spam_learned() == 3);
+    CHECK(back.ham_learned() == 1);
+    std::filesystem::remove(path);
+}
+
 TEST_CASE("sasl: XOAUTH2 and OAUTHBEARER give their user and token, and anything else none")
 {
     std::string user, token;
