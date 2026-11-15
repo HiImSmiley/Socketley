@@ -1,5 +1,6 @@
-// lib_db_put_load <port> <connections> <seconds> <bearer>: one PUT outstanding on each connection to a db runtime, the
-// next sent as its answer arrives, for the given time; prints how many answers each status had, "201:n 503:m".
+// lib_db_put_load <port> <connections> <seconds> <bearer> [answers]: one PUT outstanding on each connection to a db
+// runtime, the next sent as its answer arrives, for the given time -- or, given a number of answers, until that many
+// came, the time then only the most it waits; prints how many answers each status had, "201:n 503:m".
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -24,6 +25,7 @@ struct conn
 };
 
 static long counts[600];
+static long answered, enough;
 static const char* bearer;
 
 static double now(void)
@@ -72,8 +74,11 @@ static int drain(struct conn* c)
         const int status = atoi(c->buf + 9);
         if (status > 0 && status < 600)
             counts[status]++;
+        answered++;
         memmove(c->buf, c->buf + whole, c->have - whole);
         c->have -= whole;
+        if (enough && answered >= enough)
+            continue;
         if (send_put(c) < 0)
             return -1;
     }
@@ -81,8 +86,9 @@ static int drain(struct conn* c)
 
 int main(int argc, char** argv)
 {
-    if (argc != 5)
+    if (argc != 5 && argc != 6)
         return 2;
+    enough = argc == 6 ? atol(argv[5]) : 0;
     const int port = atoi(argv[1]), n = atoi(argv[2]);
     const double secs = atof(argv[3]);
     bearer = argv[4];
@@ -109,7 +115,7 @@ int main(int argc, char** argv)
     const double end = now() + secs;
     struct epoll_event evs[MAXC];
     long closed = 0;
-    while (now() < end)
+    while (now() < end && !(enough && answered >= enough))
     {
         const int k = epoll_wait(ep, evs, MAXC, 200);
         for (int j = 0; j < k; ++j)

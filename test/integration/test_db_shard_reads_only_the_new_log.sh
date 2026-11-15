@@ -8,6 +8,10 @@
 #     the writes, so every request and every answer on a reading shard read a mebibyte of zeros, and a sharded
 #     database's writes cost several times the CPU of one shard's; counted as the bytes the workers read per write,
 #     which a busy box cannot blur
+#
+# The writes are a number, 1500, not what three seconds hold: at load 20-30 three seconds held 444 to 784 of them, and
+# a check that more than a thousand came measured the box.  What is held is per write, so it needs enough of them to
+# make the reads between writes small, not that they came fast.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -44,14 +48,14 @@ workers=$(pgrep -P "$SOCKETLEY_DPID" | tr '\n' ' ')
 rchar() { for p in $workers; do awk '/^rchar:/ {print $2}' "/proc/$p/io" 2>/dev/null; done | awk '{s += $1} END {print s + 0}'; }
 
 r0=$(rchar)
-out=$("$T/load" "$P" 16 3 readsecret0123456789)
+out=$("$T/load" "$P" 16 120 readsecret0123456789 1500)
 r1=$(rchar)
 written=$(echo "$out" | tr ' ' '\n' | awk -F: '$1 ~ /^2/ {s += $2} END {print s + 0}')
 refused=$(echo "$out" | tr ' ' '\n' | awk -F: '$1 !~ /^2/ {s += $2} END {print s + 0}')
 per=$(( written > 0 ? (r1 - r0) / written : 0 ))
 echo "  $written writes answered ($out), the workers read $(( (r1 - r0) >> 10 )) KiB: $per bytes a write"
-[ "$written" -gt 1000 ] && [ "$refused" -eq 0 ] && ok \
-    || bad "the writes reach the database" "$written answered, $refused otherwise: $out"
+[ "$written" -ge 1500 ] && [ "$refused" -eq 0 ] && ok \
+    || bad "1500 writes reach the database within two minutes" "$written answered, $refused otherwise: $out"
 # A write is a few hundred bytes on the wire and in the log, read by three reading shards; a window of the room is a
 # mebibyte a look.
 [ "$per" -gt 0 ] && [ "$per" -lt 32768 ] && ok \
