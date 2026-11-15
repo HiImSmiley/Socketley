@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -26,10 +27,44 @@ constexpr size_t max_work = size_t{1} << 22;
 
 enum class verdict : uint8_t { ok, no, broken };
 
+// Whether a number from_chars found out of a double's range is past the largest one rather than nearer 0 than the
+// least: by the decimal exponent of its first digit that is not 0, which is far from 0 either way.
+bool past_largest(std::string_view s)
+{
+    if (!s.empty() && s[0] == '-')
+        s.remove_prefix(1);
+    const size_t e = std::min(s.find_first_of("eE"), s.size());
+    const std::string_view mantissa = s.substr(0, e);
+    const size_t point = std::min(mantissa.find('.'), mantissa.size());
+    const size_t first = mantissa.find_first_not_of("0.");
+    if (first == std::string_view::npos)
+        return false;
+    long long at = first < point ? static_cast<long long>(point - first) - 1 : -static_cast<long long>(first - point);
+    if (e < s.size())
+    {
+        std::string_view x = s.substr(e + 1);
+        const bool down = !x.empty() && x[0] == '-';
+        if (!x.empty() && (x[0] == '-' || x[0] == '+'))
+            x.remove_prefix(1);
+        long long n = 0;
+        for (const char c : x)
+            n = std::min(n * 10 + (c - '0'), 1'000'000'000'000LL);
+        at += down ? -n : n;
+    }
+    return at >= 0;
+}
+
 double number(const jv& v)
 {
     double d = 0;
-    std::from_chars(v.s.data(), v.s.data() + v.s.size(), d);
+    // from_chars leaves d as it was for a number past a double's range, so 1e400 would be 0: under every maximum, an
+    // integer, and equal to 0. It is past every finite bound instead, or nearer 0 than any number but 0.
+    if (std::from_chars(v.s.data(), v.s.data() + v.s.size(), d).ec == std::errc::result_out_of_range)
+    {
+        d = past_largest(v.s) ? HUGE_VAL : std::numeric_limits<double>::denorm_min();
+        if (!v.s.empty() && v.s[0] == '-')
+            d = -d;
+    }
     return d;
 }
 
@@ -100,7 +135,12 @@ struct checker
         {
             case kind::null: return true;
             case kind::boolean: return a.b == b.b;
-            case kind::number: return a.s == b.s || number(a) == number(b);
+            case kind::number:
+            {
+                // Two numbers past a double's range are not the same for being both infinite here.
+                const double x = number(a), y = number(b);
+                return a.s == b.s || (std::isfinite(x) && x == y);
+            }
             case kind::string: return a.s == b.s;
             case kind::array:
                 if (a.items.size() != b.items.size())
@@ -356,8 +396,10 @@ struct checker
             {
                 if (!(step > 0))
                     return broken("has a multipleOf that is not above 0");
+                // Only 0 is a multiple of a number past every double; x / step would make any finite x one.
                 const double q = x / step;
-                if (!std::isfinite(q) || std::fabs(q - std::round(q)) > 1e-9 * std::max(1.0, std::fabs(q)))
+                if (std::isfinite(step) ? !std::isfinite(q) || std::fabs(q - std::round(q)) > 1e-9 * std::max(1.0, std::fabs(q))
+                                        : x != 0)
                     return no(where, "is no multiple of " + js::written(*js::member(schema, "multipleOf")));
             }
         }

@@ -33,6 +33,7 @@ namespace {
 // range, a list's length and kind, and a member held by reference.
 constexpr std::string_view typed_schema = R"({"type":"object","required":["path"],"additionalProperties":false,
 "properties":{"path":{"type":"string","pattern":"^[a-z0-9/]{1,64}$"},"count":{"type":"integer","minimum":1,"maximum":100},
+"offset":{"type":"integer","minimum":0,"maximum":10},
 "mode":{"enum":["r","w"]},"tags":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":16}},
 "opts":{"$ref":"#/$defs/opts"}},"$defs":{"opts":{"type":"object","additionalProperties":false,
 "properties":{"deep":{"type":"boolean"}}}}})";
@@ -57,6 +58,14 @@ bool typed_by_hand(const js::jvalue& a)
                 return false;
             const double d = std::strtod(v.s.c_str(), nullptr);
             if (!(d >= 1 && d <= 100) || std::floor(d) != d)
+                return false;
+        }
+        else if (name == "offset")
+        {
+            if (v.k != k::number)
+                return false;
+            const double d = std::strtod(v.s.c_str(), nullptr);
+            if (!(d >= 0 && d <= 10) || std::floor(d) != d)
                 return false;
         }
         else if (name == "mode")

@@ -352,3 +352,37 @@ TEST_CASE("the input schema's keywords")
     CHECK(!admits(R"({"if":{"properties":{"k":{"const":1}}},"then":{"required":["v"]}})", R"({"k":1})"));
     CHECK(admits(R"({"if":{"properties":{"k":{"const":1}}},"then":{"required":["v"]}})", R"({"k":2})"));
 }
+
+TEST_CASE("a number past a double's range is held to the bounds as the number it is, not as 0")
+{
+    const auto admits = [](const std::string& schema, const std::string& value) {
+        js::jvalue v;
+        js::json_policy any;
+        any.object_root = false;
+        REQUIRE(js::json_reader(value, any).document(v));
+        std::string why;
+        return schema_admits(schema, v, why);
+    };
+    const std::string range = R"({"type":"integer","minimum":0,"maximum":10})";
+    CHECK(admits(range, "3"));
+    for (const char* past : {"1e400", "-1e400", "1E+999", "1e-400", "-1e-400",
+                             "100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                             "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                             "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                             "0000000000000000000000"})
+    {
+        CAPTURE(past);
+        CHECK(!admits(range, past));
+        CHECK(!admits(R"({"enum":[0]})", past));
+        CHECK(!admits(R"({"const":0})", past));
+    }
+    CHECK(!admits(R"({"maximum":1e308})", "1e400"));
+    CHECK(!admits(R"({"minimum":-1e308})", "-1e400"));
+    CHECK(!admits(R"({"maximum":0})", "1e-400"));
+    CHECK(admits(R"({"exclusiveMinimum":0})", "1e-400"));
+    CHECK(!admits(R"({"minimum":0})", "-1e-400"));
+    // A bound past the range is one too: no finite number is above it, and only 0 is a multiple of it.
+    CHECK(!admits(R"({"minimum":1e400})", "1e308"));
+    CHECK(admits(R"({"maximum":1e400})", "1e308"));
+    CHECK(!admits(R"({"multipleOf":1e400})", "5"));
+}
