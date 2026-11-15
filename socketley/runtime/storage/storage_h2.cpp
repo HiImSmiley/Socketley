@@ -409,7 +409,8 @@ void storage_run::h2_stream_out(const std::shared_ptr<conn>& c, std::string data
     conn* parent = c->h2_parent;
     h2_session& s = *parent->h2;
     h2_stream& st = *c->h2s;
-    if (st.reset || st.local_closed)
+    // Nothing more is framed once the session has sent GOAWAY for an error, as drain() sends nothing of it.
+    if (st.reset || st.local_closed || s.dying)
         return;
     h2::frame_answer(s, st, std::move(data));
     c->last_progress = std::chrono::steady_clock::now();
@@ -519,6 +520,9 @@ void storage_run::h2_go_on(const std::shared_ptr<conn>& sc)
             return;
     }
     else if (!sc->h2s || !sc->h2s->hdr.empty() || sc->h2s->tx_left() || sc->h2s->os == h2_stream::out_state::head)
+        return;
+    // A stream of a session that sent GOAWAY for an error reads no next piece of its file: none of it would be sent.
+    else if (sc->h2_parent && sc->h2_parent->h2 && sc->h2_parent->h2->dying)
         return;
     const conn::after_kind next = sc->after_write;
     sc->after_write = conn::after_kind::none;

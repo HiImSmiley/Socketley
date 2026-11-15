@@ -238,6 +238,15 @@ void drain(session<S>& s, std::string& out, size_t unsent_now, size_t out_high, 
     const size_t start = out.size();
     out += s.ctl;
     s.ctl.clear();
+    // A session that sent GOAWAY for an error sends its own frames and nothing of its streams: the connection closes
+    // once that GOAWAY is out (RFC 9113 5.4.1), and a stream that went on being framed kept the connection from ever
+    // being flushed -- the storage sent the rest of a 64 MiB file, 31 MB of DATA, after the GOAWAY a peer's broken
+    // frame had drawn (the class of nghttp2's CVE-2026-27135).
+    if (s.dying)
+    {
+        s.rr.clear();
+        return;
+    }
     while (!s.rr.empty() && unsent_now + (out.size() - start) < out_high)
     {
         const uint32_t sid = s.rr.front();

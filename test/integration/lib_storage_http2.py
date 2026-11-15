@@ -266,6 +266,50 @@ check("streams opened and reset by the hundred end the connection with ENHANCE_Y
 cont = frame(4, 0, 0) + frame(1, 0, 1, hblock) + b"".join(frame(9, 0, 1, b"\x40\x01a\x01b") for _ in range(200))
 check("CONTINUATIONs without end are ENHANCE_YOUR_CALM", goaway_code(raw(cont, 3)) == 11)
 
+# ── nothing after a connection error ─────────────────────────────────────────
+# A GET with every window open; after its first DATA a PING on a stream, which is the connection's error.  The GOAWAY
+# that draws must be the last frame of the connection: the storage went on sending the rest of the file behind it.
+c = Client()
+huge = os.urandom(32 << 20)
+sid = c.request("PUT", "/%s/huge" % BUCKET, huge, end=False)
+c.send_body(sid, huge)
+c.pump(lambda: sid in c.ended, 60)
+c.close()
+s = socket.create_connection(("127.0.0.1", PORT), 10)
+path = ("/%s/huge" % BUCKET).encode()
+get = b"\x82\x86\x44" + bytes([len(path)]) + path + b"\x41\x09127.0.0.1"
+s.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0, b"\x00\x04\x7f\xff\xff\xff") +
+          frame(8, 0, 0, (2**31 - 1 - 65535).to_bytes(4, "big")) + frame(1, 0x5, 1, get))
+s.settimeout(2)
+pending, before, after, frames_after, code, sent_bad, closed = b"", 0, 0, 0, None, False, False
+end = time.time() + 20
+while time.time() < end:
+    try:
+        d = s.recv(1 << 20)
+    except socket.timeout:
+        break
+    if not d:
+        closed = True
+        break
+    pending += d
+    while len(pending) >= 9 and len(pending) >= 9 + int.from_bytes(pending[:3], "big"):
+        n = int.from_bytes(pending[:3], "big")
+        ftype, pl, pending = pending[3], pending[9:9 + n], pending[9 + n:]
+        if ftype == 7:
+            code = int.from_bytes(pl[4:8], "big")
+        elif ftype == 0 and code is not None:
+            after += n
+            frames_after += 1
+        elif ftype == 0:
+            before += n
+    if before and not sent_bad:
+        s.sendall(frame(6, 0, 1, b"12345678"))
+        sent_bad = True
+s.close()
+check("a connection error's GOAWAY is the last frame: no DATA follows it", code == 1 and frames_after == 0,
+      "goaway %s, %d DATA frames (%d bytes) after it, %d before" % (code, frames_after, after, before))
+check("and the connection is closed behind it", closed)
+
 c = Client()
 sid = c.request("GET", "/%s/side1" % BUCKET)
 c.pump(lambda: sid in c.ended, 10)
