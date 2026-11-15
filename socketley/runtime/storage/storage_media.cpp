@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -294,6 +295,34 @@ std::string ffprobe_path(const std::string& ffmpeg)
             return beside;
     }
     return search_path("ffprobe");
+}
+
+// What one ffmpeg may take of the machine, set the moment it is started, ahead of its reading the object: a crafted
+// medium that has a decoder ask for all the memory there is ends that ffmpeg and not the daemon, and it is the first
+// the kernel ends when memory runs out. What it writes is bounded by its job's time and by eviction after, since a
+// medium larger than the whole cache is still made and served once.
+void fence_ffmpeg(pid_t pid)
+{
+    static const rlim_t data = [] {
+        uint64_t mb = 0;
+        if (const auto v = settings::number<uint64_t>("SOCKETLEY_MEDIA_MEMORY_MB"))
+            mb = *v;
+        else
+        {
+            const long pages = ::sysconf(_SC_PHYS_PAGES), page = ::sysconf(_SC_PAGESIZE);
+            mb = pages > 0 && page > 0 ? (static_cast<uint64_t>(pages) * static_cast<uint64_t>(page)) >> 21 : 4096;
+            mb = std::max<uint64_t>(mb, 1024);
+        }
+        return mb == 0 ? RLIM_INFINITY : static_cast<rlim_t>(std::min<uint64_t>(mb, UINT64_MAX >> 21) << 20);
+    }();
+    const rlimit d{data, data};
+    if (::prlimit(pid, RLIMIT_DATA, &d, nullptr) != 0) {}
+    const std::string path = "/proc/" + std::to_string(pid) + "/oom_score_adj";
+    if (const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC); fd >= 0)
+    {
+        if (::write(fd, "1000", 4) < 0) {}
+        ::close(fd);
+    }
 }
 
 // The demuxers an object is read with, each of one file, so that none (hls, dash, concat, imf, vobsub) opens a URL the
@@ -1135,6 +1164,7 @@ bool storage_run::media_hw_test(bool low_power)
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0)
         return false;
+    fence_ffmpeg(pid);
     media_job j;
     j.pid = pid;
     j.want.kind = k_hwtest;
@@ -2064,6 +2094,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
     posix_spawnattr_destroy(&attr);
     if (rc != 0)
         return false;
+    fence_ffmpeg(pid);
     if (src_fd >= 0)
         ++m_c.media_direct;
     if (j.gpu)

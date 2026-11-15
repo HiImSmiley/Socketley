@@ -136,6 +136,8 @@ inline constexpr setting table[] = {
      "where renditions are encoded: off, or a render node"},
     {"SOCKETLEY_MEDIA_CACHE_MB", kind::number, audience::tuning, 0, no_max, "10240",
      "MiB of made media past which the least asked for go"},
+    {"SOCKETLEY_MEDIA_MEMORY_MB", kind::number, audience::tuning, 0, no_max, "half the machine's memory, 1024 at least",
+     "MiB of memory one ffmpeg a storage starts may take, 0 for no bound; it is also the first the kernel ends when memory runs out"},
 
     // ─── cluster ───
     {"SOCKETLEY_RAFT_TICK_MS", kind::number, audience::tuning, 1, std::numeric_limits<uint32_t>::max(), "100",

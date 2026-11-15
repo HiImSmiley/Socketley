@@ -25820,6 +25820,14 @@ it is being made.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_MEDIA_MEMORY_MB
+Sets the memory in MiB that each ffmpeg a storage runtime starts may take (its data size), 0 for no bound.
+Default: half the machine's memory, 1024 at least.
+Each such ffmpeg is also the first process the kernel ends when memory runs out, so a crafted medium costs its
+own job and not the daemon.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_CACHE_TTL_SWEEP_MS
 Sets the interval in milliseconds between periodic sweeps for expired cache
 keys.
