@@ -13,6 +13,11 @@
 #                          bound), resumes from L on every reconnect -- whichever shard the kernel hands it to, the
 #                          one it was on or a sibling that never held a stream -- with the next change and no reset
 #   * the history then     while that stream was near, the shards kept more than the idle bound
+#
+# The writes go eight at a time, one on each connection, and the database's files live on tmpfs where there is one:
+# one at a time, each waiting out its own sync of a disk shared with builds and other tests, 3,000 of them took past
+# the client's two minutes at load 20-30 -- every one of eight runs side by side red at "3 MiB of writes are taken",
+# which is the disk, not what is kept.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -30,7 +35,14 @@ command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit
 daemon_isolate dbhistory
 P=$((SL_PORT_BASE + 1740))
 T=$(mktemp -d /tmp/skl-dbhist-XXXXXX)
-trap '"$BIN" stop dh >/dev/null 2>&1; sleep 0.3; "$BIN" remove dh >/dev/null 2>&1; daemon_stop; rm -rf "$T"' EXIT
+# The daemon's state, the database's files with it, on tmpfs when the box has one.
+SHM=""
+if [ "$(stat -f -c %T /dev/shm 2>/dev/null)" = tmpfs ] && [ -w /dev/shm ]; then
+    SHM=$(mktemp -d /dev/shm/socketley-dbhistory-XXXXXX); export HOME="$SHM/home"; mkdir -p "$HOME"
+else
+    echo "  note: no tmpfs, so the writes wait for the disk's syncs"
+fi
+trap '"$BIN" stop dh >/dev/null 2>&1; sleep 0.3; "$BIN" remove dh >/dev/null 2>&1; daemon_stop; rm -rf "$T"; [ -n "$SHM" ] && rm -rf "$SHM"' EXIT
 printf 'items private\n' > "$T/schema"
 printf 'backend histsecret0123456789\n' > "$T/keys"
 chmod 600 "$T/keys"
@@ -46,22 +58,26 @@ AUTH = "Bearer histsecret0123456789"
 BODY = "x" * 1000
 
 def put_many(first, count):
-    # Keep-alive connections of their own, so the writes reach both shards.
-    socks = [socket.create_connection(("127.0.0.1", port), timeout=10) for _ in range(8)]
-    for i in range(first, first + count):
-        s = socks[i % len(socks)]
-        body = json.dumps({"n": i, "pad": BODY}).encode()
-        s.sendall(b"PUT /c/items/d%d HTTP/1.1\r\nHost: x\r\nAuthorization: %s\r\nContent-Type: application/json\r\n"
-                  b"Content-Length: %d\r\n\r\n%s" % (i, AUTH.encode(), len(body), body))
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            buf += s.recv(65536)
-        head, rest = buf.split(b"\r\n\r\n", 1)
-        n = int([l.split(b":")[1] for l in head.split(b"\r\n") if l.lower().startswith(b"content-length")][0])
-        while len(rest) < n:
-            rest += s.recv(65536)
-        if not head.startswith(b"HTTP/1.1 20"):
-            print("refused", i, head[:40]); return
+    # Keep-alive connections of their own, so the writes reach both shards; one write on each at a time, all eight
+    # sent before any answer is waited for, so they share the syncs as a client of eight connections' do.
+    socks = [socket.create_connection(("127.0.0.1", port), timeout=30) for _ in range(8)]
+    for wave in range(first, first + count, len(socks)):
+        sent = []
+        for s, i in zip(socks, range(wave, min(wave + len(socks), first + count))):
+            body = json.dumps({"n": i, "pad": BODY}).encode()
+            s.sendall(b"PUT /c/items/d%d HTTP/1.1\r\nHost: x\r\nAuthorization: %s\r\nContent-Type: application/json\r\n"
+                      b"Content-Length: %d\r\n\r\n%s" % (i, AUTH.encode(), len(body), body))
+            sent.append((s, i))
+        for s, i in sent:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += s.recv(65536)
+            head, rest = buf.split(b"\r\n\r\n", 1)
+            n = int([l.split(b":")[1] for l in head.split(b"\r\n") if l.lower().startswith(b"content-length")][0])
+            while len(rest) < n:
+                rest += s.recv(65536)
+            if not head.startswith(b"HTTP/1.1 20"):
+                print("refused", i, head[:40]); return
     print("put", count)
 
 def touch():
