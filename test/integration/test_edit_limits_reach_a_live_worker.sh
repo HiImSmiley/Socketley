@@ -59,6 +59,9 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_ports.sh"
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
+# ready_tcp, the wait for the cache's port below: without it the call was "command not found", which its
+# `|| true` hid, and the cache was asked before anyone knew it listened.
+. "$HERE/lib_ready.sh"
 
 echo "=== Integration: edit delivers limits live and defers the rest ==="
 
