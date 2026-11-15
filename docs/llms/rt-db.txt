@@ -58,7 +58,7 @@ Every flag a db runtime takes, by group.
 | `--keys` | path | Keys: Service keys a backend sends as Authorization: Bearer, one name and secret per line. |
 | `--idp` | text | Identity provider: The idp runtime whose accounts own documents and sign in by its cookie or access tokens. |
 | `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. |
-| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in; * lets any page call it, without the sign-in. |
+| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in, each whole as a browser sends it (never null); * lets any page call it, without the sign-in. |
 | `--max-bytes` | size | Quota: The most bytes the documents hold. |
 | `--cache` | size | Cache: Memory for the documents read most recently; the rest are read from disk. |
 

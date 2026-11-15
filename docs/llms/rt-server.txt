@@ -110,7 +110,7 @@ Every flag a server runtime takes, by group.
 | `--master-pw` | text | Master password: The password that claims master mode. |
 | `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. |
 | `--cache` | text | Cache: A cache runtime its scripts and clients use. |
-| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it; * for any. |
+| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it, each whole as a browser sends it (never null); * for any. |
 | `-u` (--upstream) | list | Upstreams: Servers it relays to, host:port each. |
 
 ## Benchmarks

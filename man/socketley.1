@@ -4877,6 +4877,12 @@ The list is comma\-separated, such as
 .BR https://app.example.com .
 .B *
 admits any origin.
+Each origin is written whole, as a browser sends it: a scheme, a host and an
+optional port, with no path and no pattern.
+A list naming
+.B null
+is refused: every sandboxed page, file and data: page sends that origin alike,
+so naming it would let any site in.
 .IP
 The server refuses a handshake whose
 .B Origin
@@ -16494,6 +16500,12 @@ The web origins a browser may call the database from, comma\-separated. They
 are answered with CORS and the browser's sign-in.
 .B *
 allows any page, without the sign-in.
+Each origin is written whole, as a browser sends it: a scheme, a host and an
+optional port, with no path and no pattern.
+A list naming
+.B null
+is refused: every sandboxed page, file and data: page sends that origin alike,
+so naming it would let any site in.
 .TP
 .BI "\-\-max\-bytes " size
 The most the documents may hold. A write past it is refused with 507.
@@ -18007,7 +18019,14 @@ A change that only the cookie authorizes must carry the page's
 .B X\-Socketley\-UI
 header, which another site cannot make a browser send.
 No other origin can read the answer to a request that the cookie signs.
-A message's HTML is cleaned of anything that runs, submits or reaches out.
+A message's HTML keeps only what an allowlist names: text, tables, lists,
+links, images and CSS.
+SVG, MathML, forms, frames, media and scripts are taken out.
+A link goes to the web, to a mail address or a telephone number, and opens
+apart; one to another scheme or to the page's own origin is no link.
+An image comes from the message itself or, once asked for, from the web,
+never from the page's own origin.
+What is cleaned is cleaned again until it parses into what was checked.
 It is shown in a frame sandboxed without scripts.
 Its remote images wait until the reader asks for them, either for that message
 or for its sender from then on.
@@ -19314,6 +19333,12 @@ is answered
 as the revision requires of every server.
 A client that is not a browser sends no
 .BR Origin .
+Each origin is written whole, as a browser sends it: a scheme, a host and an
+optional port, with no path and no pattern.
+A list naming
+.B null
+is refused: every sandboxed page, file and data: page sends that origin alike,
+so naming it would let any site in.
 .TP
 .BI "\-\-idp " runtime
 The idp runtime whose users sign in to this runtime, in the way the MCP revisions specify for a client.

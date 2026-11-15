@@ -75,7 +75,7 @@ constexpr row rows[] = {
     {"--master-pw", "S", "text", "Master password", "The password that claims master mode.", "Server"},
     {"--no-master-pw", "S", "switch", "No master password", "Take the master password away, which ends master mode.", "Server"},
     {"--cache", "S", "text", "Cache", "A cache runtime its scripts and clients use.", "Server", {}, "store"},
-    {"--origins", "S", "list", "Web origins", "Other web origins whose pages may open a WebSocket to it; * for any.", "Server", {}, "https://app.example.com"},
+    {"--origins", "S", "list", "Web origins", "Other web origins whose pages may open a WebSocket to it, each whole as a browser sends it (never null); * for any.", "Server", {}, "https://app.example.com"},
     {"-u", "S", "list", "Upstreams", "Servers it relays to, host:port each.", "Server", {}, "10.0.0.5:9000", "--upstream"},
 
     // ── client ──────────────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ constexpr row rows[] = {
     {"--keys", "B", "path", "Keys", "Service keys a backend sends as Authorization: Bearer, one name and secret per line.", "Database", {}, "/etc/socketley/db.keys"},
     {"--idp", "B", "text", "Identity provider", "The idp runtime whose accounts own documents and sign in by its cookie or access tokens.", "Database", {}, "auth"},
     {"--idp-audience", "B", "list", "Token clients", "The idp's clients whose access tokens it takes; a token of any other is refused.", "Database", {}, "spa"},
-    {"--origins", "B", "list", "Web origins", "Web origins whose pages may call it with the user's sign-in; * lets any page call it, without the sign-in.", "Database", {}, "https://app.example.com"},
+    {"--origins", "B", "list", "Web origins", "Web origins whose pages may call it with the user's sign-in, each whole as a browser sends it (never null); * lets any page call it, without the sign-in.", "Database", {}, "https://app.example.com"},
     {"--max-bytes", "B", "size", "Quota", "The most bytes the documents hold.", "Database", {}, "2G"},
     {"--cache", "B", "size", "Cache", "Memory for the documents read most recently; the rest are read from disk.", "Database", {}, "256M"},
     {"--replicate", "B", "text", "Copy of", "The http or https address of the database this one follows; a copy answers reads.", "Replication", {}, "https://data.example.com"},
@@ -190,7 +190,7 @@ constexpr row rows[] = {
     // ── metrics ─────────────────────────────────────────────────────────────
     {"--keys", "X", "path", "Keys", "The keys that may call it, one per line: name and secret, plus admin for a key that may change the daemon.", "MCP", {}, "/etc/socketley/mcp.keys"},
     {"--anonymous", "X", "switch", "Anonymous", "Anyone may call it without a key; only for a port no other machine can reach.", "MCP"},
-    {"--origins", "X", "list", "Origins", "The web origins a browser may call it from, or * for any.", "MCP", {}, "https://app.example.com"},
+    {"--origins", "X", "list", "Origins", "The web origins a browser may call it from, each whole as a browser sends it (never null), or * for any.", "MCP", {}, "https://app.example.com"},
     {"--tools", "X", "choice", "Daemon tools", "This daemon's runtimes as tools: listed and read by every key, started and stopped by an admin's.", "MCP", "none,daemon"},
     {"--instructions", "X", "text", "Instructions", "What a client is told the server is for.", "MCP", {}, "Ask about orders."},
     {"--idp", "X", "text", "Identity provider", "The idp runtime whose people sign in, by an access token for https://<first name>/mcp.", "MCP", {}, "auth"},

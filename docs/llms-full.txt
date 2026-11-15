@@ -3030,7 +3030,7 @@ Every flag a db runtime takes, by group.
 | `--keys` | path | Keys: Service keys a backend sends as Authorization: Bearer, one name and secret per line. |
 | `--idp` | text | Identity provider: The idp runtime whose accounts own documents and sign in by its cookie or access tokens. |
 | `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. |
-| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in; * lets any page call it, without the sign-in. |
+| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in, each whole as a browser sends it (never null); * lets any page call it, without the sign-in. |
 | `--max-bytes` | size | Quota: The most bytes the documents hold. |
 | `--cache` | size | Cache: Memory for the documents read most recently; the rest are read from disk. |
 
@@ -3523,7 +3523,7 @@ Every flag a mcp runtime takes, by group.
 |---|---|---|
 | `--keys` | path | Keys: The keys that may call it, one per line: name and secret, plus admin for a key that may change the daemon. |
 | `--anonymous` |  | Anonymous: Anyone may call it without a key; only for a port no other machine can reach. |
-| `--origins` | list | Origins: The web origins a browser may call it from, or * for any. |
+| `--origins` | list | Origins: The web origins a browser may call it from, each whole as a browser sends it (never null), or * for any. |
 | `--tools` | one of none, daemon | Daemon tools: This daemon's runtimes as tools: listed and read by every key, started and stopped by an admin's. |
 | `--instructions` | text | Instructions: What a client is told the server is for. |
 | `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. |
@@ -4078,7 +4078,7 @@ Every flag a server runtime takes, by group.
 | `--master-pw` | text | Master password: The password that claims master mode. |
 | `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. |
 | `--cache` | text | Cache: A cache runtime its scripts and clients use. |
-| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it; * for any. |
+| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it, each whole as a browser sends it (never null); * for any. |
 | `-u` (--upstream) | list | Upstreams: Servers it relays to, host:port each. |
 
 ## Benchmarks
@@ -4682,7 +4682,7 @@ Every flag of every runtime type, with the types that take it.
 | `--master-pw` | text | Master password: The password that claims master mode. Types: server. |
 | `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. Types: server. |
 | `--cache` | text | Cache: A cache runtime its scripts and clients use. Types: server. |
-| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it; * for any. Types: server. |
+| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it, each whole as a browser sends it (never null); * for any. Types: server. |
 | `-u` (--upstream) | list | Upstreams: Servers it relays to, host:port each. Types: server. |
 
 **Client**
@@ -4856,7 +4856,7 @@ Every flag of every runtime type, with the types that take it.
 | `--keys` | path | Keys: Service keys a backend sends as Authorization: Bearer, one name and secret per line. Types: db. |
 | `--idp` | text | Identity provider: The idp runtime whose accounts own documents and sign in by its cookie or access tokens. Types: db. |
 | `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. Types: db. |
-| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in; * lets any page call it, without the sign-in. Types: db. |
+| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in, each whole as a browser sends it (never null); * lets any page call it, without the sign-in. Types: db. |
 | `--max-bytes` | size | Quota: The most bytes the documents hold. Types: db. |
 | `--cache` | size | Cache: Memory for the documents read most recently; the rest are read from disk. Types: db. |
 
@@ -4887,7 +4887,7 @@ Every flag of every runtime type, with the types that take it.
 |---|---|---|
 | `--keys` | path | Keys: The keys that may call it, one per line: name and secret, plus admin for a key that may change the daemon. Types: mcp. |
 | `--anonymous` |  | Anonymous: Anyone may call it without a key; only for a port no other machine can reach. Types: mcp. |
-| `--origins` | list | Origins: The web origins a browser may call it from, or * for any. Types: mcp. |
+| `--origins` | list | Origins: The web origins a browser may call it from, each whole as a browser sends it (never null), or * for any. Types: mcp. |
 | `--tools` | one of none, daemon | Daemon tools: This daemon's runtimes as tools: listed and read by every key, started and stopped by an admin's. Types: mcp. |
 | `--instructions` | text | Instructions: What a client is told the server is for. Types: mcp. |
 | `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. Types: mcp. |
@@ -7221,7 +7221,7 @@ Removes the password from a server that has one. Only **edit** accepts it. This 
 
 ### `--origins list`
 
-Lists the web origins, besides the server's own, whose pages may open a WebSocket to this server. The list is comma-separated, such as **https://app.example.com**. * admits any origin.
+Lists the web origins, besides the server's own, whose pages may open a WebSocket to this server. The list is comma-separated, such as **https://app.example.com**. * admits any origin. Each origin is written whole, as a browser sends it: a scheme, a host and an optional port, with no path and no pattern. A list naming **null** is refused: every sandboxed page, file and data: page sends that origin alike, so naming it would let any site in.
 
 The server refuses a handshake whose **Origin** is not in the list and is not the **Host** the handshake was sent to (or the **X-Forwarded-Host** set by a proxy in front). It answers **403 Forbidden** and closes the connection. This stops a page on another site from driving the server, or the cache linked to it, through the browser of someone who can reach them. A client that sends no **Origin** is not affected, and only browsers send one.
 
@@ -11093,7 +11093,7 @@ The ids of the idp's clients whose access tokens the runtime takes, comma-separa
 
 ### `--origins list`
 
-The web origins a browser may call the database from, comma-separated. They are answered with CORS and the browser's sign-in. * allows any page, without the sign-in.
+The web origins a browser may call the database from, comma-separated. They are answered with CORS and the browser's sign-in. * allows any page, without the sign-in. Each origin is written whole, as a browser sends it: a scheme, a host and an optional port, with no path and no pattern. A list naming **null** is refused: every sandboxed page, file and data: page sends that origin alike, so naming it would let any site in.
 
 ### `--max-bytes size`
 
@@ -11575,7 +11575,7 @@ The entries are objects in the **--storage** bucket under *.dav/***user***/*, ap
 
 The webmail speaks German where the browser asks for it, and English otherwise. It signs in through the idp runtime. The idp's session cookie under its **--cookie-domain** signs the user in to every runtime under that domain at once. A page that is not signed in is sent to the idp's **/login**.
 
-A change that only the cookie authorizes must carry the page's **X-Socketley-UI** header, which another site cannot make a browser send. No other origin can read the answer to a request that the cookie signs. A message's HTML is cleaned of anything that runs, submits or reaches out. It is shown in a frame sandboxed without scripts. Its remote images wait until the reader asks for them, either for that message or for its sender from then on. The page's one script may run only by its hash.
+A change that only the cookie authorizes must carry the page's **X-Socketley-UI** header, which another site cannot make a browser send. No other origin can read the answer to a request that the cookie signs. A message's HTML keeps only what an allowlist names: text, tables, lists, links, images and CSS. SVG, MathML, forms, frames, media and scripts are taken out. A link goes to the web, to a mail address or a telephone number, and opens apart; one to another scheme or to the page's own origin is no link. An image comes from the message itself or, once asked for, from the web, never from the page's own origin. What is cleaned is cleaned again until it parses into what was checked. It is shown in a frame sandboxed without scripts. Its remote images wait until the reader asks for them, either for that message or for its sender from then on. The page's one script may run only by its hash.
 
 On the same port, a JMAP client signs in as on **--jmap**. It may use a password only where the entrance forwarded HTTPS. A client that fails ten times is locked out by the address that the entrance forwards for it.
 
@@ -12108,7 +12108,7 @@ Lets anyone call the runtime without a key. Use it only on a port that only this
 
 ### `--origins list`
 
-The web origins from which a browser may call the runtime, comma-separated, or * for any. A request with any other **Origin** is answered **403**, as the revision requires of every server. A client that is not a browser sends no **Origin**.
+The web origins from which a browser may call the runtime, comma-separated, or * for any. A request with any other **Origin** is answered **403**, as the revision requires of every server. A client that is not a browser sends no **Origin**. Each origin is written whole, as a browser sends it: a scheme, a host and an optional port, with no path and no pattern. A list naming **null** is refused: every sandboxed page, file and data: page sends that origin alike, so naming it would let any site in.
 
 ### `--idp runtime`
 

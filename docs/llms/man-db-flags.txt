@@ -79,7 +79,7 @@ The ids of the idp's clients whose access tokens the runtime takes, comma-separa
 
 ### `--origins list`
 
-The web origins a browser may call the database from, comma-separated. They are answered with CORS and the browser's sign-in. * allows any page, without the sign-in.
+The web origins a browser may call the database from, comma-separated. They are answered with CORS and the browser's sign-in. * allows any page, without the sign-in. Each origin is written whole, as a browser sends it: a scheme, a host and an optional port, with no path and no pattern. A list naming **null** is refused: every sandboxed page, file and data: page sends that origin alike, so naming it would let any site in.
 
 ### `--max-bytes size`
 

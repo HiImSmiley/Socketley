@@ -58,7 +58,7 @@ Removes the password from a server that has one. Only **edit** accepts it. This 
 
 ### `--origins list`
 
-Lists the web origins, besides the server's own, whose pages may open a WebSocket to this server. The list is comma-separated, such as **https://app.example.com**. * admits any origin.
+Lists the web origins, besides the server's own, whose pages may open a WebSocket to this server. The list is comma-separated, such as **https://app.example.com**. * admits any origin. Each origin is written whole, as a browser sends it: a scheme, a host and an optional port, with no path and no pattern. A list naming **null** is refused: every sandboxed page, file and data: page sends that origin alike, so naming it would let any site in.
 
 The server refuses a handshake whose **Origin** is not in the list and is not the **Host** the handshake was sent to (or the **X-Forwarded-Host** set by a proxy in front). It answers **403 Forbidden** and closes the connection. This stops a page on another site from driving the server, or the cache linked to it, through the browser of someone who can reach them. A client that sends no **Origin** is not affected, and only browsers send one.
 

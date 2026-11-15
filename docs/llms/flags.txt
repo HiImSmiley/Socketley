@@ -72,7 +72,7 @@ Every flag of every runtime type, with the types that take it.
 | `--master-pw` | text | Master password: The password that claims master mode. Types: server. |
 | `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. Types: server. |
 | `--cache` | text | Cache: A cache runtime its scripts and clients use. Types: server. |
-| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it; * for any. Types: server. |
+| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it, each whole as a browser sends it (never null); * for any. Types: server. |
 | `-u` (--upstream) | list | Upstreams: Servers it relays to, host:port each. Types: server. |
 
 **Client**
@@ -246,7 +246,7 @@ Every flag of every runtime type, with the types that take it.
 | `--keys` | path | Keys: Service keys a backend sends as Authorization: Bearer, one name and secret per line. Types: db. |
 | `--idp` | text | Identity provider: The idp runtime whose accounts own documents and sign in by its cookie or access tokens. Types: db. |
 | `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. Types: db. |
-| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in; * lets any page call it, without the sign-in. Types: db. |
+| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in, each whole as a browser sends it (never null); * lets any page call it, without the sign-in. Types: db. |
 | `--max-bytes` | size | Quota: The most bytes the documents hold. Types: db. |
 | `--cache` | size | Cache: Memory for the documents read most recently; the rest are read from disk. Types: db. |
 
@@ -277,7 +277,7 @@ Every flag of every runtime type, with the types that take it.
 |---|---|---|
 | `--keys` | path | Keys: The keys that may call it, one per line: name and secret, plus admin for a key that may change the daemon. Types: mcp. |
 | `--anonymous` |  | Anonymous: Anyone may call it without a key; only for a port no other machine can reach. Types: mcp. |
-| `--origins` | list | Origins: The web origins a browser may call it from, or * for any. Types: mcp. |
+| `--origins` | list | Origins: The web origins a browser may call it from, each whole as a browser sends it (never null), or * for any. Types: mcp. |
 | `--tools` | one of none, daemon | Daemon tools: This daemon's runtimes as tools: listed and read by every key, started and stopped by an admin's. Types: mcp. |
 | `--instructions` | text | Instructions: What a client is told the server is for. Types: mcp. |
 | `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. Types: mcp. |

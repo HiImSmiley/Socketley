@@ -27,7 +27,7 @@ Lets anyone call the runtime without a key. Use it only on a port that only this
 
 ### `--origins list`
 
-The web origins from which a browser may call the runtime, comma-separated, or * for any. A request with any other **Origin** is answered **403**, as the revision requires of every server. A client that is not a browser sends no **Origin**.
+The web origins from which a browser may call the runtime, comma-separated, or * for any. A request with any other **Origin** is answered **403**, as the revision requires of every server. A client that is not a browser sends no **Origin**. Each origin is written whole, as a browser sends it: a scheme, a host and an optional port, with no path and no pattern. A list naming **null** is refused: every sandboxed page, file and data: page sends that origin alike, so naming it would let any site in.
 
 ### `--idp runtime`
 
