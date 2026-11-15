@@ -242,3 +242,34 @@ TEST_CASE("a file's ETag is its inode, time and size in hex, as %llx writes them
         CHECK(socketley::http::etag_of(s) == std::string(want, static_cast<size_t>(n)));
     }
 }
+
+// Round 8b: the request line goes on to the backend as it came, so each word is what RFC 9112 3 allows, or a reader
+// that splits at any whitespace or stops at a NUL reads another request than the one routed and checked.
+TEST_CASE("a request line is a token method, a target without control bytes and HTTP/1.x")
+{
+    auto ok = [](std::string_view l) {
+        const size_t a = l.find(' ');
+        const size_t b = a == std::string_view::npos ? a : l.find(' ', a + 1);
+        return a != std::string_view::npos && b != std::string_view::npos && http_request_line_ok(l, a, b);
+    };
+    CHECK(ok("GET / HTTP/1.1"));
+    CHECK(ok("POST /a?b=c%20d HTTP/1.0"));
+    CHECK(ok("PROPFIND /caf\xc3\xa9 HTTP/1.1"));
+    CHECK(ok("OPTIONS * HTTP/1.1"));
+    CHECK_FALSE(ok("G\x01T / HTTP/1.1"));
+    CHECK_FALSE(ok("GET /a\x0bHTTP/1.1 HTTP/1.1"));
+    CHECK_FALSE(ok(std::string_view("GET /a\0b HTTP/1.1", 17)));
+    CHECK_FALSE(ok("GET /a\x7f HTTP/1.1"));
+    CHECK_FALSE(ok("GET /a HTTP/1.1 junk"));
+    CHECK_FALSE(ok("GET /a /b HTTP/1.1"));
+    CHECK_FALSE(ok("GET  /a HTTP/1.1"));
+    CHECK_FALSE(ok("GET /a HTTP/9.9"));
+    CHECK_FALSE(ok("GET /a http/1.1"));
+    CHECK_FALSE(ok("GET /a HTTP/1.10"));
+}
+
+TEST_CASE("a request field value holding a NUL is refused")
+{
+    CHECK_FALSE(http_scan_request_headers(std::string_view("Host: x\r\nX-A: a\0b", 17)).ok);
+    CHECK(http_scan_request_headers("Host: x\r\nX-A: a\x01" "b\t c").ok);
+}

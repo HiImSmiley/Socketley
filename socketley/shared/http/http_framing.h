@@ -322,6 +322,22 @@ inline bool http_te_codings_ok(std::string_view val, bool& chunked_seen,
     return true;
 }
 
+// A request line split at its two spaces, `sp1` and `sp2`, whose words are what RFC 9112 3 allows: a method that is
+// a token, a target of visible bytes (8-bit bytes taken, as browsers send them unescaped; no control byte, no DEL)
+// and a version "HTTP/1." with one digit after it.
+inline bool http_request_line_ok(std::string_view line, size_t sp1, size_t sp2)
+{
+    if (sp1 == 0 || sp2 <= sp1 + 1 || sp2 >= line.size())
+        return false;
+    if (!http_is_token(line.substr(0, sp1)))
+        return false;
+    for (const char c : line.substr(sp1 + 1, sp2 - sp1 - 1))
+        if (static_cast<unsigned char>(c) <= 0x20 || c == 0x7f)
+            return false;
+    const std::string_view v = line.substr(sp2 + 1);
+    return v.size() == 8 && v.starts_with("HTTP/1.") && v[7] >= '0' && v[7] <= '9';
+}
+
 // What one header block says about the framing of its own message, gathered
 // for every block including the interim 1xx ones, whose shape still matters
 // even where their values do not.
@@ -515,6 +531,14 @@ inline http_request_framing_scan http_scan_request_headers(std::string_view head
         // OWS is SP or HTAB (RFC 9110 Section 5.6.3), and a trim that knows
         // only spaces fails every check below on a perfectly ordinary message.
         const std::string_view val = http_trim_ows(line.substr(colon + 1));
+
+        // A NUL ends the value early for a reader holding C strings and not for one holding lengths, and RFC 9110
+        // 5.5 has a recipient refuse it or blank it; a request is refused, since it goes on to such a reader.
+        if (SOCKETLEY_UNLIKELY(val.find('\0') != std::string_view::npos))
+        {
+            out.ok = false;
+            return out;
+        }
 
         if (http_token_equals(name, "content-length", 14))
         {

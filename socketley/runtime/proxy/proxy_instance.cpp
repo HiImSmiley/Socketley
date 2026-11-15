@@ -4858,6 +4858,14 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     if (SOCKETLEY_UNLIKELY(sp2 == std::string_view::npos))
         return http_request_parse::invalid;
 
+    // Each word as RFC 9112 3 spells it, since the line goes on to the backend as it came: a method that is no
+    // token, a target holding a control byte (a VT or NUL splits or ends it for a reader that takes any whitespace
+    // or a C string, where this one split at the space) or a version that is no HTTP/1.x would be read there as
+    // another request than the one routed, checked and filtered here.  HTTP/2 and HTTP/3 heads come through here
+    // too, written back from pseudo-headers their own readers check less.
+    if (SOCKETLEY_UNLIKELY(!http_request_line_ok(line, sp1, sp2)))
+        return http_request_parse::invalid;
+
     conn->ex.method.assign(line.data(), sp1);
     conn->ex.path.assign(line.data() + sp1 + 1, sp2 - sp1 - 1);
     conn->ex.version.assign(line.data() + sp2 + 1, line.size() - sp2 - 1);
