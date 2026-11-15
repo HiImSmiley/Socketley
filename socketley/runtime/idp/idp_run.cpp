@@ -2095,13 +2095,36 @@ void idp_run::refresh_grant(const std::shared_ptr<conn>& c, const client& cl, co
         return;
     }
     const std::string id = who.id, user(who.username());
-    // One before the newest was used before, so whoever holds the newest may have stolen either: the family ends.
-    const auto reused = [this, id, user, field, client_id = cl.id](const std::shared_ptr<conn>& cc)
+    // One before the newest was used before, so whoever holds the newest may have stolen either: the family ends, and
+    // with it every access token it gave, which carry the family as their sid -- the newest refresher's included, which
+    // would otherwise be taken for its hour (RFC 9700 4.14.2).  As a code used again ends what it gave (revoke_grant).
+    const auto reused = [this, id, user, field, family, client_id = cl.id](const std::shared_ptr<conn>& cc)
     {
         LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": a refresh token of \"" + user + "\" for " + client_id +
                   " came again after it was used; that sign-in is ended").c_str());
-        update_account(id, {{field, ""}}, [](bool, const std::string&) {});
-        json_error(cc, 400, "invalid_grant", "the refresh token was used already; its sign-in has ended");
+        field_list fields;
+        if (const account* a = m_accounts.by_id(id))
+        {
+            const int64_t at = wall::now_sec();
+            // Until the newest access token the family gave, one being sent just now included, has expired.
+            fields = sign_out_fields(*a, family, at + token_secs + code_secs, at);
+        }
+        fields.emplace_back(field, "");
+        std::weak_ptr<conn> w = cc;
+        cc->waiting = true;
+        // Answered once that is written, so a client told its token is spent finds the newest one spent as well.
+        auto inside = std::make_shared<bool>(true);
+        update_account(id, std::move(fields), [this, w, inside](bool, const std::string&)
+        {
+            auto c2 = w.lock();
+            if (!c2 || c2->dead)
+                return;
+            c2->waiting = false;
+            json_error(c2, 400, "invalid_grant", "the refresh token was used already; its sign-in has ended");
+            if (!*inside)
+                m_http.resume(c2);
+        });
+        *inside = false;
     };
     if (newest != generation)
     {
@@ -2126,7 +2149,12 @@ void idp_run::refresh_grant(const std::shared_ptr<conn>& c, const client& cl, co
         const client* again = find_client(client_id);
         const account* a = m_accounts.by_id(id);
         if (!ok && why == changed_meanwhile)
+        {
+            // Resumed by the revocation once it is written, when it waits for that.
             reused(cc);
+            if (cc->waiting)
+                return;
+        }
         else if (!ok || !again || !a)
             json_error(cc, 503, "temporarily_unavailable", "the refresh could not be kept; try again");
         else

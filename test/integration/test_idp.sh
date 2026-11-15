@@ -14,7 +14,8 @@
 #     refresh and access tokens of the first exchange standing, or brought by another client revoking them
 #   * a token that does not verify against the published key, or names the account by anything but its id
 #   * a refresh for an account disabled, signed out everywhere or made to reset its password since
-#   * a refresh token good more than once, or one used again leaving its sign-in standing
+#   * a refresh token good more than once, or one used again leaving its sign-in standing or the access tokens its
+#     refreshes gave taken for their hour
 #   * a password that must be reset letting the account in before it is
 #   * the signing key changing across a restart, which would sign every user out
 #   * a code of the second step taken again after a restart
@@ -312,13 +313,19 @@ if phase == "main":
     r0 = json.loads(body).get("refresh_token", "") if st == 200 else ""
     st, body, _ = refresh(r0)
     r1 = json.loads(body).get("refresh_token", "") if st == 200 else ""
+    a1 = json.loads(body).get("access_token", "") if st == 200 else ""
     check("a refresh gives a refresh token of its own", (st, bool(r1) and r1 != r0), (200, True))
     st, body, _ = refresh(r1)
     r2 = json.loads(body).get("refresh_token", "") if st == 200 else ""
+    a2 = json.loads(body).get("access_token", "") if st == 200 else ""
     check("which refreshes in turn", (st, bool(r2)), (200, True))
+    userinfo = lambda tok: req("GET", "/userinfo", headers={"Authorization": "Bearer " + tok})[0]
+    check("the access tokens the refreshes gave are taken", (userinfo(a1), userinfo(a2)), (200, 200))
     st, body, _ = refresh(r0)
     check("one used before is refused", (st, json.loads(body).get("error")), (400, "invalid_grant"))
     check("and ends its sign-in, its newest token too", refresh(r2)[0], 400)
+    # The family's access tokens end with it, the first refresher's and the newest, not after their hour.
+    check("and every access token its refreshes gave", (userinfo(a1), userinfo(a2)), (401, 401))
     st, body, _ = refresh(rt.get("refresh_token", ""))
     check("while another sign-in's token still refreshes", st, 200)
     rt = json.loads(body) if st == 200 else {}
