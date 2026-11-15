@@ -133,6 +133,10 @@ struct proxy_exchange
     // so it is read away after our FIN until EOF, the byte bound, or
     // header_deadline, which the answer no longer needs.
     bool drain_on_close{false};
+    // The request carried an upgrade offer this proxy passed on, which is the one thing a 101 may answer (RFC 9110
+    // 15.2.2): a 101 to anything else is a backend switching to a protocol nobody asked for, and taking it as a
+    // switch made the rest of the connection a byte relay past every check this proxy runs per request.
+    bool upgrade_offered{false};
 
     // The client's half-close has been passed on with shutdown(SHUT_WR), a
     // flag because the call has to happen exactly once and every path asks
@@ -1052,6 +1056,7 @@ private:
     // on a fresh connection or refused 502; false when there is no client
     // waiting on it and the ordinary path goes on.
     bool refuse_desynced_answer(proxy_backend_connection* bconn, int bfd);
+    bool refuse_unoffered_switch(proxy_backend_connection* bconn, int bfd, bool first_bytes);
     // Consumes the completion of the read that detach_and_pool_backend
     // cancelled, and releases the fd and the struct once it is the last one.
     void finish_pool_drain(proxy_backend_connection* bconn,

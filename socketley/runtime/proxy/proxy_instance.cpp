@@ -4661,6 +4661,13 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         const size_t excess = conn->http_frame.excess_in_chunk;
         if (SOCKETLEY_UNLIKELY(excess > 0 && excess <= data_len))
             forward_len = data_len - excess;
+        if (SOCKETLEY_UNLIKELY(!tunnel_before && conn->http_frame.switched_protocols) &&
+            refuse_unoffered_switch(conn, fd, first_bytes))
+        {
+            if (is_provided)
+                m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            return;
+        }
     }
 
     // A client that asked to close is told close, where a pooled backend says
@@ -5168,6 +5175,7 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         const bool has_body = conn->ex.declared_body_len > 0 || conn->ex.declared_body_chunked;
         upgrade_offered = conn_has_upgrade && has_upgrade_field && !offers_h2 && !has_body;
     }
+    conn->ex.upgrade_offered = upgrade_offered;
 
     bool host_written = false;
     bool client_keep_alive = false;
@@ -8936,6 +8944,40 @@ bool proxy_instance::refuse_desynced_answer(proxy_backend_connection* bconn, int
     cconn->ex.backend_fd = -1;
     bconn->client_fd = -1;
     answer_gateway_failure(cconn, false);
+    close_pair(-1, bfd, close_reason::force);
+    return true;
+}
+
+// A 101 to a request that offered no upgrade, which this proxy would otherwise have relayed bytes past from then on:
+// the client's next requests would reach the backend with no route, --auth, filter or entrance check run on them,
+// asked of a backend that answers a status its caller chose (a /status/101 endpoint is enough).  Answered 502 when
+// nothing of the answer has reached the client yet, else the pair is closed; the socket is never kept.
+bool proxy_instance::refuse_unoffered_switch(proxy_backend_connection* bconn, int bfd, bool first_bytes)
+{
+    proxy_client_connection* cconn = nullptr;
+    if (bconn->client_fd >= 0 && bconn->client_fd < MAX_FDS && m_conn_idx[bconn->client_fd].side == conn_client)
+        cconn = m_conn_idx[bconn->client_fd].client;
+    if (cconn && cconn->ex.backend_fd == bfd && cconn->ex.upgrade_offered)
+        return false;
+    // Once per process: a backend that does it does it to every such request.
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+        LOG_WARN("proxy: a backend answered 101 to a request that offered no upgrade; answered 502 instead of "
+                 "relaying the connection");
+    if (cconn && cconn->ex.backend_fd == bfd && !cconn->closing)
+    {
+        // Nothing of this answer was forwarded when the 101 opened it, so the client can still be told.
+        if (first_bytes && bconn->http_frame.interim_blocks == 0)
+            cconn->ex.response_started = false;
+        cconn->ex.backend_fd = -1;
+        bconn->client_fd = -1;
+        if (!answer_gateway_failure(cconn, false))
+        {
+            cconn->closing = true;
+            close_pair(cconn->fd, bfd, close_reason::force);
+            return true;
+        }
+    }
     close_pair(-1, bfd, close_reason::force);
     return true;
 }
