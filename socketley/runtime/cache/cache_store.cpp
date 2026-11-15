@@ -943,11 +943,20 @@ int cache_store::copy_key(std::string_view src, std::string_view dst, bool repla
     const bool taken = exists(dst);
     if (taken && !replace)
         return 0;
+    // A stream's copy is rebuilt through its serialisation and sizes its blocks
+    // afresh, so it may hold more heap than its source: 21 entries of 192 bytes
+    // with the first one erased hold 4336 bytes and their copy 4624.  Admitted
+    // for the source's cost, a COPY of one took the store past its limit; so
+    // the copy is made first and admitted for what it holds.
+    std::optional<stream_inner> stream_copy;
+    if (auto it = m_streams.find(src); it != m_streams.end())
+        stream_copy.emplace(it->second);
     // Refused for room before REPLACE deletes anything, answered apart from a
     // destination in the way because Redis refuses COPY with -OOM.
     if (m_max_memory != 0)
     {
-        const size_t need  = new_key_cost(dst.size()) + value_cost(src)
+        const size_t value = stream_copy ? entry_cost(dst, *stream_copy) - stored_string(dst) : value_cost(src);
+        const size_t need  = new_key_cost(dst.size()) + value
                            + (m_expiry.count(src) ? expiry_entry_overhead : 0);
         const size_t freed = taken ? key_cost(dst) : 0;   // what REPLACE gives back
         if (need > freed && !check_memory(need - freed, src))
@@ -958,12 +967,17 @@ int cache_store::copy_key(std::string_view src, std::string_view dst, bool repla
     }
     if (taken)
         del(dst);
-    if (!move_one(m_data,   nullptr,         src, dst, true)
-     && !move_one(m_lists,  &m_list_elems,   src, dst, true)
-     && !move_one(m_sets,   &m_set_elems,    src, dst, true)
-     && !move_one(m_hashes, &m_hash_fields,  src, dst, true)
-     && !move_one(m_zsets,  &m_zset_members, src, dst, true)
-     && !move_one(m_streams, nullptr,        src, dst, true))
+    if (stream_copy)
+    {
+        auto nit = m_streams.insert_or_assign(std::string(dst), std::move(*stream_copy)).first;
+        track_add(entry_cost(nit->first, nit->second));
+        touch_lru(dst);
+    }
+    else if (!move_one(m_data,   nullptr,         src, dst, true)
+          && !move_one(m_lists,  &m_list_elems,   src, dst, true)
+          && !move_one(m_sets,   &m_set_elems,    src, dst, true)
+          && !move_one(m_hashes, &m_hash_fields,  src, dst, true)
+          && !move_one(m_zsets,  &m_zset_members, src, dst, true))
         return -2;
     // The deadline is copied too.  This first read "COPY copies the value, not
     // the deadline", which sounded right and is not what redis-server does --

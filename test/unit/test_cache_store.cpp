@@ -4526,6 +4526,41 @@ TEST_CASE("a stream is charged for what it holds and gives it all back")
     }
 }
 
+TEST_CASE("a COPY of a stream is admitted for what the copy holds, which may be more than its source")
+{
+    // The copy is rebuilt through the stream's serialisation and sizes its
+    // blocks afresh: 21 entries of 192 bytes with the first one erased hold
+    // 4336 bytes of heap and their copy 4624.  Admitted for the source's cost,
+    // the COPY took the store past a limit it had been under (fuzz_cache_ops,
+    // "over-limit").  Every limit from the store's size up: a COPY either fits
+    // or is refused.
+    const auto make = [](cache_store& st) {
+        for (uint64_t i = 1; i <= 21; ++i)
+            REQUIRE(store_xadd(st, "s", { i, 0 }, { "f", std::string(192, 'v') }));
+        stream_inner* s = st.stream_find("s");
+        st.stream_change("s", *s, [](stream_inner& x) { REQUIRE(x.erase({ 1, 0 })); });
+    };
+    cache_store probe;
+    make(probe);
+    const size_t base = probe.get_memory_used();
+    size_t admitted = 0, refused = 0, over = 0;
+    for (size_t limit = base; limit < base + 8192; limit += 8)
+    {
+        cache_store store;
+        make(store);
+        store.set_max_memory(limit);
+        store.set_eviction(evict_none);
+        const int r = store.copy_key("s", "t", false);
+        REQUIRE((r == 1 || r == -3));
+        (r == 1 ? admitted : refused)++;
+        if (r == 1 && store.get_memory_used() > limit)
+            over++;
+    }
+    CHECK(admitted > 0);
+    CHECK(refused > 0);
+    CHECK(over == 0);
+}
+
 TEST_CASE("a stream write refused for room leaves the stream as it was")
 {
     cache_store store;
