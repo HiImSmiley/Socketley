@@ -286,7 +286,7 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(('127.0.0.1', listen), H).serve_forever()
 PY
 python3 "$T/trunc.py" "$X" "$P" "$T/trunc.flag" & TRUNC_PID=$!
-for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$X " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$X " <<<"$listening_now" && break; sleep 0.1; done
 S -o /dev/null -X PUT "http://127.0.0.1:$P/trunc"
 printf 'k\n' | S -o /dev/null -X PUT --data-binary @- "http://127.0.0.1:$P/trunc/kept.txt"
 printf 'l\n' | S -o /dev/null -X PUT --data-binary @- "http://127.0.0.1:$P/trunc/left-out.txt"

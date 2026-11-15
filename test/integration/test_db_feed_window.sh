@@ -31,7 +31,7 @@ printf 'backend feedwindowsecret0123456789\n' > "$T/keys"
 chmod 600 "$T/keys"
 "$BIN" create db data -p "$PD" --schema "$T/schema" --keys "$T/keys" -s >/dev/null 2>&1 \
     && ok || bad "the db runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PD " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PD " <<<"$listening_now" && break; sleep 0.1; done
 WORKER=$(ss -ltnp 2>/dev/null | awk -v p=":$PD" '$4 ~ p"$" {
     if (match($0, /pid=[0-9]+/)) print substr($0, RSTART+4, RLENGTH-4) }' | head -1)
 [ -n "${WORKER:-}" ] || { echo "  FAIL: no worker pid for the listener"; exit 1; }

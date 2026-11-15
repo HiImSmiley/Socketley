@@ -71,8 +71,8 @@ while True:
 BE_PID=$!
 # Listening before the proxy is made, or its connect fails and the client is answered with a 502 at once -- which
 # passed below without the sweep ever having run. Asked of ss, since an accept of this backend's holds it 90 s.
-for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$BE " && break; sleep 0.1; done
-ss -ltn 2>/dev/null | grep -q "127.0.0.1:$BE " || { bad "the backend listens" "nothing on $BE after 5 s"; }
+for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q "127.0.0.1:$BE " <<<"$listening_now" && break; sleep 0.1; done
+listening_now=$(ss -ltn 2>/dev/null) && grep -q "127.0.0.1:$BE " <<<"$listening_now" || { bad "the backend listens" "nothing on $BE after 5 s"; }
 
 "$BIN" create proxy is_p -p "$PX" --backend "127.0.0.1:$BE" \
     --idle-timeout 1 --backend-timeout 0 -s >/dev/null 2>&1

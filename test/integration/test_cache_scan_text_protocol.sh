@@ -55,8 +55,8 @@ daemon_start "$BIN"
 
 # No --resp on purpose: this is the port the other files never open.
 "$BIN" create cache tx_c -p "$P" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$P "; then
+for _ in $(seq 1 150); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
+if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now"; }; then
     echo "  FATAL: the cache never bound $P"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 

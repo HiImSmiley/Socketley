@@ -278,7 +278,7 @@ PY
 "$BIN" create server dso -p "$PS" --send-to sender -s >/dev/null 2>&1 || true
 "$BIN" create cache dsc -p "$PC" -s >/dev/null 2>&1 || true
 for p in "$PS" "$PC"; do
-    for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$p " && break; sleep 0.1; done
+    for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$p " <<<"$listening_now" && break; sleep 0.1; done
 done
 
 check(){   # name output
@@ -356,7 +356,7 @@ function on_connect(id)
 end
 LUA
 "$BIN" create server dsl -p "$PL" --lua "$WORK/tell.lua" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PL " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PL " <<<"$listening_now" && break; sleep 0.1; done
 OUT=$(timeout 90 python3 "$WORK/peer.py" slowclient "$PL" 2>&1 || true)
 echo "  tell:     $OUT"
 check "a server script's sends to a client arrive whole and in order" "$OUT"
@@ -380,7 +380,7 @@ function on_websocket(id, headers)
 end
 LUA
 "$BIN" create server dsw -p "$PW" --lua "$WORK/ws.lua" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PW " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PW " <<<"$listening_now" && break; sleep 0.1; done
 OUT=$(timeout 90 python3 "$WORK/peer.py" wsclient "$PW" 2>&1 || true)
 echo "  ws:       $OUT"
 check "a server script's frames to a websocket arrive whole and in order" "$OUT"
@@ -397,7 +397,7 @@ head -c 700 /dev/zero | tr '\0' 'b' > "$WORK/www/b.txt"
 head -c 60000 /dev/urandom > "$WORK/www/d.bin"
 head -c 200000 /dev/urandom > "$WORK/www/e.bin"
 "$BIN" create server dsh -p "$PH" --http "$WORK/www" --http-cache -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PH " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PH " <<<"$listening_now" && break; sleep 0.1; done
 OUT=$(timeout 90 python3 "$WORK/peer.py" http "$PH" 2>&1 || true)
 echo "  http:     $OUT"
 check "a server's pipelined HTTP answers arrive whole and in order" "$OUT"

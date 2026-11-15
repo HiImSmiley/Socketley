@@ -97,7 +97,7 @@ daemon_start "$BIN"
 for i in $(seq 1 100); do
     ready=1
     for p in $((P+1)) $((P+2)) $((P+3)); do
-        ss -ltn 2>/dev/null | grep -q ":$p " || ready=0
+        listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$p " <<<"$listening_now" || ready=0
     done
     [ "$ready" = 1 ] && break
     sleep 0.1

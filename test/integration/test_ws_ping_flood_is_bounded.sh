@@ -53,7 +53,7 @@ echo "=== Integration: a WebSocket ping flood is held to the write bound ==="
 daemon_start "$BIN"
 P=$((SL_PORT_BASE + 1780))
 "$BIN" create server wpf -p "$P" -s >/dev/null 2>&1
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 WORKER=$(ss -ltnp 2>/dev/null | awk -v p=":$P" '$4 ~ p"$" {
     if (match($0, /pid=[0-9]+/)) print substr($0, RSTART+4, RLENGTH-4) }' | head -1)
 [ -n "${WORKER:-}" ] || { echo "  FAIL: no worker pid for the listener"; exit 1; }

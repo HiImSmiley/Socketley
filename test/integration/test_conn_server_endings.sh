@@ -30,7 +30,7 @@ mkdir -p "$T/site"; printf 'page\n' > "$T/site/index.html"
 "$BIN" create mcp tools -p "$P" --anonymous -s >/dev/null 2>&1 || bad "an mcp runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 "$BIN" create web site -p $((P+1)) --root "$T/site" -s >/dev/null 2>&1 || bad "a web runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for p in "$P" $((P+1)); do
-    for _ in $(seq 1 50); do ss -ltn | grep -q ":$p " && break; sleep 0.1; done
+    for _ in $(seq 1 50); do listening_now=$(ss -ltn) && grep -q ":$p " <<<"$listening_now" && break; sleep 0.1; done
 done
 
 for p in "$P" $((P+1)); do

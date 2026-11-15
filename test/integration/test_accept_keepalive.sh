@@ -44,7 +44,7 @@ trap cleanup EXIT
 
 daemon_start "$BIN"
 
-wait_port() { local p=$1 i; for i in $(seq 1 200); do ss -ltn | grep -q ":$p " && return 0; sleep 0.1; done; return 1; }
+wait_port() { local p=$1 i; for i in $(seq 1 200); do listening_now=$(ss -ltn) && grep -q ":$p " <<<"$listening_now" && return 0; sleep 0.1; done; return 1; }
 
 # The accepted end is the one whose LOCAL port is the runtime's.  Read to the
 # end and keep the first match: `exit` out of a pipe under pipefail reports 141

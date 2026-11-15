@@ -43,8 +43,8 @@ daemon_start "$BIN"
 printf -- '-- present so publishes are forwarded\n' > "$WORK/any.lua"
 "$BIN" create server scripted -p "$SP" --lua "$WORK/any.lua" -s >/dev/null 2>&1 || true
 "$BIN" create cache pubc -p "$P" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$P "; then
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
+if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now"; }; then
     echo "  FATAL: the cache never bound $P"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 # The daemon tells the worker whether to forward on its health tick.

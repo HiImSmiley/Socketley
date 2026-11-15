@@ -133,7 +133,7 @@ PYEOF
 peer() { python3 "$T/peer.py" "$@" > /dev/null 2>&1 & PEERS="$PEERS $!"; }
 listening() {
     for _ in $(seq 1 200); do
-        ss -ltn 2>/dev/null | grep -q ":$1 " && return 0
+        listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$1 " <<<"$listening_now" && return 0
         sleep 0.05
     done
     return 1

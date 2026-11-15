@@ -99,7 +99,7 @@ run_proxy() {   # tag -> a daemon and a TCP proxy, WORKER set; an env prefix rea
     daemon_isolate "earnms-$1"
     daemon_start "$BIN"
     "$BIN" create proxy em -p "$P" --backend "127.0.0.1:$BP" --protocol tcp -s >/dev/null 2>&1 || true
-    for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+    for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
     WORKER=$(ss -ltnp 2>/dev/null | awk -v p=":$P" '$4 ~ p"$" {
         if (match($0, /pid=[0-9]+/)) print substr($0, RSTART+4, RLENGTH-4) }' | head -1)
 }
@@ -115,7 +115,7 @@ held_mb() {   # clients bytes -> MB the worker added at its peak while C clients
 
 python3 "$WORK/be.py" "$BP" sink "$WORK/unused" >/dev/null 2>&1 &
 BEPID=$!
-for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$BP " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BP " <<<"$listening_now" && break; sleep 0.1; done
 
 # ── 1. a stream holds what single-shot holds ────────────────────────────────
 if [ -n "$SANITIZED" ]; then
@@ -144,7 +144,7 @@ kill -9 "$BEPID" 2>/dev/null; wait "$BEPID" 2>/dev/null || true
 : > "$WORK/counts"
 python3 "$WORK/be.py" "$BP" count "$WORK/counts" >/dev/null 2>&1 &
 BEPID=$!
-for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$BP " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BP " <<<"$listening_now" && break; sleep 0.1; done
 
 # ── 2. a connection that earned the arm and then streams loses nothing ──────
 run_proxy mixed
@@ -175,7 +175,7 @@ while True:
 PY
 python3 "$WORK/echo.py" "$BP" >/dev/null 2>&1 &
 BEPID=$!
-for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$BP " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BP " <<<"$listening_now" && break; sleep 0.1; done
 run_proxy echo
 GOT=$(python3 - "$P" <<'PY'
 import socket, sys

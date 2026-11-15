@@ -58,7 +58,7 @@ fi
 
 daemon_start "$BIN"
 # The daemon's own socket is listed with no skmem where the kernel has no unix_diag, and then nothing here can be read.
-if ! ss -xmaH 2>/dev/null | grep -q '\btb[0-9]'; then
+if ! { listening_now=$(ss -xmaH 2>/dev/null) && grep -q '\btb[0-9]' <<<"$listening_now"; }; then
     echo "  SKIP: ss -xm reads no unix socket's buffer here (the kernel has no CONFIG_UNIX_DIAG)"
     exit 0
 fi

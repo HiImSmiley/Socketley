@@ -53,8 +53,8 @@ ASKED=$(( VAL * N / 1048576 ))      # MB
 daemon_start "$BIN"
 P=$((SL_PORT_BASE + 1700))
 "$BIN" create cache cp -p $((P+1)) -s >/dev/null 2>&1 || true
-for i in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$((P+1)) " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$((P+1)) "; then
+for i in $(seq 1 150); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$((P+1)) " <<<"$listening_now" && break; sleep 0.1; done
+if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$((P+1)) " <<<"$listening_now"; }; then
     echo "  FATAL: the cache never bound its port"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 WORKER=$(ss -ltnp 2>/dev/null | awk -v p=":$((P+1))" '$4 ~ p"$" {

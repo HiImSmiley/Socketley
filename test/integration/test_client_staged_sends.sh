@@ -93,7 +93,7 @@ PYEOF
 python3 "$SOCKETLEY_TMPD/peer.py" "$P" "$N" > "$SOCKETLEY_TMPD/peer.out" 2>&1 &
 LPID=$!
 for _ in $(seq 1 200); do
-    ss -ltn 2>/dev/null | grep -q ":$P " && break
+    listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break
     sleep 0.05
 done
 

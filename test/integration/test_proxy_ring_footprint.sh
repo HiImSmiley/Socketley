@@ -56,12 +56,12 @@ while True:
 PY
 python3 "$WORK/echo.py" "$BP" >/dev/null 2>&1 &
 BEPID=$!
-for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$BP " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BP " <<<"$listening_now" && break; sleep 0.1; done
 
 daemon_isolate proxyring
 daemon_start "$BIN"
 "$BIN" create proxy pr -p "$P" --backend "127.0.0.1:$BP" --protocol tcp -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 WORKER=$(ss -ltnp 2>/dev/null | awk -v p=":$P" '$4 ~ p"$" {
     if (match($0, /pid=[0-9]+/)) print substr($0, RSTART+4, RLENGTH-4) }' | head -1)
 if [ -z "${WORKER:-}" ]; then

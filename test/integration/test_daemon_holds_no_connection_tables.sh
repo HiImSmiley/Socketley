@@ -67,7 +67,7 @@ done
 up=0
 for _ in $(seq 1 150); do
     up=0
-    for i in $(seq 1 $N); do ss -ltn 2>/dev/null | grep -q ":$((P + i)) " && up=$((up + 1)); done
+    for i in $(seq 1 $N); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$((P + i)) " <<<"$listening_now" && up=$((up + 1)); done
     [ "$up" = "$N" ] && break
     sleep 0.1
 done

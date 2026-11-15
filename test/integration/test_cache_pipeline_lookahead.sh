@@ -38,7 +38,7 @@ P=$((SL_PORT_BASE + 133))
 daemon_isolate pipelookahead
 daemon_start "$BIN"
 "$BIN" create cache la -p "$P" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 
 OUT=$(timeout 300 python3 - "$P" <<'PY'
 import socket, sys, random

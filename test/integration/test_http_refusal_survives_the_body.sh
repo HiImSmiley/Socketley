@@ -43,7 +43,7 @@ mkdir -p "$WORK/www"; echo ok > "$WORK/www/index.html"
 daemon_isolate refusalbody
 daemon_start "$BIN"
 "$BIN" create server rb -p "$P" --http "$WORK/www" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 
 OUT=$(timeout 120 python3 - "$P" "${UPLOADS:-64}" <<'PY'
 import socket, sys, threading

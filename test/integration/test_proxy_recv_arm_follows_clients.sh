@@ -201,8 +201,8 @@ PY
 python3 "$WORK/be.py" "$((SL_PORT_BASE + 1746))" "$BODY" "$BODY_MID" "$BODY_SMALL" >"$WORK/be.log" 2>&1 &
 BEPID=$!
 BPORT=$((SL_PORT_BASE + 1746))
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$BPORT " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$BPORT "; then
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BPORT " <<<"$listening_now" && break; sleep 0.1; done
+if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BPORT " <<<"$listening_now"; }; then
     echo "  FATAL: the body backend never bound $BPORT"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 
@@ -217,8 +217,8 @@ run_arm() {   # tag [clients] [path] [hold] [samples]   (the pin is the caller's
     daemon_isolate "recvarm-$tag"
     daemon_start "$BIN"
     "$BIN" create proxy pa -p "$PPORT" --backend "127.0.0.1:$BPORT" -s >/dev/null 2>&1 || true
-    for i in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$PPORT " && break; sleep 0.1; done
-    if ! ss -ltn 2>/dev/null | grep -q ":$PPORT "; then
+    for i in $(seq 1 150); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" && break; sleep 0.1; done
+    if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now"; }; then
         echo "  FATAL: the proxy never bound $PPORT for arm $tag"
         echo "  Results: 0/0 passed (0 failed)"; exit 2
     fi
@@ -282,7 +282,7 @@ else fail "the unpinned arm carries no pin" \
           "-- the ratio below would compare one pinned arm with another"; fi
 
 daemon_stop
-for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
+for i in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" || break; sleep 0.1; done
 
 # ── 3. the same clients with the arm pinned on ───────────────────────────────
 export SOCKETLEY_RECV_MULTISHOT=1
@@ -334,7 +334,7 @@ else fail "the multishot path still serves whole bodies" \
 
 daemon_stop
 unset SOCKETLEY_RECV_MULTISHOT
-for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
+for i in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" || break; sleep 0.1; done
 
 # ── 6. the same ratio ABOVE the threshold, where the arm is multishot ───────
 # This is the row the withdrawal exists for.  Below the threshold the rule picks
@@ -353,7 +353,7 @@ run_arm bigrule "$MANY_CLIENTS" /pa/mid 10 400
 HELD_BR=$ARM_STEADY; OPENED_BR=$ARM_OPENED; SAMPLES_BR=$ARM_SAMPLES; KERNEL_BR=$ARM_KERNEL
 echo "  above the threshold, the rule: $OPENED_BR slow clients, held ${HELD_BR} MB (peak ${HELD} MB)"
 daemon_stop
-for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
+for i in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" || break; sleep 0.1; done
 
 export SOCKETLEY_RECV_MULTISHOT=1
 run_arm bigpin "$MANY_CLIENTS" /pa/mid 10 400
@@ -362,7 +362,7 @@ echo "  above the threshold, pinned:   $OPENED_BP slow clients, held ${HELD_BP} 
 echo "  the kernel's queues toward the clients held $KERNEL_BR and $KERNEL_BP MB"
 daemon_stop
 unset SOCKETLEY_RECV_MULTISHOT
-for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
+for i in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" || break; sleep 0.1; done
 
 if [ -n "$SANITIZED" ]; then
     not_asserted "above the threshold the rule still bounds the queue" \
@@ -400,7 +400,7 @@ fi
 daemon_isolate recvarm-many
 daemon_start "$BIN"
 "$BIN" create proxy pa -p "$PPORT" --backend "127.0.0.1:$BPORT" -s >/dev/null 2>&1 || true
-for i in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$PPORT " && break; sleep 0.1; done
+for i in $(seq 1 150); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" && break; sleep 0.1; done
 MANY=$(timeout 180 python3 "$WORK/many.py" "$PPORT" "$MANY_CLIENTS" "/pa/small" "$BODY_SMALL" 2>/dev/null || echo "0 0 0")
 read -r n_open n_done n_full <<<"$MANY"
 if [ "${n_open:-0}" -gt 768 ] && [ "${n_full:-0}" -ge $(( n_open * 95 / 100 )) ]; then

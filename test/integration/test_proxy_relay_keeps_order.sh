@@ -130,7 +130,7 @@ phase(){   # copy | splice
     if [ "$1" = splice ]; then export SOCKETLEY_PROXY_SPLICE=1; else unset SOCKETLEY_PROXY_SPLICE; fi
     daemon_start "$BIN"
     "$BIN" create proxy relayp -p "$PX" --backend "127.0.0.1:$BE" --protocol tcp -s >/dev/null 2>&1 || true
-    for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PX " && break; sleep 0.1; done
+    for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PX " <<<"$listening_now" && break; sleep 0.1; done
 
     exchange late "$1"
     exchange first "$1"
@@ -149,7 +149,7 @@ phase(){   # copy | splice
         grep -v '\[INFO\]' "$SOCKETLEY_DLOG" 2>/dev/null | tail -8 | sed 's/^/        log: /' || true
     fi
     daemon_stop
-    for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$PX " || break; sleep 0.1; done
+    for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PX " <<<"$listening_now" || break; sleep 0.1; done
 }
 
 # ── 1-5. the copy path: the backend half-closes late, then first ─────────

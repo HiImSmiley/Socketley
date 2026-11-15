@@ -82,7 +82,7 @@ for n in 1 2; do
 done
 for i in $(seq 1 150); do
     ready=1
-    for n in 1 2; do ss -ltn 2>/dev/null | grep -q ":$((P+n)) " || ready=0; done
+    for n in 1 2; do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$((P+n)) " <<<"$listening_now" || ready=0; done
     [ "$ready" = 1 ] && break
     sleep 0.1
 done

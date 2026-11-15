@@ -93,7 +93,7 @@ disown "$STALL_PID" 2>/dev/null || true
 
 READY=""
 for _ in $(seq 1 40); do
-    ss -ltn 2>/dev/null | grep -q ":$STALL_PORT " && { READY=yes; break; }
+    listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$STALL_PORT " <<<"$listening_now" && { READY=yes; break; }
     sleep 0.25
 done
 if [ "$READY" = yes ]; then pass

@@ -54,7 +54,7 @@ printf 'backend dbbackendsecret0123456789\n' > "$T/keys"; chmod 600 "$T/keys"
 printf 'access_key = anyrtaccess\nsecret_key = anyrtsecretsecretsecret\n' > "$T/creds"; chmod 600 "$T/creds"
 printf '$ORIGIN t.test.\n$TTL 60\n@ IN SOA ns.t.test. h.t.test. 1 60 60 60 60\n@ IN NS ns.t.test.\nns IN A 127.0.0.1\n' > "$T/t.zone"
 
-listening() { ss -ltnuH 2>/dev/null | grep -q "[:.]$1 "; }
+listening() { listening_now=$(ss -ltnuH 2>/dev/null) && grep -q "[:.]$1 " <<<"$listening_now"; }
 wait_port() { local n=0; until listening "$1"; do n=$((n+1)); [ "$n" -gt 300 ] && return 1; sleep 0.1; done; }
 
 # Up, listening where it should, and gone with exit 0 on SIGTERM.

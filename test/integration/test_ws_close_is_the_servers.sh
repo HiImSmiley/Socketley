@@ -46,8 +46,8 @@ fi
 daemon_start "$BIN"
 P=$((SL_PORT_BASE + 106))
 "$BIN" create server wc -p "$P" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$P "; then
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
+if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now"; }; then
     echo "  FATAL: the server never bound $P"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 

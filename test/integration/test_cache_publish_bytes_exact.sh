@@ -37,7 +37,7 @@ command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; ec
 P=$((SL_PORT_BASE + 121))
 daemon_start "$BIN"
 "$BIN" create cache px -p "$P" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 
 N=20000
 timeout 120 python3 - "$P" "$N" > "$WORK/out" <<'PY'

@@ -123,7 +123,7 @@ P=$((SL_PORT_BASE + 1660))
 "$BIN" create server small -p $((P+2)) --lua "$WORK/wm.lua" --write-buffer 256K -s >/dev/null 2>&1 || true
 for i in $(seq 1 100); do
     ready=1
-    for p in $((P+1)) $((P+2)); do ss -ltn 2>/dev/null | grep -q ":$p " || ready=0; done
+    for p in $((P+1)) $((P+2)); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$p " <<<"$listening_now" || ready=0; done
     [ "$ready" = 1 ] && break
     sleep 0.1
 done

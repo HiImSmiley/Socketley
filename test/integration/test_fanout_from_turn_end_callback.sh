@@ -43,7 +43,7 @@ function on_writable(id)
 end
 LUA
 "$BIN" create server room -p "$P" --lua "$T/room.lua" -s >/dev/null 2>&1
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 
 # The filler reads part of its queue, enough to bring it under the watermark, and then stops for PAUSE seconds;
 # the member must hear "drained" well inside that pause.

@@ -63,7 +63,7 @@ P=$((SL_PORT_BASE + 1940))
 "$BIN" create server hd -p "$P" --http "$WWW" -s >/dev/null 2>&1
 "$BIN" create server hc -p $((P + 1)) --http "$WWW" --http-cache -s >/dev/null 2>&1
 for p in "$P" $((P + 1)); do
-    for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$p " && break; sleep 0.1; done
+    for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$p " <<<"$listening_now" && break; sleep 0.1; done
 done
 
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$1$2"; }

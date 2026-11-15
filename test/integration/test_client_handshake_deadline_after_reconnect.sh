@@ -55,7 +55,7 @@ while time.time() < end:
 PY
 HOLDER=$!
 disown "$HOLDER" 2>/dev/null || true
-for _ in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.25; done
+for _ in $(seq 1 40); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.25; done
 
 daemon_start "$BIN"
 "$BIN" create client hsr -t "127.0.0.1:$P" --tls --ca "$D/cert.pem" --reconnect 5 -s >/dev/null 2>&1

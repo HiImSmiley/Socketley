@@ -233,7 +233,7 @@ expect "and the one swapped in above --root's own name" "$(curl -s "http://127.0
 # runtime of its own with nothing else to answer, so only its own tick can let it go.
 truncate -s 256M "$R/r2/huge.bin"
 "$BIN" create web quiet -p $((P+3)) --root "$R/r2" -s >/dev/null 2>&1 || bad "a quiet web runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
-for _ in $(seq 1 50); do ss -ltn | grep -q ":$((P+3)) " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn) && grep -q ":$((P+3)) " <<<"$listening_now" && break; sleep 0.1; done
 rss0=$(awk '/^VmRSS/{print $2}' /proc/"$wpid"/status 2>/dev/null)
 python3 - "$P" $((P+3)) <<'PY' &
 import socket, sys, time

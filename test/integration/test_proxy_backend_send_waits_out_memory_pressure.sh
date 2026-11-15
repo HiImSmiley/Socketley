@@ -66,13 +66,13 @@ pressures(){ awk '/^TcpExt:/ { if (!h) { split($0, k); h = 1 } else { split($0, 
 # and the drain after it is what lets every upload finish.
 "$WORK/load" drain "$BP" 6 "$WORK/counts" >/dev/null 2>&1 &
 BEPID=$!
-for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$BP " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BP " <<<"$listening_now" && break; sleep 0.1; done
 
 daemon_isolate backendpressure
 daemon_start "$BIN"
 "$BIN" create proxy bp -p "$P" --backend "127.0.0.1:$BP" --protocol tcp -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$P "; then
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
+if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now"; }; then
     echo "  FATAL: the proxy never bound $P"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 

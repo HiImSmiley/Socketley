@@ -41,7 +41,7 @@ daemon_isolate proxyrefusal
 daemon_start "$BIN"
 "$BIN" create server rbe -p "$BP" --http "$WORK/www" -s >/dev/null 2>&1 || true
 "$BIN" create proxy rp -p "$P" --backend "127.0.0.1:$BP" --protocol http -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 
 OUT=$(timeout 120 python3 - "$P" "${UPLOADS:-64}" <<'PY'
 import socket, sys, threading

@@ -27,7 +27,7 @@ unset SOCKETLEY_CONFIG
 trap 'daemon_stop' EXIT
 daemon_start "$BIN"
 "$BIN" create mcp tools -p "$P" --anonymous --max-connections 10000 -s >/dev/null 2>&1 || bad "an mcp runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
-for _ in $(seq 1 50); do ss -ltn | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 pid=$(ss -ltnpH "( sport = :$P )" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 rss() { awk '/^VmRSS/ {print $2}' "/proc/$pid/status"; }
 N=200

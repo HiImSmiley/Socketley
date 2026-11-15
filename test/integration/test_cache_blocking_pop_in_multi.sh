@@ -65,7 +65,7 @@ echo "=== Integration: a blocking pop inside MULTI answers rather than parking =
 
 daemon_start "$BIN"
 "$BIN" create cache bp -p "$P" --resp -s >/dev/null 2>&1
-for _ in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 150); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 
 OUT=$(timeout 90 python3 - "$P" <<'PYEOF'
 import socket, sys, time

@@ -137,14 +137,14 @@ fi
 start_backend(){   # quiet_seconds counts_file
     python3 "$WORK/sink.py" "$BPORT" "$1" "$2" >"$WORK/be.log" 2>&1 &
     BEPID=$!
-    for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$BPORT " && break; sleep 0.1; done
-    if ! ss -ltn 2>/dev/null | grep -q ":$BPORT "; then
+    for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BPORT " <<<"$listening_now" && break; sleep 0.1; done
+    if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BPORT " <<<"$listening_now"; }; then
         echo "  FATAL: the sink backend never bound $BPORT"
         echo "  Results: 0/0 passed (0 failed)"; exit 2
     fi
 }
 stop_backend(){ [ -n "$BEPID" ] && { kill -9 "$BEPID" 2>/dev/null || true; }; BEPID=""
-    for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$BPORT " || break; sleep 0.1; done; }
+    for _ in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BPORT " <<<"$listening_now" || break; sleep 0.1; done; }
 
 HELD=0; WORKER=""; ARM_CARRIED=""; ARM_OPENED=0; ARM_SENT=0
 run_arm(){   # tag clients per hold   (the pin is the caller's)
@@ -152,8 +152,8 @@ run_arm(){   # tag clients per hold   (the pin is the caller's)
     daemon_isolate "upbound-$tag"
     daemon_start "$BIN"
     "$BIN" create proxy up -p "$PPORT" --backend "127.0.0.1:$BPORT" --protocol tcp -s >/dev/null 2>&1 || true
-    for i in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$PPORT " && break; sleep 0.1; done
-    if ! ss -ltn 2>/dev/null | grep -q ":$PPORT "; then
+    for i in $(seq 1 150); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" && break; sleep 0.1; done
+    if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now"; }; then
         echo "  FATAL: the proxy never bound $PPORT for arm $tag"
         echo "  Results: 0/0 passed (0 failed)"; exit 2
     fi
@@ -189,7 +189,7 @@ run_arm rule "$MANY" "$PER" 12
 HELD_RULE=$HELD; OPENED_RULE=$ARM_OPENED; CARRIED_RULE=$ARM_CARRIED
 echo "  the rule:      $OPENED_RULE uploading clients, worker held ${HELD_RULE} MB (MULTISHOT=$CARRIED_RULE)"
 daemon_stop; stop_backend
-for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
+for i in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" || break; sleep 0.1; done
 
 if [ "$CARRIED_RULE" = absent ]; then pass
 else fail "the unpinned arm carries no pin" \
@@ -204,7 +204,7 @@ HELD_SINGLE=$HELD; OPENED_SINGLE=$ARM_OPENED; CARRIED_SINGLE=$ARM_CARRIED
 echo "  single-shot:   $OPENED_SINGLE uploading clients, worker held ${HELD_SINGLE} MB (MULTISHOT=$CARRIED_SINGLE)"
 daemon_stop; stop_backend
 unset SOCKETLEY_RECV_MULTISHOT
-for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
+for i in $(seq 1 100); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PPORT " <<<"$listening_now" || break; sleep 0.1; done
 
 if [ "$CARRIED_SINGLE" = 0 ]; then pass
 else fail "the single-shot arm carries the pin" \

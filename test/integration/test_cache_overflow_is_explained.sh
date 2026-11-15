@@ -82,7 +82,7 @@ else fail "both caches are created" "a create exited $RC"; fi
 for port in "$PLAIN" "$TLS_P"; do
     BOUND=""
     for _ in $(seq 1 40); do
-        ss -ltn 2>/dev/null | grep -q ":$port " && { BOUND=yes; break; }
+        listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$port " <<<"$listening_now" && { BOUND=yes; break; }
         sleep 0.25
     done
     if [ "$BOUND" = yes ]; then pass

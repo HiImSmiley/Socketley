@@ -132,7 +132,7 @@ daemon_start "$BIN"
 "$BIN" create proxy px_slow -p "$PX_SLOW" --backend "127.0.0.1:$BE_SLOW" \
        --protocol http --backend-timeout 30 -s >/dev/null 2>&1
 for _ in $(seq 1 150); do
-    ss -ltn 2>/dev/null | grep -q ":$PX_MUTE " && ss -ltn 2>/dev/null | grep -q ":$PX_SLOW " && break
+    listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PX_MUTE " <<<"$listening_now" && listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PX_SLOW " <<<"$listening_now" && break
     sleep 0.1
 done
 

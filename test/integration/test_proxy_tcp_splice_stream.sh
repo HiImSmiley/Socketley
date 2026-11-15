@@ -91,7 +91,7 @@ PY
 python3 "$T/echo.py" "$BE" & ECHO_PID=$!
 daemon_start "$BIN"
 "$BIN" create proxy relay -p "$P" --protocol tcp --backend "127.0.0.1:$BE" -s >/dev/null 2>&1
-for _ in $(seq 1 50); do ss -ltn | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 worker=$(ss -ltnp | awk -v p=":$P" '$4 ~ p"$" {match($0,/pid=[0-9]+/); print substr($0,RSTART+4,RLENGTH-4)}' | head -1)
 pipes_of() { ls -l /proc/"$1"/fd 2>/dev/null | grep -c 'pipe:'; }
 base_pipes=$(pipes_of "$worker")
@@ -115,7 +115,7 @@ daemon_stop
 daemon_isolate tcpsplice1
 SOCKETLEY_PROXY_SPLICE=1 daemon_start "$BIN"
 SOCKETLEY_PROXY_SPLICE=1 "$BIN" create proxy relay1 -p "$P" --protocol tcp --backend "127.0.0.1:$BE" -s >/dev/null 2>&1
-for _ in $(seq 1 50); do ss -ltn | grep -q ":$P " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
 worker=$(ss -ltnp | awk -v p=":$P" '$4 ~ p"$" {match($0,/pid=[0-9]+/); print substr($0,RSTART+4,RLENGTH-4)}' | head -1)
 if tr '\0' '\n' < /proc/"$worker"/environ 2>/dev/null | grep -qx 'SOCKETLEY_PROXY_SPLICE=1'; then ok
 else bad "the worker spliced from the first byte is asked to" "SOCKETLEY_PROXY_SPLICE=1 is not in its environment"; fi

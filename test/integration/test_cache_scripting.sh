@@ -313,7 +313,7 @@ want "a returned table whose __index raises leaves the cache up" "+PONG" '[["PIN
 # so the row above cannot decide this one.
 PR=$((SL_PORT_BASE+1463))
 "$BIN" create cache sc_r -p "$PR" -s >/dev/null 2>&1
-for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$PR " && break; sleep 0.1; done
+for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PR " <<<"$listening_now" && break; sleep 0.1; done
 REC='return redis.call(\"eval\", ARGV[1], 0, ARGV[1])'
 want "a script cannot run a script" "not allowed from script" \
   "[[\"EVAL\",\"$REC\",\"0\",\"$REC\"]]" "$PR"

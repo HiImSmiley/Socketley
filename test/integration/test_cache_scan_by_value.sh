@@ -62,9 +62,9 @@ daemon_start "$BIN"
 
 "$BIN" create cache sv_c  -p "$P"  --resp -s >/dev/null 2>&1
 "$BIN" create cache sv_cs -p "$PS" --shards 4 --resp -s >/dev/null 2>&1
-for _ in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$P " && break; sleep 0.1; done
-for _ in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$PS " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$P "; then
+for _ in $(seq 1 150); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break; sleep 0.1; done
+for _ in $(seq 1 150); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PS " <<<"$listening_now" && break; sleep 0.1; done
+if ! { listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now"; }; then
     echo "  FATAL: the cache never bound $P"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 
@@ -286,7 +286,7 @@ else
 fi
 
 echo "--- 7. and the same answer from a sharded cache ---"
-if ss -ltn 2>/dev/null | grep -q ":$PS "; then
+if listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$PS " <<<"$listening_now"; then
     seed "$PS"
     R=$(scan "$PS" COUNT 10000 VALUEMATCH '*berlin*')
     if [ "$(keys_of "$R")" = "other:1 u:1 u:3" ]; then

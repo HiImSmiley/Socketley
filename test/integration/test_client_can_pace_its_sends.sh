@@ -130,7 +130,7 @@ LPID=$!
 # here removes the race; on_connect firing before a connect completes is a
 # separate thing and is named in the message.
 for _ in $(seq 1 200); do
-    ss -ltn 2>/dev/null | grep -q ":$P " && break
+    listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$P " <<<"$listening_now" && break
     sleep 0.05
 done
 
