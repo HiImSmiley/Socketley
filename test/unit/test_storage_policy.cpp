@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
+#include "../../socketley/shared/util/build_cost.h"
 
 #include "../../socketley/runtime/storage/bucket_policy.h"
 #include "../../socketley/shared/util/glob_match.h"
@@ -608,5 +609,5 @@ TEST_CASE("IAM's wildcard answers as the backtracking walk does, and a long patt
     CHECK(socketley::iam_wild_match("*?a?*", str));
     const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     MESSAGE("a 19,000-byte run against 60,000 bytes: " << took << " s");
-    CHECK(took < 0.3);
+    CHECK(took < 0.3 * build_cpu_factor);
 }
