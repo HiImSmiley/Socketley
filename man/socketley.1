@@ -23597,6 +23597,21 @@ An HTTP/2 or HTTP/3 request at an entrance is written back as such a line and
 refused the same way.
 .RE
 .PP
+A
+.B 101 Switching Protocols
+from a backend switches the connection to a byte relay only when the request
+offered an upgrade
+.RB ( "Connection: Upgrade"
+with an
+.B Upgrade
+field), which is the one thing a 101 may answer.
+A 101 to any other request is answered
+.B 502 Bad Gateway
+(or the connection is closed, when part of the answer has already gone out):
+relaying it would carry every later request on the connection past the routes,
+.BR \-\-auth ,
+filters and entrance checks this proxy runs per request.
+.PP
 Every request on a connection is framed and checked on its own, including one
 pipelined behind another.
 Only the body that a request declares travels with it.
