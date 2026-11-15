@@ -870,6 +870,20 @@ bool answerable(const spool_entry& e)
            sender_signed(e);
 }
 
+// Whether `e` came as mail of this runtime's own domains may: from a signed-in user, this machine or this runtime,
+// or with DMARC passed for the domain its From names. A stranger's message whose From is one of ours that DMARC did
+// not pass (none, or fail under p=none or quarantine) is still delivered, but not sent on from here.
+bool arrived_as_own(const spool_entry& e)
+{
+    if (!e.user.empty() || e.bounce || e.peer == "127.0.0.1" || e.peer == "::1" || e.peer == "local")
+        return true;
+    // "; dmarc=<result>" is written once, by this host; a sender's names hold no ';'.
+    constexpr std::string_view passed = "; dmarc=pass";
+    const size_t p = e.auth.find(passed);
+    return p != std::string::npos &&
+           (p + passed.size() == e.auth.size() || e.auth[p + passed.size()] == ' ' || e.auth[p + passed.size()] == ';');
+}
+
 // A folder fileinto may name: printable, no step out of the user's mailboxes.
 bool folder_ok(std::string_view f)
 {
@@ -1092,12 +1106,31 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
     }
     // Sent on once the copies kept are in, so a retry of them sends nothing twice and a refusal sends nothing on.
     const std::string edited = out.header ? *out.header : std::string();
-    // A From the script wrote in is the user's word, so it goes on only as one they could submit.
-    if (!redirects.empty() && !edited.empty())
+    std::string was, now;
+    const size_t n_was = from_headers(header_block(bytes), &was);
+    const size_t n_now = edited.empty() ? n_was : from_headers(edited, &now);
+    const bool from_written = !edited.empty() && (n_was != n_now || was != now);
+    // A From of this runtime's domains as it came is sent on only where it came as such mail may: from the user's
+    // address on the envelope it would pass SPF here and align, so the next hop's DMARC would pass a forgery that
+    // this host's own check did not.
+    if (!redirects.empty() && !from_written && !arrived_as_own(*e) &&
+        !authors_owned(header_block(bytes), [this](const address& a) {
+            std::string d = a.domain;
+            socketley::ascii::lower_in_place(d);
+            return !m_run.is_local_domain(d);
+        }))
     {
-        std::string was, now;
-        const size_t n_was = from_headers(header_block(bytes), &was), n_now = from_headers(edited, &now);
-        if ((n_was != n_now || was != now) && !m_run.sends_on_as_own(user, own, edited))
+        LOG_WARN(("mail: " + own + "'s filter would send on a message whose From is of this runtime's domains, which "
+                  "came from elsewhere without DMARC passing for it, so it is kept rather than sent")
+                     .c_str());
+        redirects.clear();
+        if (puts.empty())
+            puts.push_back({inbox, 0});
+    }
+    // A From the script wrote in is the user's word, so it goes on only as one they could submit.
+    if (!redirects.empty() && from_written)
+    {
+        if (!m_run.sends_on_as_own(user, own, edited))
         {
             LOG_WARN(("mail: " + own + "'s filter wrote a From of another address of this runtime's into a message it "
                       "sends on, so it is kept rather than sent")

@@ -21,6 +21,7 @@
 #     a restart; the active script forgotten by one
 #   * a script deactivated still run
 #   * a vacation answering a sender a stranger only named (backscatter, under this domain's signature)
+#   * a stranger's message whose From is of this domain, DMARC not passed, sent on from the user's aligned address
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -463,6 +464,31 @@ sleep 2
 [ -z "$(grep -l -- "rewritten as bob" "$T"/sink/*.eml 2>/dev/null)" ] \
     && ok "a delivery's filter that writes such a From keeps the message rather than send it on" \
     || bad "a delivery's filter that writes such a From keeps the message rather than send it on" "$(grep -h '^From:' $(grep -l -- 'rewritten as bob' "$T"/sink/*.eml))"
+
+# A stranger's message whose From is of this runtime's domain, which DMARC did not pass, is not sent on: from the
+# user's address it would align with SPF here, and the next hop's DMARC would pass the forgery.
+printf 'redirect "fwd@remote.test";\n' > "$T/fwd.sieve"
+"$BIN" mail m sieve alice put fwd "$T/fwd.sieve" >/dev/null 2>&1
+"$BIN" mail m sieve alice activate fwd >/dev/null 2>&1
+n0=$(keys INBOX | wc -l)
+python3 - "$P" <<'PY'
+import smtplib, sys
+for src, frm, subject in (("127.0.0.2", "Bob <bob@example.test>", "forged own domain"),
+                          ("127.0.0.2", "news@else.test", "a stranger's own"),
+                          ("127.0.0.1", "Bob <bob@example.test>", "own from this machine")):
+    s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=(src, 0)); s.ehlo("x")
+    s.sendmail("bob@example.test" if "example" in frm else "news@else.test", ["alice@example.test"],
+               "From: %s\r\nTo: alice@example.test\r\nSubject: %s\r\n\r\nwire it today\r\n" % (frm, subject))
+    s.quit()
+PY
+at_sink "a stranger's own" >/dev/null && ok "a filter sends on a stranger's message" || bad "a filter sends on a stranger's message" "-"
+at_sink "own from this machine" >/dev/null && ok "and one of this domain from this machine" \
+    || bad "and one of this domain from this machine" "-"
+for _ in $(seq 1 60); do [ "$(keys INBOX | wc -l)" -gt "$n0" ] && break; sleep 0.1; done
+[ -z "$(grep -l -- "forged own domain" "$T"/sink/*.eml 2>/dev/null)" ] && [ "$(keys INBOX | wc -l)" = "$((n0 + 1))" ] \
+    && ok "but keeps one of this domain from a stranger that DMARC did not pass" \
+    || bad "but keeps one of this domain from a stranger that DMARC did not pass" \
+        "inbox $n0 -> $(keys INBOX | wc -l); $(grep -h '^from \|^rcpt ' $(grep -l -- 'forged own domain' "$T"/sink/*.eml 2>/dev/null) 2>/dev/null)"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
