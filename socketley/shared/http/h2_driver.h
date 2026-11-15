@@ -109,13 +109,20 @@ outcome window_update_in(session<S>& s, const frame_head& h, std::string_view pl
             return outcome::conn(PROTOCOL_ERROR);
         if (s.send_win + inc > max_window)
             return outcome::conn(FLOW_CONTROL_ERROR);
+        // Only a connection window that was used up holds back streams this update lets go: while it is open, every
+        // stream with bytes and a window of its own is in the turn already, since drain() leaves one out only when a
+        // window stops it.  Walking them on every update let a peer send 13-byte updates of 1, each walking every
+        // stream -- 200 MB of them cost the storage 14.8 s of its loop with 128 streams waiting, where 200 MB of any
+        // other frame cost 0.5 to 1.1 s (the class of HAProxy's CVE-2026-49975, frames cheap to send and dear to take).
+        const bool was_shut = s.send_win <= 0;
         s.send_win += inc;
-        for (auto& [sid, hnd] : s.streams)
-        {
-            stream& st = state_of(hnd);
-            if (st.tx_left() && st.send_win > 0)
-                enqueue(s, st);
-        }
+        if (was_shut)
+            for (auto& [sid, hnd] : s.streams)
+            {
+                stream& st = state_of(hnd);
+                if (st.tx_left() && st.send_win > 0)
+                    enqueue(s, st);
+            }
         return outcome::taken();
     }
     if (h.sid > s.last_sid)

@@ -386,3 +386,72 @@ TEST_CASE("a SETTINGS that would take one stream's window past 2^31-1 is refused
     CHECK(s.peer_max_frame == 32768);
     CHECK(s.got_settings);
 }
+
+namespace
+{
+// A handle whose stream is reached through a state_of() of its own, so a test can count how often the driver walks.
+struct counted_node
+{
+    std::unique_ptr<h2::stream> h2s{new h2::stream};
+};
+size_t walks = 0;
+h2::stream& state_of(const std::shared_ptr<counted_node>& h)
+{
+    ++walks;
+    return *h->h2s;
+}
+}   // namespace
+
+// HAProxy's CVE-2026-49975 class: a frame cheap to send and dear to take.  A WINDOW_UPDATE of 1 on the connection walked
+// every stream, 128 at the storage, so a flood of them cost 27 times the loop time of any other frame.
+TEST_CASE("a WINDOW_UPDATE on the connection walks the streams only when the connection window was used up")
+{
+    using handle = std::shared_ptr<counted_node>;
+    h2::session<handle> s;
+    s.send_win = 0;
+    for (uint32_t i = 0; i < 128; ++i)
+    {
+        auto n = std::make_shared<counted_node>();
+        n->h2s->sid = 1 + 2 * i;
+        n->h2s->tx = "body";
+        s.streams.emplace(n->h2s->sid, n);
+    }
+    s.last_sid = 255;
+
+    std::string frame;
+    h2::put_window_update(frame, 0, 1);
+    const std::string_view pl = std::string_view(frame).substr(h2::head_len);
+    h2::frame_head h{};
+    h.type = h2::WINDOW_UPDATE;
+    h.len = 4;
+    h.sid = 0;
+
+    // The window was shut, so the first update lets every waiting stream go.
+    walks = 0;
+    CHECK(h2::window_update_in(s, h, pl).kind == h2::outcome::what::taken);
+    CHECK(s.rr.size() == 128);
+    CHECK(walks == 128);
+
+    // While it stays open, ten thousand more walk nothing, and the window still grows by each.
+    walks = 0;
+    for (int i = 0; i < 10000; ++i)
+        REQUIRE(h2::window_update_in(s, h, pl).kind == h2::outcome::what::taken);
+    CHECK(walks == 0);
+    CHECK(s.send_win == 10001);
+
+    // Used up by a turn, it walks again on the next update, and the streams the turn left out are queued again.
+    std::string out;
+    h2::drain(s, out, 0, size_t(1) << 30, [](const handle&) {}, [](const handle&) {}, [](const handle&) {});
+    CHECK(s.send_win == 10001 - 128 * 4);
+    s.send_win = 0;
+    for (auto& [sid, n] : s.streams)
+    {
+        n->h2s->tx = "more";
+        n->h2s->tx_off = 0;
+    }
+    CHECK(s.rr.empty());
+    walks = 0;
+    CHECK(h2::window_update_in(s, h, pl).kind == h2::outcome::what::taken);
+    CHECK(walks == 128);
+    CHECK(s.rr.size() == 128);
+}
