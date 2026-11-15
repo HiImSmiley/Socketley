@@ -16013,7 +16013,20 @@ and kept in the state directory, so a restart signs nobody out. A refresh token
 is read back only by the provider, and is signed HS256 under a secret made from
 that key. A refresh token is good once. A refresh gives the next token of its
 sign-in, which is kept with the account. A refresh token used a second time ends
-that sign-in, including its newest token. Passwords are hashed and checked off
+that sign-in, including its newest token.
+An authorization code is good once and lives a minute. If the client it was given
+to exchanges it a second time, the exchange is refused with
+.B invalid_grant
+and the tokens of the first exchange are revoked (RFC 6749 4.1.2): its refresh
+token, and every access token of that sign-in, refreshed ones included, at
+.BR /userinfo ,
+at the SSH certificate authority and at every runtime that verifies them.
+Another client bringing the code is refused and revokes nothing.
+An access token carries the grant it is of as its
+.BR sid .
+A code that was exchanged is remembered for its minute plus the hour an access
+token lives, and no longer.
+Passwords are hashed and checked off
 the event loop. The runtime uses one thread for each core it may use, up to
 four, shared out among its shards. Each thread computes up to four sign-ins'
 scrypt at once with AVX2. The provider serves plain HTTP and is reached through
@@ -16054,7 +16067,8 @@ answers. So a change made with
 .B idp\-user
 or on the account page holds at every shard once it is answered. A change made
 at another shard is sent to shard 0. A code is redeemed at the shard that gave
-it, which the code names, wherever the exchange arrives. It is good once there.
+it, which the code names, wherever the exchange arrives. It is good once there,
+and a second exchange at any shard revokes what the first one gave.
 A sign-in is counted at every shard while it is being checked. A failed sign-in
 is answered only once every shard counts it against its address and its
 account. So guesses sent at once over the shards share one budget. The number
@@ -23102,7 +23116,18 @@ Behind a proxy on this machine, the address counted is the one in
 X\-Forwarded\-For.
 .IP
 The session is a cookie sealed with a key that the daemon generates at start.
-The cookie is HttpOnly and SameSite=Strict, and also Secure behind HTTPS.
+The cookie is
+.B skl_dash
+(HttpOnly, SameSite=Strict).
+Behind HTTPS (an entrance's X\-Forwarded\-Proto: https) it is
+.B __Host\-skl_dash
+instead, Secure and for this host alone, and only that name is read there.
+A page on another name under the same domain can set a
+.B skl_dash
+of its own that a browser sends first, but no
+.B __Host\-
+cookie of this host.
+Two sessions of different users sent together let neither in.
 It is valid for twelve hours.
 The daemon ends a session when the user signs out, when the user's key is
 removed from the file, or when that key is given another secret.
