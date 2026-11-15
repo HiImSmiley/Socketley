@@ -13701,7 +13701,11 @@ announces, or larger than 32 KiB written as an HTTP/1.1 head.
 .IP \(bu 2
 A handshake not done in 10 seconds is dropped.
 .IP \(bu 2
-A connection is closed after 30 seconds without a packet.
+A connection is closed after 30 seconds without a packet, or after the
+client's own idle timeout when that is shorter.
+While a request is open on it the server sends a PING at half that time, so a
+request whose body pauses is bounded by the runtime's own timeouts, not by
+QUIC's.
 .PP
 The runtime paces what it sends with BBR.
 BBR follows the path's measured rate and round trip rather than backing off at each
@@ -15495,7 +15499,14 @@ turns HTTP/2 off. Over UDP on the same port, the entrance speaks HTTP/3
 An HTTP/3 stream is routed by its own
 .B :authority
 exactly as an HTTP/2 stream is, and a client may have eight of them open at once
-on a connection. A browser that cannot reach the UDP port goes on over TCP.
+on a connection. While a stream is open the entrance keeps its connection alive,
+so a request is bounded by
+.B \-\-idle\-timeout
+and
+.B \-\-backend\-timeout
+as over TCP, and a stream whose body stops past
+.B \-\-backend\-timeout
+is reset as a cancelled request. A browser that cannot reach the UDP port goes on over TCP.
 .B SOCKETLEY_PROXY_HTTP3=0
 opens no UDP socket.
 .IP

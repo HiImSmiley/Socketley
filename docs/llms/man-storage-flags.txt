@@ -1584,7 +1584,7 @@ The limits are:
 - 128 streams are open at once.
 - A request's head is answered 431 when it is larger than 64 KiB as RFC 9114 counts it (each field's name and value and 32 more), the size the server announces, or larger than 32 KiB written as an HTTP/1.1 head.
 - A handshake not done in 10 seconds is dropped.
-- A connection is closed after 30 seconds without a packet.
+- A connection is closed after 30 seconds without a packet, or after the client's own idle timeout when that is shorter. While a request is open on it the server sends a PING at half that time, so a request whose body pauses is bounded by the runtime's own timeouts, not by QUIC's.
 
 The runtime paces what it sends with BBR. BBR follows the path's measured rate and round trip rather than backing off at each lost packet. Over a 50 ms path that loses one packet in a hundred, as Wi-Fi and mobile links do, a download ran ten to twenty times faster than with CUBIC. On a clean path it was as fast. **SOCKETLEY_STORAGE_HTTP3_CC=cubic** (or **reno**) chooses another congestion control. AES-128-GCM is offered first, because every packet is sealed on its own and AES-128-GCM costs a quarter less than AES-256.
 
