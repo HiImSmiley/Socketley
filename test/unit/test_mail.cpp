@@ -1550,6 +1550,53 @@ TEST_CASE("DMARC: pct= samples the policy, two records are none, a name past ASC
     CHECK(socketley::idna::to_ascii("M\xc3\xbcnchen.DE") == "xn--mnchen-3ya.de");
 }
 
+TEST_CASE("a DKIM d= a stranger wrote is told as a name in time linear in it, however many labels or code points")
+{
+    // One label of 20,000 distinct code points (punycode took its length times them: 1.7 s), and 40,000 labels
+    // (every suffix copied to be looked up: their count times its length), each in a signature of an inbound message,
+    // whose d= is read for its organization before anything is checked.
+    std::string wide;
+    for (uint32_t i = 0; i < 20000; ++i)
+    {
+        const uint32_t cp = 0x4E00 + i;
+        wide += static_cast<char>(0xE0 | (cp >> 12));
+        wide += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        wide += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+    wide += ".test";
+    std::string many;
+    for (int i = 0; i < 40000; ++i)
+        many += "a.";
+    many += "example.test";
+    table_resolver r;
+    const std::string msg = "DKIM-Signature: v=1; a=rsa-sha256; d=" + wide + "; s=x; h=from; bh=YQ==; b=YQ==\r\n"
+                            "DKIM-Signature: v=1; a=rsa-sha256; d=" + many + "; s=x; h=from; bh=YQ==; b=YQ==\r\n"
+                            "From: a@example.test\r\n\r\nx\r\n";
+    const auto t0 = thread_cpu_now();
+    CHECK(socketley::idna::to_ascii(wide).empty());
+    CHECK(organizational_domain(wide).empty());
+    CHECK(organizational_domain(many) == many);
+    const inbound_result res = check_inbound(msg, "1.2.3.4", "h", "", r, 0);
+    const auto spent = thread_cpu_now() - t0;
+    MESSAGE("CPU for the two names and the message: " << std::chrono::duration<double>(spent).count() << " s");
+    CHECK(spent < std::chrono::milliseconds(500));
+    CHECK(res.from_domain == "example.test");
+    // A label of 20 code points past ASCII is still one, 60 never fit 63 bytes; a name of 253 bytes still has its
+    // organization.
+    std::string twenty, sixty;
+    for (int i = 0; i < 20; ++i)
+        twenty += "\xc3\xbc";
+    for (int i = 0; i < 60; ++i)
+        sixty += "\xc3\xbc";
+    CHECK(socketley::idna::to_ascii(twenty + ".de").starts_with("xn--"));
+    CHECK(socketley::idna::to_ascii(sixty + ".de").empty());
+    std::string longest = std::string(253 - 13, 'a') + ".example.test";
+    for (size_t i = 60; i < longest.size() - 13; i += 61)
+        longest[i] = '.';
+    REQUIRE(longest.size() == 253);
+    CHECK(organizational_domain(longest) != longest);
+}
+
 TEST_CASE("DMARC: the From domain's policy is read first, so names a sender makes slow cannot spend its budget")
 {
     // A resolver whose budget is one lookup, as the twenty seconds are once a sender's slow names have taken them.

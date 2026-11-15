@@ -54,6 +54,10 @@ void list::load(std::string_view text)
 std::string list::registrable(std::string_view name) const
 {
     const std::string n = lower(name);
+    // Longer than a name may be (RFC 1035 2.3.4), it is no registered one, and stays itself; the walk below copies
+    // every suffix of it, which for a stranger's DKIM d= of 100,000 labels was time of their count times its length.
+    if (n.size() > 253)
+        return n;
     std::vector<size_t> starts;   // where each label begins, from the left
     starts.push_back(0);
     for (size_t i = 0; i < n.size(); ++i)

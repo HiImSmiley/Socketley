@@ -146,6 +146,11 @@ std::string to_ascii(std::string_view name)
         if (std::all_of(cps.begin(), cps.end(), [](uint32_t c) { return c < 0x80; }))
             for (const uint32_t c : cps)
                 l += static_cast<char>(c);
+        // An A-label is "xn--", the label's ASCII, and at least one digit for each other code point: past 59 of them
+        // it is longer than a label may be, which is told before encoding, as punycode takes time of the label's
+        // length times its distinct code points (a stranger's 60 KB DKIM d= took 1.7 s, and grew as its square).
+        else if (cps.size() > 59)
+            return {};
         else if (l = "xn--"; !punycode(cps, l))
             return {};
         if (l.size() > 63)
