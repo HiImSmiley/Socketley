@@ -88,7 +88,7 @@ out = open(sys.argv[2], "a")
 while True:
     d, a = s.recvfrom(4096)
     i, f = struct.unpack("!HH", d[:4])
-    out.write("notify opcode=%d\n" % ((f >> 11) & 15)); out.flush()
+    out.write("notify opcode=%d id=%d\n" % ((f >> 11) & 15, i)); out.flush()
     r = bytearray(d); r[2] |= 0x80
     s.sendto(bytes(r), a)
 EOF
@@ -169,6 +169,10 @@ sleep 2.5
 expect "a broken edit leaves the zone before it" "$(q +short new.example.com A)" "198.51.100.7"
 sleep 2
 expect "the secondary was told once at start and once of the new serial" "$(grep -c 'opcode=4' "$T/notified")" 2
+# RFC 5452 9.2: an ID drawn afresh for each message, not the last one plus one, so one seen does not tell the next.
+ids=$(grep -o 'opcode=4 id=[0-9]*' "$T/notified" | sed 's/.*id=//' | tr '\n' ' ')
+expect "the two NOTIFYs do not carry the same or consecutive IDs" \
+    "$(echo "$ids" | awk '{d=($2-$1+65536)%65536; print (NF==2 && d!=0 && d!=1) ? "apart" : "consecutive: " $0}')" "apart"
 stat_of() { "$BIN" stats ns 2>/dev/null | awk -F: -v k="$1" '$1==k {s+=$2} END {print s+0}'; }
 expect "and answered both, so neither was sent again" "$(stat_of notify_acked) $(stat_of notify_sent)" "2 2"
 expect "the failed reload is counted" "$(stat_of zone_reload_failures)" 1

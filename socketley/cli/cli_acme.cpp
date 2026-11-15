@@ -185,6 +185,17 @@ int dns_wait_seconds()
     return wait;
 }
 
+// Whether a question given back is the one asked, the name's letters in either case (RFC 4343).
+bool same_question(std::string_view got, std::string_view asked)
+{
+    if (got.size() != asked.size() || got.size() < 4 || got.substr(got.size() - 4) != asked.substr(asked.size() - 4))
+        return false;
+    for (size_t i = 0; i + 4 < got.size(); ++i)
+        if (socketley::dns::lower(static_cast<uint8_t>(got[i])) != socketley::dns::lower(static_cast<uint8_t>(asked[i])))
+            return false;
+    return true;
+}
+
 // One question to `host`:`port` over UDP, its answer raw; empty when none came. `recurse` sets RD.
 std::string dns_ask(const std::string& host, const std::string& port, const std::string& qname, uint16_t qtype,
                     bool recurse)
@@ -214,23 +225,32 @@ std::string dns_ask(const std::string& host, const std::string& port, const std:
     hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
     if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &ai) != 0 || !ai)
         return {};
-    const int fd = ::socket(ai->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    // Connected, so the kernel lets in datagrams from that server's address and port alone, to a port it drew; an
+    // answer is then taken by its ID, QR and the question given back (RFC 5452 9.1).
+    int fd = ::socket(ai->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd >= 0 && ::connect(fd, ai->ai_addr, ai->ai_addrlen) != 0)
+    {
+        ::close(fd);
+        fd = -1;
+    }
+    const std::string_view question = std::string_view(q).substr(12);
     for (int attempt = 0; fd >= 0 && attempt < 3 && answer.empty(); ++attempt)
     {
-        if (::sendto(fd, q.data(), q.size(), 0, ai->ai_addr, ai->ai_addrlen) < 0)
+        if (::send(fd, q.data(), q.size(), 0) < 0)
             break;
         pollfd pfd{fd, POLLIN, 0};
         while (::poll(&pfd, 1, 3000) > 0)
         {
             char buf[1500];
             const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
-            if (n < 12)
+            if (n < 0)
                 break;
-            if (buf[0] == q[0] && buf[1] == q[1])
-            {
-                answer.assign(buf, static_cast<size_t>(n));
-                break;
-            }
+            const std::string_view got(buf, static_cast<size_t>(n));
+            if (got.size() < 12 + question.size() || got[0] != q[0] || got[1] != q[1] || !(got[2] & 0x80) ||
+                got[4] != 0 || got[5] != 1 || !same_question(got.substr(12, question.size()), question))
+                continue;
+            answer.assign(got);
+            break;
         }
     }
     if (fd >= 0)

@@ -547,4 +547,18 @@ size_t make_notify(const zone& z, uint16_t id, uint8_t* out, size_t cap)
     return w.overflowed() ? 0 : w.size();
 }
 
+bool is_notify_answer(const uint8_t* msg, size_t len, uint16_t id, std::string_view origin)
+{
+    if (len < header_len || rd16(msg) != id)
+        return false;
+    const uint16_t flags = rd16(msg + 2);
+    if (!(flags & 0x8000) || ((flags >> 11) & 0xF) != opcode::NOTIFY || rd16(msg + 4) != 1)
+        return false;
+    uint8_t name[max_name];
+    size_t next = 0;
+    const size_t n = read_name(msg, len, header_len, name, next);
+    return n != 0 && next + 4 <= len && std::string_view(reinterpret_cast<const char*>(name), n) == origin &&
+           rd16(msg + next) == type::SOA && rd16(msg + next + 2) == rclass::IN;
+}
+
 }   // namespace socketley::dns

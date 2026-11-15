@@ -42,6 +42,7 @@
 #include "../../shared/net/ip_block.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/random_id.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/persist/replaced_file.h"
@@ -345,6 +346,8 @@ private:
     {
         int fd{-1};
         std::string origin;
+        // The origin in wire form, lower case: the question an answer must give back.
+        std::string origin_wire;
         sockaddr_storage to{};
         socklen_t to_len{0};
         uint16_t id{0};
@@ -420,7 +423,6 @@ private:
     std::vector<ip_block> m_transfer;
     std::vector<std::pair<sockaddr_storage, socklen_t>> m_notify_to;
     std::vector<notify_job> m_notify;
-    uint16_t m_notify_id{0};
 
     std::vector<std::unique_ptr<udp_ep>> m_udp;
     std::vector<std::unique_ptr<tcp_listener>> m_tcp;
@@ -1578,9 +1580,11 @@ void dns_run::queue_notify(const zone& z)
     {
         notify_job j;
         j.origin = origin;
+        j.origin_wire = z.origin;
         j.to = to;
         j.to_len = len;
-        j.id = ++m_notify_id;
+        // Drawn afresh for each, so an ID seen or guessed says nothing of the next (RFC 5452 9.2).
+        j.id = static_cast<uint16_t>(random_u64());
         j.next_at = 0;
         m_notify.push_back(j);
     }
@@ -1625,10 +1629,9 @@ bool dns_run::notify_answered(notify_job& j)
             continue;
         if (n < static_cast<ssize_t>(header_len))
             return false;
-        // A response to this NOTIFY: its ID, QR set, opcode NOTIFY. A connected socket takes datagrams from the
-        // secondary's address alone.
-        const uint16_t flags = rd16(buf + 2);
-        if (rd16(buf) == j.id && (flags & 0x8000) && ((flags >> 11) & 0xF) == opcode::NOTIFY)
+        // A response to this NOTIFY: its ID, and the question it asked given back. The socket, connected, takes
+        // datagrams from the secondary's address and port alone, to a port the kernel drew.
+        if (is_notify_answer(buf, static_cast<size_t>(n), j.id, j.origin_wire))
             return true;
     }
 }

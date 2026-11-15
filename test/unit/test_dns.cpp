@@ -552,6 +552,42 @@ TEST_CASE("transfer: SOA, every record, SOA, across messages")
     CHECK(r.qd == 1);
 }
 
+TEST_CASE("a NOTIFY's answer is taken by its ID and the question it gives back, and nothing less")
+{
+    const zone z = load(example_zone);
+    uint8_t q[512];
+    const size_t n = make_notify(z, 0x5a17, q, sizeof q);
+    REQUIRE(n > 0);
+    std::vector<uint8_t> a(q, q + n);
+    a[2] |= 0x80;
+    CHECK(is_notify_answer(a.data(), a.size(), 0x5a17, z.origin));
+    // The name given back in another case is the same name.
+    std::vector<uint8_t> upper = a;
+    for (size_t i = header_len; i < upper.size() - 4; ++i)
+        if (upper[i] >= 'a' && upper[i] <= 'z')
+            upper[i] = static_cast<uint8_t>(upper[i] - 32);
+    CHECK(is_notify_answer(upper.data(), upper.size(), 0x5a17, z.origin));
+
+    CHECK_FALSE(is_notify_answer(a.data(), a.size(), 0x5a18, z.origin));
+    CHECK_FALSE(is_notify_answer(q, n, 0x5a17, z.origin));   // the query itself, QR clear
+    std::vector<uint8_t> other = a;
+    other[header_len + 1] = 'x';   // another zone's name
+    CHECK_FALSE(is_notify_answer(other.data(), other.size(), 0x5a17, z.origin));
+    std::vector<uint8_t> typ = a;
+    wr16(typ.data() + typ.size() - 4, type::A);
+    CHECK_FALSE(is_notify_answer(typ.data(), typ.size(), 0x5a17, z.origin));
+    std::vector<uint8_t> cls = a;
+    wr16(cls.data() + cls.size() - 2, 3);
+    CHECK_FALSE(is_notify_answer(cls.data(), cls.size(), 0x5a17, z.origin));
+    std::vector<uint8_t> none(a.begin(), a.begin() + header_len);
+    wr16(none.data() + 4, 0);   // no question at all
+    CHECK_FALSE(is_notify_answer(none.data(), none.size(), 0x5a17, z.origin));
+    std::vector<uint8_t> query = a;
+    query[2] = static_cast<uint8_t>((query[2] & 0x87) | (opcode::QUERY << 3));
+    CHECK_FALSE(is_notify_answer(query.data(), query.size(), 0x5a17, z.origin));
+    CHECK_FALSE(is_notify_answer(a.data(), a.size() - 1, 0x5a17, z.origin));   // cut short
+}
+
 TEST_CASE("published names and DNS-01 answers join a zone; what the file says wins")
 {
     zone z = load(example_zone);

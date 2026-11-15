@@ -63,6 +63,11 @@ void transfer(const zone& z, const uint8_t* q, size_t question_end, Emit&& emit)
 // A NOTIFY for zone `z` (RFC 1996), with `id`, into `out`; its length.
 size_t make_notify(const zone& z, uint16_t id, uint8_t* out, size_t cap);
 
+// Whether `msg` answers the NOTIFY with `id` for the zone whose origin is `origin` (wire form, lower case): QR set,
+// opcode NOTIFY, and the question it asked -- the origin, SOA, IN -- given back (RFC 1996 3.7, matched as RFC 5452 9.1
+// matches answers). The caller's socket, connected to the secondary, has already taken it from that address alone.
+bool is_notify_answer(const uint8_t* msg, size_t len, uint16_t id, std::string_view origin);
+
 // One record written with its owner, compressing names in its data the way RFC 3597 allows for the types RFC 1035
 // defined, and SRV's target never.
 void write_rr(writer& w, std::string_view owner, uint16_t type, uint32_t ttl, std::string_view rdata);
