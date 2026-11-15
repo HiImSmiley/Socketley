@@ -13,6 +13,10 @@ set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(readlink -f "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
+# The compatibility clients installed beside the suite (aws, mc, rclone, restic, mosquitto_*), taken before
+# daemon_isolate moves HOME: without this, a machine that has them only there skipped every one of them.
+COMPAT="${SOCKETLEY_COMPAT_BIN:-$HOME/.local/share/socketley-test/compat/bin}"
+[ -d "$COMPAT" ] && PATH="$COMPAT:$PATH"
 . "$HERE/lib_daemon.sh"
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_ready.sh"

@@ -51,6 +51,10 @@ set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# The compatibility clients installed beside the suite (aws, mc, rclone, restic, mosquitto_*), taken before
+# daemon_isolate moves HOME: without this, a machine that has them only there skipped every one of them.
+COMPAT="${SOCKETLEY_COMPAT_BIN:-$HOME/.local/share/socketley-test/compat/bin}"
+[ -d "$COMPAT" ] && PATH="$COMPAT:$PATH"
 . "$HERE/lib_daemon.sh"
 . "$HERE/lib_ports.sh"
 exec 2>&1
@@ -593,7 +597,7 @@ if [ -n "$RCLONE" ] && [ -x "$RCLONE" ]; then
     out=$(rc purge :webdav:docs/tree); check "and removes it" "$out" ""
     check "leaving nothing" "$(s3 "$U/docs?list-type=2&prefix=tree/" | grep -c '<Key>')" 0
 else
-    echo "  (rclone not found: its part skipped)"
+    echo "  SKIP: rclone is not on PATH, so its part is not run"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
