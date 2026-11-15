@@ -626,4 +626,18 @@ void write_encoder::add_metadata(const metadata& m)
         put_bytes_field(m_out, 0x2a, m.unit);
 }
 
+bool series_fits(const series& s, const series_bounds& b)
+{
+    if (s.labels.size() > b.max_labels)
+        return false;
+    size_t bytes = 0;
+    for (const label& l : s.labels)
+    {
+        if (l.name.size() > b.max_name)
+            return false;
+        bytes += l.name.size() + l.value.size();
+    }
+    return bytes <= b.max_bytes;
+}
+
 }   // namespace socketley::metrics::remote

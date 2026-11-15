@@ -116,6 +116,17 @@ private:
     std::vector<sample> m_samples;
 };
 
+// What one written series may carry to be stored: at most `max_labels` labels, no name longer than `max_name` bytes,
+// and at most `max_bytes` of names and values together. The metrics runtime gives a scraped line's bounds, so a
+// request cannot make a series larger than a scrape could.
+struct series_bounds
+{
+    size_t max_labels;
+    size_t max_name;
+    size_t max_bytes;
+};
+bool series_fits(const series& s, const series_bounds& b);
+
 // Builds a WriteRequest a series at a time; the caller gives each series' labels sorted by name, as Prometheus wants.
 class write_encoder
 {

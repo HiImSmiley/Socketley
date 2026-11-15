@@ -316,9 +316,8 @@ namespace
 // A WriteRequest's series into the store, each refused one counted rather than failing the rest.
 struct write_into final : remote::write_sink
 {
-    static constexpr size_t max_labels = text_limits{}.max_labels;
-    static constexpr size_t max_name = text_limits{}.max_name;
-    static constexpr size_t max_series_bytes = text_limits{}.max_line;
+    static constexpr remote::series_bounds bounds{text_limits{}.max_labels, text_limits{}.max_name,
+                                                  text_limits{}.max_line};
     store& st;
     label_set ls;
     uint64_t appended{0}, refused{0};
@@ -328,14 +327,7 @@ struct write_into final : remote::write_sink
     {
         // Held to what a scraped line may carry: its labels, a name's length and the line's bytes, so one request of
         // its 32 MiB cannot make a series of any size, nor the series bound of any memory.
-        size_t bytes = 0;
-        bool fits = s.labels.size() <= max_labels;
-        for (const auto& l : s.labels)
-        {
-            fits = fits && l.name.size() <= max_name;
-            bytes += l.name.size() + l.value.size();
-        }
-        if (!fits || bytes > max_series_bytes)
+        if (!remote::series_fits(s, bounds))
         {
             refused += s.samples.size();
             return;
