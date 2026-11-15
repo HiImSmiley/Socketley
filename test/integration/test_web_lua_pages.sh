@@ -10,7 +10,8 @@
 # by the old version, a page past the root or one a request may not name run, a
 # raise answered with a 200, a file shadowed by a page, a POST refused where
 # a page takes it, or a page that waits on socketley.http holding every other
-# request of the runtime until it is answered.
+# request of the runtime until it is answered; or a table a page keeps across
+# requests, rendered from, handing the next visitor the last one's req.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -89,6 +90,15 @@ echo(tostring(ok), " ", tostring(why):match("call it from the page itself") and 
 EOF
 echo 'one {{ x }}' > "$W/_views/v.tpl"
 echo 'return render("_views/v.tpl", { x = "x" })' > "$W/vt.lua"
+# A table the page keeps across requests, rendered from: neither the visitor before's req nor what its template set
+# may be read through it by the next.
+cat > "$W/kept.lua" <<'EOF'
+_G.KEPT = _G.KEPT or { x = "k" }
+local before = KEPT.req and KEPT.req.get.who or "none"
+local out = render("_views/set.tpl", KEPT)
+echo((out:gsub("%s", "")), " ", before, " ", tostring(rawget(KEPT, "mark")))
+EOF
+printf '{%% mark = req.get.who %%}{{ x }}' > "$W/_views/set.tpl"
 cat > "$W/esc.lua" <<'EOF'
 echo(escape([[a&b<c>d"e'f]]), "|", escape(42), "|", escape("plain"))
 echo("|", url_decode("a+b%41%4a%zz%4"), "|", url_decode("plain"))
@@ -187,6 +197,9 @@ echo 'echo("v2, longer")' > "$W/edit.lua"
 check "an edited page is compiled again" "v2, longer" "$(get /edit.lua)"
 check "render from a coroutine the page made says where to call it from" "false said" "$(get /inco.lua)"
 check "a template before its edit" "one x" "$(get /vt.lua)"
+get '/kept.lua?who=alice' >/dev/null
+check "a table a page keeps and renders from carries neither the last visitor's req nor what its template set" \
+      "k none nil" "$(get '/kept.lua?who=bob')"
 echo 'two {{ x }}' > "$W/_views/v.tpl"
 check "and an edited template, which the page was not asked about again until the site changed" "two x" "$(get /vt.lua)"
 

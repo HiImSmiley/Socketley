@@ -224,7 +224,14 @@ local function render(name, values)
     -- A number is never anything to escape.
     if israw or type(x) == "number" then b[#b + 1] = tostring(x) else b[#b + 1] = escape(x) end
   end
-  local tenv = setmetatable(values or {}, { __index = st.env })
+  -- A table of its own, the values copied in: the caller's table is not given this request's env behind it, which a
+  -- table that outlives the request (a module's, a cached one) would have carried to the next visitor, who read the
+  -- first one's req and session through any name it lacked; nor does a template's assignment reach it.
+  local tenv = {}
+  if values ~= nil then
+    for k, x in pairs(values) do tenv[k] = x end
+  end
+  setmetatable(tenv, { __index = st.env })
   setfenv(f, tenv)
   f()(o, v, path_of, tenv)
   return concat(b)
