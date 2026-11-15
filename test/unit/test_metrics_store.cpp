@@ -16,6 +16,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <time.h>
 #include <unistd.h>
 
 #include "runtime/metrics/metrics_block.h"
@@ -1330,19 +1331,37 @@ TEST_CASE("a selector's regexes over the label values are held to the query's ti
         REQUIRE(s.append(id, T0 + 1000, 1));
     }
     eng.limits().timeout_ms = 120'000;
+    // The three with the 9,000 names against the same three naming only what they keep, each the least of five
+    // taken in turn: a ratio of two runs side by side, where a wall-clock bound measured the box (0.15-0.17 s quiet,
+    // 0.21-0.6 s with eight busy loops beside it, red at 0.5 s in 3 of 4 runs).  The process's CPU, as the series are
+    // read on helper threads: what the query costs, not when those threads were let run.
+    const auto cpu_now = [] {
+        timespec ts{};
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+        return double(ts.tv_sec) + double(ts.tv_nsec) / 1e9;
+    };
+    const auto three = [&](const std::string& names) {
+        const double t1 = cpu_now();
+        REQUIRE_MESSAGE(eng.eval_instant("sum by (" + names + "a, a) (g)", T0 + 2000, r, err), err.message);
+        CHECK(r.series.size() == 7);
+        REQUIRE_MESSAGE(eng.eval_instant("count without (" + names + "b, c) (g)", T0 + 2000, r, err), err.message);
+        CHECK(r.series.size() == 7);
+        REQUIRE_MESSAGE(eng.eval_instant("count(g * on (" + names + "a, b) g)", T0 + 2000, r, err), err.message);
+        CHECK(r.series.at(0).points.at(0).v == 30000);
+        return cpu_now() - t1;
+    };
     std::string names;
     for (int i = 0; i < 9000; ++i)
         names += "n" + std::to_string(i) + ",";
-    const auto t1 = std::chrono::steady_clock::now();
-    REQUIRE_MESSAGE(eng.eval_instant("sum by (" + names + "a, a) (g)", T0 + 2000, r, err), err.message);
-    CHECK(r.series.size() == 7);
-    REQUIRE_MESSAGE(eng.eval_instant("count without (" + names + "b, c) (g)", T0 + 2000, r, err), err.message);
-    CHECK(r.series.size() == 7);
-    REQUIRE_MESSAGE(eng.eval_instant("count(g * on (" + names + "a, b) g)", T0 + 2000, r, err), err.message);
-    CHECK(r.series.at(0).points.at(0).v == 30000);
-    const double grouped = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
-    MESSAGE("by, without and on of 9,002 names over 30,000 series: " << grouped << " s");
-    CHECK(grouped < 0.5);
+    double grouped = 1e9, plain = 1e9;
+    for (int round = 0; round < 5; ++round)
+    {
+        grouped = std::min(grouped, three(names));
+        plain = std::min(plain, three(""));
+    }
+    MESSAGE("by, without and on of 9,002 names over 30,000 series: " << grouped << " s of CPU, of their own two: "
+            << plain << " s");
+    CHECK(grouped < 3 * plain);
 }
 
 TEST_CASE("perf: a dashboard's sum by (code) (rate(x[1m])) over 50,000 counters of six minutes at 1 s")
