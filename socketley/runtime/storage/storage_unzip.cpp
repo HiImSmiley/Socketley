@@ -10,6 +10,7 @@
 #include "../../shared/util/inflate.h"
 #include "sse.h"
 #include "tierer.h"
+#include "zip_layout.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/utf8.h"
 #include "../../shared/json/json_escape.h"
@@ -156,6 +157,8 @@ struct storage_run::unzip_job : std::enable_shared_from_this<unzip_job>
         uint64_t    csize{0};
         uint64_t    usize{0};
         uint64_t    local{0};
+        // Where the next file's header or the directory begins, which this one's bytes end by.
+        uint64_t    limit{0};
         uint32_t    crc{0};
         uint16_t    method{0};
         bool        dir{false};
@@ -497,7 +500,7 @@ void storage_run::unzip_job::start_entry(size_t i)
             return;
         }
         const uint64_t first = e.local + 30 + rd16(h, 26) + rd16(h, 28);
-        if (first > self->meta.size || e.csize > self->meta.size - first)
+        if (first > e.limit || e.csize > e.limit - first)
         {
             self->entry_done(i, false);
             return;
@@ -710,7 +713,7 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
                     j->refuse(400, "The archive's directory is too large or not where it says.\n");
                     return;
                 }
-                j->read_range(cd_off, cd_size, [this, wj, count, size](bool ok, std::string d)
+                j->read_range(cd_off, cd_size, [this, wj, count, size, cd_off, cd_size](bool ok, std::string d)
                 {
                     auto j = wj.lock();
                     if (!j)
@@ -800,6 +803,19 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
                         }
                         j->entries.push_back(std::move(e));
                     }
+                    // Files that share their bytes would each unpack the same stretch again: refused whole.
+                    std::vector<zip_span> spans;
+                    for (const auto& en : j->entries)
+                        if (!en.dir)
+                            spans.push_back({en.local, en.csize, 0});
+                    if (!zip_spans_apart(spans, size, cd_off, cd_size))
+                    {
+                        j->refuse(400, "The archive's files overlap one another or its directory, as a ZIP bomb's do.\n");
+                        return;
+                    }
+                    for (size_t k = 0, f = 0; k < j->entries.size(); ++k)
+                        if (!j->entries[k].dir)
+                            j->entries[k].limit = spans[f++].limit;
                     j->launch();
                 });
             };

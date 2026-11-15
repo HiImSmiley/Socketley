@@ -28,6 +28,8 @@
 #   * a folder's ZIP not holding its files byte for byte, its Content-Length
 #     not its length, a selection taking more than it named, or the ZIP
 #     giving what its reader may not read
+#   * a ZIP whose files share one stretch of bytes (the overlapping-file bomb) unpacked
+#     into as many copies of it as it names
 #   * a ZIP entry named so it unpacks outside its folder ("..", a leading or
 #     doubled '/', '\\'), with a control character, or twice under one name
 #   * a user's watch positions seen by another user, kept for what the user
@@ -397,6 +399,17 @@ b = bytearray(open(t + "/broken.zip", "rb").read())
 i = b.find(b"PK\x03\x04", 10)           # the second entry's local header, its deflated bytes after it
 b[i + 30 + 7 + 3] ^= 0xff
 open(t + "/broken.zip", "wb").write(bytes(b))
+# Forty files of the directory naming one deflated MiB, as a ZIP bomb's overlapping files do: 40 MiB out of 1 KiB.
+import struct
+with zipfile.ZipFile(t + "/one.zip", "w") as z:
+    z.writestr("f00.bin", b"\0" * (1 << 20), zipfile.ZIP_DEFLATED, 9)
+b = open(t + "/one.zip", "rb").read()
+cd = b.find(b"PK\x01\x02")
+eocd = b.find(b"PK\x05\x06")
+rec = b[cd:eocd]
+recs = b"".join(rec.replace(b"f00.bin", b"f%02d.bin" % k) for k in range(40))
+end = b[eocd:eocd + 8] + struct.pack("<HHII", 40, 40, len(recs), cd) + b"\0\0"
+open(t + "/overlap.zip", "wb").write(b[:cd] + recs + end)
 ZEOF
 unzip_code() { curl -s -m 60 -o "$T/unzip.json" -w '%{http_code}' "$@"; }
 check "a ZIP is put" "$(code -u "$A" -T "$T/mixed.zip" "$U/~dav/docs/arch/mixed.zip")" 201
@@ -427,6 +440,10 @@ check "a file whose bytes do not open to its CRC fails" \
       "5001 1 ['bad.txt']"
 check "and is not written, while the rest are" \
       "$(code -u "$A" "$U/~dav/docs/arch/broken/bad.txt") $(curl -s -u "$A" "$U/~dav/docs/arch/broken/good.txt")" "404 good"
+code -u "$A" -T "$T/overlap.zip" "$U/~dav/docs/arch/overlap.zip" >/dev/null
+check "an archive whose files share their bytes is refused whole, as a ZIP bomb" \
+      "$(unzip_code -u "$A" -X POST "$U/~dav/docs/arch/overlap.zip?unzip") $(code -u "$A" "$U/~dav/docs/arch/overlap/f00.bin") $(code -u "$A" "$U/~dav/docs/arch/overlap/f39.bin")" \
+      "400 404 404"
 
 # Watch positions, a user's own.
 pos() { curl -s -b "skl_ui=$ck" -H 'X-Socketley-UI: 1' -o /dev/null -w '%{http_code}' -X POST -d "$1" "$U/~ui/progress"; }
