@@ -3334,6 +3334,55 @@ def h2session_seeds():
         "http1": seed(0, 0, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
     }
 
+def decoders_seeds():
+    import io, struct, tarfile, gzip, zipfile
+    def u64(*v):
+        return b"".join(struct.pack("<Q", x) for x in v)
+    def tar_of(gz):
+        b = io.BytesIO()
+        with tarfile.open(fileobj=b, mode="w", format=tarfile.PAX_FORMAT) as t:
+            for name, data in (("state/a.json", b"{}"), ("state/" + "d" * 120 + "/long.txt", b"long name\n")):
+                i = tarfile.TarInfo(name)
+                i.size = len(data)
+                t.addfile(i, io.BytesIO(data))
+        # gzip's own time left at 0, so the seed is the same bytes at every run.
+        return gzip.compress(b.getvalue(), mtime=0) if gz else b.getvalue()
+    wide = "".join(chr(0x4E00 + i) for i in range(70)).encode()
+    return {
+        # 0: modified UTF-7 mailbox names.
+        "utf7_rfc3501": b"\0~peter/mail/&U,BTFw-/&ZeVnLIqe-",
+        "utf7_amp": b"\0A&-B",
+        "utf7_astral": b"\0&2D3eAA- Smile",
+        "utf7_cr": b"\0&AA0ACg-",
+        "utf7_utf8": b"\0Entw\xc3\xbcrfe",
+        # 1: names as A-labels and their registrable domain.
+        "name_idn": b"\1M\xc3\xbcnchen.example.co.uk",
+        "name_wide_label": b"\1" + wide + b".test",
+        "name_many_labels": b"\1" + b"a." * 200 + b"example.com",
+        "name_exception": b"\1a.www.ck",
+        # 2: RFC 2047 words, quoted-printable, base64, RFC 2231.
+        "mime_words": b"\2=?utf-8?B?w6TDtsO8?= =?iso-8859-1?Q?caf=E9_au_lait?=",
+        "mime_iconv": b"\2=?shift_jis?B?gqCCoA==?= =?koi8-r?Q?=F0=D2=C9?=",
+        "mime_qp_soft": b"\2line one=\r\n continued =41=4",
+        "mime_rfc2231": b"\2name=utf-8'de'Gr%C3%BC%C3%9Fe.txt",
+        "mime_rfc2231_charset": b"\2n=iso-2022-jp''%1B%24B%24%22%1B%28B",
+        # 3: base64, both alphabets.
+        "b64_std": b"\3aGVsbG8gd29ybGQ=",
+        "b64_url": b"\3eyJhbGciOiJFUzI1NiJ9",
+        "b64_stray_bits": b"\3aGVsbG8gd29ybGR=",
+        # 4: %XX.
+        "pct": b"\4/a%20b/%2e%2E/%zz%4+x",
+        # 5: a ZIP's layout: size, directory place and size, then each file's place and compressed size.
+        "zip_apart": b"\5" + u64(4000, 3000, 200, 0, 100, 200, 500, 1000, 1000),
+        "zip_overlap": b"\5" + u64(4000, 3000, 200) + u64(0, 1000) * 40,
+        "zip_into_directory": b"\5" + u64(4000, 3000, 200, 2900, 150),
+        "zip_huge_csize": b"\5" + u64(4000, 3000, 200, 10, 0xFFFFFFFFFFFFFFF0),
+        # 6: tar, plain and gzip'd, with a pax name.
+        "tar_plain": b"\6" + tar_of(False),
+        "tar_gzip": b"\6" + tar_of(True),
+        "tar_gzip_header_flags": b"\6" + b"\x1f\x8b\x08\x1c\0\0\0\0\0\xff" + b"\x05\x00extra" + b"name\0comment\0",
+    }
+
 def main(argv):
     root = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
     total = 0
@@ -3358,7 +3407,8 @@ def main(argv):
                         ("statejson", statejson_seeds()),
                         ("wsreassembly", wsreassembly_seeds()),
                         ("respdispatch", respdispatch_seeds()),
-                        ("sievebudget", sievebudget_seeds())):
+                        ("sievebudget", sievebudget_seeds()),
+                        ("decoders", decoders_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

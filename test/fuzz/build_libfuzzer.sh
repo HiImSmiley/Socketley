@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp fuzz_http_codecs fuzz_fastcgi fuzz_lua_json fuzz_storage_parsers fuzz_mail_sessions fuzz_h2_session fuzz_sieve_budget fuzz_state_json fuzz_ws_reassembly fuzz_resp_dispatch"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp fuzz_http_codecs fuzz_fastcgi fuzz_lua_json fuzz_storage_parsers fuzz_mail_sessions fuzz_h2_session fuzz_sieve_budget fuzz_state_json fuzz_ws_reassembly fuzz_resp_dispatch fuzz_decoders"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -137,6 +137,13 @@ want fuzz_db && build fuzz_db "$ROOT/test/fuzz/fuzz_db.cpp" "$ROOT/socketley/run
     "$ROOT/socketley/shared/crypto/key_file.cpp" "$ROOT/socketley/shared/util/base64.cpp" -lcrypto
 want fuzz_http_codecs && build fuzz_http_codecs "$ROOT/test/fuzz/fuzz_http_codecs.cpp" "$ROOT/socketley/shared/http/hpack.cpp" \
     "$ROOT/socketley/shared/util/inflate.cpp" "$ROOT/socketley/shared/util/deflate.cpp" "$ROOT/socketley/shared/util/crc.cpp"
+want fuzz_decoders && build fuzz_decoders "$ROOT/test/fuzz/fuzz_decoders.cpp" \
+    "$ROOT/socketley/runtime/mail/imap_utf7.cpp" "$ROOT/socketley/runtime/mail/mail_mime.cpp" \
+    "$ROOT/socketley/runtime/mail/mail_compose.cpp" "$ROOT/socketley/runtime/mail/smtp_session.cpp" \
+    "$ROOT/socketley/shared/net/idna.cpp" "$ROOT/socketley/shared/net/public_suffix.cpp" \
+    "$ROOT/socketley/shared/util/base64.cpp" "$ROOT/socketley/shared/persist/tar_archive.cpp" \
+    "$ROOT/socketley/shared/util/inflate.cpp" "$ROOT/socketley/shared/util/deflate.cpp" \
+    "$ROOT/socketley/shared/util/crc.cpp" -lpthread
 want fuzz_h2_session && build fuzz_h2_session "$ROOT/test/fuzz/fuzz_h2_session.cpp" -std=c++23 \
     "$ROOT/socketley/shared/http/hpack.cpp" "$ROOT/socketley/shared/http/mux_head.cpp"
 want fuzz_sieve_budget && build fuzz_sieve_budget "$ROOT/test/fuzz/fuzz_sieve_budget.cpp" -std=c++23 \

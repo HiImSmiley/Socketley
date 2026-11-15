@@ -1437,6 +1437,35 @@ project "fuzz_http_codecs"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the decoders no other target reaches: modified UTF-7, IDNA, MIME words, base64, %XX, a ZIP's layout, tar ───
+
+project "fuzz_decoders"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_decoders.cpp",
+        "socketley/runtime/mail/imap_utf7.cpp",
+        "socketley/runtime/mail/mail_mime.cpp",
+        "socketley/runtime/mail/mail_compose.cpp",
+        "socketley/runtime/mail/smtp_session.cpp",
+        "socketley/shared/net/idna.cpp",
+        "socketley/shared/net/public_suffix.cpp",
+        "socketley/shared/util/base64.cpp",
+        "socketley/shared/persist/tar_archive.cpp",
+        "socketley/shared/util/inflate.cpp",
+        "socketley/shared/util/deflate.cpp",
+        "socketley/shared/util/crc.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+    links { "pthread" }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: RESP2 command parsing (header-only, no libs) ───
 
 project "fuzz_resp"
