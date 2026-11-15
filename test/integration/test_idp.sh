@@ -36,6 +36,8 @@
 #   * a cookie of an account renamed since still taken, carrying the old name another account may be given
 #   * a session signed out still taken from a copy of its cookie, or a sign-out ending the account's other sessions
 #   * another site's page signing its visitors out of the provider unasked
+#   * a session another name under the domain planted beside the provider's (a bucket's website, say) taken for the
+#     visitor's: at the provider, which reads its own __Host- cookie over https, or at a runtime given two accounts' sessions
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -748,11 +750,31 @@ expect "the provider's own page still signs in, by its Origin" \
     "$(F2 'rd=/&username=carol&password=carolpassword1' -H 'Origin: https://auth.example.com')" 302
 expect "and by what the browser says of it, under whichever of its names it was asked" \
     "$(F2 'rd=/&username=carol&password=carolpassword1' -H 'Origin: https://login.example.com' -H 'Sec-Fetch-Site: same-origin')" 302
-CAROL=$(curl -s -i -X POST -H 'Origin: https://auth.example.com' -d 'rd=/&username=carol&password=carolpassword1' "http://127.0.0.1:$P2/login" | sed -n 's/^[Ss]et-[Cc]ookie: \(skl_idp=[^;]*\).*/\1/p' | head -1)
+# A browser's Cookie field for what a sign-in sets: the domain's skl_idp and the provider's own __Host- copy.
+signin2() { curl -s -i -X POST -H 'Origin: https://auth.example.com' -d "rd=/&username=$1&password=$2" "http://127.0.0.1:$P2/login" |
+            tr -d '\r' | sed -n 's/^[Ss]et-[Cc]ookie: \(\(__Host-\)\{0,1\}skl_idp=[^;]*\).*/\1/p' | paste -sd ';' | sed 's/;/; /g'; }
+SETC=$(curl -s -i -X POST -H 'Origin: https://auth.example.com' -d 'rd=/&username=carol&password=carolpassword1' "http://127.0.0.1:$P2/login" | tr -d '\r' | grep -i '^set-cookie: __Host-skl_idp=')
+case "$SETC" in *"; Path=/; HttpOnly; SameSite=Lax; Secure"*) case "$SETC" in *Domain=*) bad "the provider's own cookie names no domain" "$SETC" ;; *) ok ;; esac ;;
+    *) bad "over https the provider also sets its own __Host- cookie, Secure, of its host alone" "$SETC" ;; esac
+CAROL=$(signin2 carol carolpassword1)
 expect "a device allowed from a page under the cookie domain is refused before its code is looked at" \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Cookie: $CAROL" -H 'Origin: https://share.example.com' -d 'user_code=ABCD-EFGH&action=allow' "http://127.0.0.1:$P2/device")" 403
 expect "where the provider's own page is answered that the code is not known" \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Cookie: $CAROL" -H 'Origin: https://auth.example.com' -d 'user_code=ABCD-EFGH&action=allow' "http://127.0.0.1:$P2/device")" 400
+
+# A page on any name under the domain -- a bucket's website there, say -- can set a skl_idp of its own, with the
+# session of an account its maker holds, at a longer path that the browser then sends first; it cannot take the
+# provider's away, nor set the provider's __Host- one. Its visitor stays who signed in, and one who has not is no one.
+"$BIN" idp-user auth2 add mallory --password mallorypassword1 >/dev/null 2>&1
+MAL=$(signin2 mallory mallorypassword1)
+MAL_DOMAIN=$(printf '%s\n' "$MAL" | tr ';' '\n' | sed 's/^ *//' | grep '^skl_idp=')
+whoat() { curl -s -H "Cookie: $1" "http://127.0.0.1:$P2/account" | sed -n 's/.*Signed in as <b>\([^<]*\)<.*/\1/p'; }
+expect "carol's browser is carol at the provider" "$(whoat "$CAROL")" carol
+expect "a session another name under the domain planted in front of hers does not make her its account" \
+    "$(whoat "$MAL_DOMAIN; $CAROL")" carol
+expect "nor signs in a browser that had not" "$(whoat "$MAL_DOMAIN")" ""
+expect "and a sign-out clears the provider's own cookie too" \
+    "$(curl -s -i -H "Cookie: $CAROL" "http://127.0.0.1:$P2/logout" | tr -d '\r' | grep -ci '^set-cookie: __Host-skl_idp=; .*Max-Age=0')" 1
 
 # Only the entrance, on 127.0.0.1, names the client a request came from. A tunnel hands its TCP visitors to a service
 # on this machine from 127.0.0.2, and one of them that wrote its own X-Forwarded-For had each guess counted against
@@ -789,12 +811,20 @@ expect "or names the runtime" \
     "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Socketley-UI: 1' -H "Cookie: $CAROL1" "http://127.0.0.1:$((PX + 2))/files2/~ui/session")" 403
 expect "where without the cookie nobody is signed in" \
     "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Socketley-UI: 1' "http://127.0.0.1:$((PX + 1))/files/~ui/session")" 401
+# A session of another account planted beside one (see mallory above) makes a runtime take neither, not the first.
+"$BIN" idp-user auth add yan --password yanpassword1234 >/dev/null 2>&1
+CAROLA=$(curl -s -i -X POST -H "Origin: http://127.0.0.1:$PI" -H 'X-Forwarded-For: 198.51.100.201' -d 'rd=/&username=yan&password=yanpassword1234' "http://127.0.0.1:$PI/login" | sed -n 's/^[Ss]et-[Cc]ookie: \(skl_idp=[^;]*\).*/\1/p' | head -1)
+[ -n "$CAROLA" ] && ok || bad "a second account of the first provider signs in" "no cookie"
+expect "a storage takes no sign-in from sessions of two accounts sent together" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Socketley-UI: 1' -H "Cookie: $CAROLA; $CAROL1" "http://127.0.0.1:$PS/~ui/session")" 401
+expect "while two of one account are that account" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Socketley-UI: 1' -H "Cookie: $CAROL1; $CAROL1" "http://127.0.0.1:$PS/~ui/session")" 403
 
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
 # The worker reports at its ticks, so the account made above is in what `stats` says within a few of them.
-for _ in $(seq 1 80); do STATS=$("$BIN" stats auth 2>/dev/null); case "$STATS" in *"accounts:15"*) break ;; *) sleep 0.1 ;; esac; done
-case "$STATS" in *"accounts:15"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+for _ in $(seq 1 80); do STATS=$("$BIN" stats auth 2>/dev/null); case "$STATS" in *"accounts:16"*) break ;; *) sleep 0.1 ;; esac; done
+case "$STATS" in *"accounts:16"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 # At a terminal, --password - asks twice and shows neither, as a password prompt does: typed only once each is asked.
 out=$(python3 - "$BIN" <<'PY'

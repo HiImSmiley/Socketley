@@ -20,6 +20,10 @@ namespace socketley::idp
 
 // The cookie an idp runtime signs a browser in with, which every runtime that trusts it reads.
 inline constexpr std::string_view session_cookie_name = "skl_idp";
+// The same session as a cookie of the provider's host alone, which the provider takes its own sign-in from where it is
+// served over HTTPS: a page on another name under the same domain can set a skl_idp of its own that the browser sends
+// here first (at a longer path), but no __Host- cookie of another host's.
+inline constexpr std::string_view host_cookie_name = "__Host-skl_idp";
 // The cookie a browser keeps once an account has signed in on it, which only the provider reads.
 inline constexpr std::string_view known_cookie_name = "skl_idp_known";
 // What an unknown user's password is checked against, a hash of the cost of a real one that no password makes: a

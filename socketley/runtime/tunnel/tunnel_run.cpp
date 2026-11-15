@@ -160,6 +160,7 @@ std::string forwarded_head(std::string_view head, bool drop_authorization)
         if (colon != std::string_view::npos && ascii::iequals(name, "cookie"))
         {
             const std::string kept = http::without_cookies(field.substr(colon + 1), {socketley::idp::session_cookie_name,
+                                                                                     socketley::idp::host_cookie_name,
                                                                                      socketley::idp::known_cookie_name});
             if (!kept.empty())
                 out.append("Cookie: ").append(kept).append("\r\n");

@@ -859,10 +859,18 @@ void idp_run::fetch_client(const std::shared_ptr<conn>& c, const std::string& id
 
 const account* idp_run::session_of(const request& rq, int64_t* auth_time) const
 {
-    // Every skl_idp cookie the request carries, since a browser sends one per domain it was set for.
+    // Over HTTPS the provider's own sign-in is its host's __Host- cookie alone, which no other name can set; the
+    // domain's skl_idp beside it is for the runtimes under --cookie-domain, and a page on any name under the domain can
+    // add one of its own (an attacker's session, at a longer path the browser sends first) but not take ours away.
+    // Over plain http, which is this machine alone, there is no such cookie and skl_idp is read.
+    const std::string_view name = m_secure_cookie ? host_cookie_name : session_cookie_name;
     const int64_t now = wall::now_sec();
     const account* found = nullptr;
-    http::for_each_cookie(rq.cookie, session_cookie_name, [&](std::string_view v) {
+    int64_t found_auth = 0;
+    bool two = false;
+    // Every cookie of the name the request carries, since a browser sends one per domain and path it was set for; two
+    // that name different accounts are one planted beside the other, and neither is taken.
+    http::for_each_cookie(rq.cookie, name, [&](std::string_view v) {
         claims c;
         std::string why;
         if (!m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, v, now, c, why) || claim(c, "aud") != "session")
@@ -872,12 +880,21 @@ const account* idp_run::session_of(const request& rq, int64_t* auth_time) const
         if (a && !a->disabled() && a->field("reset") != "1" && still_signed_in(*a, issued_ms(c)) &&
             (sid.empty() || a->field(std::string(signed_out_prefix) + sid).empty()))
         {
+            if (found && found != a)
+            {
+                two = true;
+                return true;
+            }
+            if (!found)
+                found_auth = claim_int(c, "auth_time");
             found = a;
-            if (auth_time)
-                *auth_time = claim_int(c, "auth_time");
         }
-        return found != nullptr;
+        return false;
     });
+    if (two)
+        return nullptr;
+    if (found && auth_time)
+        *auth_time = found_auth;
     return found;
 }
 
@@ -895,14 +912,16 @@ std::string idp_run::session_cookie(const account& who, bool remember) const
                              ",\"iat_ms\":" + std::to_string(wall::now_ms()) +
                              ",\"auth_time\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + life) +
                              ",\"sid\":" + socketley::json::quote(socketley::random_hex(12));
-    std::string h = "Set-Cookie: " + std::string(session_cookie_name) + "=" + sign_token(m_key, m_kid, "session+jwt", body) +
-                    "; Path=/; HttpOnly; SameSite=Lax";
-    if (remember)
-        h += "; Max-Age=" + std::to_string(life);
+    const std::string token = sign_token(m_key, m_kid, "session+jwt", body);
+    const std::string max_age = remember ? "; Max-Age=" + std::to_string(life) : std::string();
+    std::string h = "Set-Cookie: " + std::string(session_cookie_name) + "=" + token + "; Path=/; HttpOnly; SameSite=Lax" + max_age;
     if (m_secure_cookie)
         h += "; Secure";
     if (!m_cookie_domain.empty())
         h += "; Domain=" + m_cookie_domain;
+    // The provider's own copy, of its host alone (see session_of).
+    if (m_secure_cookie)
+        h += "\r\nSet-Cookie: " + std::string(host_cookie_name) + "=" + token + "; Path=/; HttpOnly; SameSite=Lax; Secure" + max_age;
     // A browser given a session is one the account signed in on, which guesses at it from elsewhere do not hold up.
     return h + "\r\n" + known_cookie(who);
 }
@@ -992,6 +1011,8 @@ std::string idp_run::clear_cookie() const
         h += "; Secure";
     if (!m_cookie_domain.empty())
         h += "; Domain=" + m_cookie_domain;
+    if (m_secure_cookie)
+        h += "\r\nSet-Cookie: " + std::string(host_cookie_name) + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure";
     return h + "\r\n";
 }
 
@@ -2868,14 +2889,25 @@ void idp_run::logout(const std::shared_ptr<conn>& c, const request& rq)
     // The sessions the browser sends end here and at every runtime, so a copy of the cookie kept elsewhere ends too.
     std::vector<std::pair<std::string, field_list>> ending;
     const int64_t now = wall::now_sec();
-    http::for_each_cookie(rq.cookie, session_cookie_name, [&](std::string_view v) {
-        claims cl;
-        std::string why;
-        if (m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, v, now, cl, why) && claim(cl, "aud") == "session")
-            if (const account* a = m_accounts.by_id(claim(cl, "sub")))
-                ending.emplace_back(a->id, sign_out_fields(*a, claim(cl, "sid"), claim_int(cl, "exp"), now));
-        return false;
-    });
+    for (const std::string_view name : {host_cookie_name, session_cookie_name})
+        http::for_each_cookie(rq.cookie, name, [&](std::string_view v) {
+            claims cl;
+            std::string why;
+            if (m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, v, now, cl, why) && claim(cl, "aud") == "session")
+                if (const account* a = m_accounts.by_id(claim(cl, "sub")))
+                {
+                    const std::string sid = claim(cl, "sid");
+                    // The host's copy and the domain's are one session, ended once.
+                    if (std::none_of(ending.begin(), ending.end(), [&](const auto& e) {
+                            return e.first == a->id && !sid.empty() &&
+                                   std::any_of(e.second.begin(), e.second.end(), [&](const auto& f) {
+                                       return f.first == std::string(signed_out_prefix) + sid;
+                                   });
+                        }))
+                        ending.emplace_back(a->id, sign_out_fields(*a, sid, claim_int(cl, "exp"), now));
+                }
+            return false;
+        });
     // A browser another site sent is asked first, unless the application names the account by an id token it was given
     // (OpenID Connect RP-Initiated Logout), so a page elsewhere cannot sign its visitors out unasked.
     const bool elsewhere = rq.fetch_site == "cross-site" ||

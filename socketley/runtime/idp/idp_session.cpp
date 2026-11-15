@@ -153,8 +153,30 @@ bool session_verifier::check(std::string_view cookies, who& out)
     if (!m_keys)
         return false;
     const int64_t now = wall::now_sec();
-    return http::for_each_cookie(cookies, session_cookie_name,
-                                 [&](std::string_view v) { return verified(v, false, now, out); });
+    // On the provider's own host its __Host- cookie, which no other name can set, decides alone (idp_logic.h).
+    const std::string_view name =
+        http::cookie_value(cookies, host_cookie_name).empty() ? session_cookie_name : host_cookie_name;
+    // A page on any name under the domain can add a session of its own beside the one the provider set, at a longer
+    // path the browser sends first, but cannot take the provider's away: two that name different accounts are one
+    // planted beside the other, and neither is taken.
+    bool found = false, two = false;
+    http::for_each_cookie(cookies, name, [&](std::string_view v) {
+        who w;
+        if (!verified(v, false, now, w))
+            return false;
+        if (found && w.sub != out.sub)
+        {
+            two = true;
+            return true;
+        }
+        if (!found)
+            out = std::move(w);
+        found = true;
+        return false;
+    });
+    if (two)
+        out = who{};
+    return found && !two;
 }
 
 bool session_verifier::check_bearer(std::string_view token, who& out)

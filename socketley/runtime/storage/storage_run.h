@@ -1059,6 +1059,8 @@ public:
     // A sign-in of the --idp runtime, the user of the account's name here; false when the request carries none.
     bool idp_cookie(const std::shared_ptr<conn>& c, auth_verdict& v);
     static bool has_ui_cookie(const conn& c);
+    // Whether the browser reached this runtime over HTTPS, for the interface cookie's name and Secure.
+    bool ui_https(conn& c);
     // A Content-Disposition that saves `key` under its last name, as ?download asks.
     static std::string attachment_of(std::string_view key);
     // A ZIP of what is under `prefix` in `bucket` (only the names in `only` and what is under them, when it names

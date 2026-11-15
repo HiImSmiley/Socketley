@@ -5316,7 +5316,8 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         if (!skip && (m_auth.idp() || !backend_checks_idp) && header_name_equals(hdr_line, "cookie", 6))
         {
             const std::string kept = socketley::http::without_cookies(
-                hdr_line.substr(7), {socketley::idp::session_cookie_name, socketley::idp::known_cookie_name});
+                hdr_line.substr(7), {socketley::idp::session_cookie_name, socketley::idp::host_cookie_name,
+                                     socketley::idp::known_cookie_name});
             if (!kept.empty())
             {
                 result += "Cookie: ";

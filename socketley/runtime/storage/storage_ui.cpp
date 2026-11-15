@@ -35,6 +35,7 @@
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/util/ascii.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/http/cookie.h"
 #include "../../shared/util/base64.h"
@@ -52,6 +53,10 @@ using socketley::json::jvalue;
 using socketley::json::json_reader;
 
 constexpr std::string_view cookie_name = "skl_ui";
+// The name over HTTPS, a cookie of this host alone: a page on another name under the same domain (a bucket's website,
+// say) can set a skl_ui of its own that a browser sends here first, at a longer path, and so sign its visitor in as
+// whoever made it; no other host can set a __Host- cookie of this one's.
+constexpr std::string_view host_cookie_name = "__Host-skl_ui";
 // How long a sign-in lasts: a browser's session, or a month when asked to stay.
 constexpr int64_t session_ms  = 12ll * 3600 * 1000;
 constexpr int64_t remember_ms = 30ll * 24 * 3600 * 1000;
@@ -256,10 +261,20 @@ std::string inbox_json(const inbox& b)
 
 }   // namespace
 
+bool storage_run::ui_https(conn& c)
+{
+    // The browser's own scheme, for its cookie alone: the entrance says it in X-Forwarded-Proto whether or not
+    // --tls-offloaded names it, and a browser cannot write that field, so a client that does gets a cookie only it
+    // misuses. What trusts the scheme with a secret, as SSE-C does, asks secure().
+    return secure(c) || ascii::iequals(c.req.header("x-forwarded-proto"), "https");
+}
+
 bool storage_run::has_ui_cookie(const conn& c)
 {
     return !http::cookie_value(c.req.header("cookie"), cookie_name).empty() ||
-           !http::cookie_value(c.req.header("cookie"), socketley::idp::session_cookie_name).empty();
+           !http::cookie_value(c.req.header("cookie"), host_cookie_name).empty() ||
+           !http::cookie_value(c.req.header("cookie"), socketley::idp::session_cookie_name).empty() ||
+           !http::cookie_value(c.req.header("cookie"), socketley::idp::host_cookie_name).empty();
 }
 
 bool storage_run::idp_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
@@ -308,13 +323,39 @@ bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
             return refused;
         return got;
     };
-    // A request that carried one is answered by its verdict, the first that lets it in or else the last refusal.
-    bool carried = false;
-    http::for_each_cookie(c->req.header("cookie"), cookie_name, [&](std::string_view val) {
+    // A request that carried one is answered by its verdict, the first that lets it in or else the last refusal; two
+    // that let in different users are one planted beside the other (over plain http, where a page on another name can
+    // set a skl_ui of its own), and neither is taken.
+    bool carried = false, have = false, two = false;
+    std::string first;
+    http::for_each_cookie(c->req.header("cookie"), ui_https(*c) ? host_cookie_name : cookie_name, [&](std::string_view val) {
         carried = true;
-        v = verdict_of(val);
-        return v.allowed;
+        auth_verdict got = verdict_of(val);
+        if (!got.allowed)
+        {
+            if (!have)
+                v = std::move(got);
+            return false;
+        }
+        std::string who = got.user ? got.user->id : got.principal;
+        if (have && who != first)
+        {
+            two = true;
+            return true;
+        }
+        if (!have)
+        {
+            v = std::move(got);
+            first = std::move(who);
+            have = true;
+        }
+        return false;
     });
+    if (two)
+    {
+        v = auth_verdict{};
+        v.allowed = false;
+    }
     return carried;
 }
 
@@ -462,18 +503,20 @@ using fs_iter = std::filesystem::directory_iterator;
 void storage_run::ui_session(const std::shared_ptr<conn>& c)
 {
     s3_request& r = c->req;
-    const std::string secure_attr = secure(*c) ? "; Secure" : "";
+    const bool https = ui_https(*c);
+    const std::string secure_attr = https ? "; Secure" : "";
+    const std::string_view name = https ? host_cookie_name : cookie_name;
     if (r.method == "DELETE")
     {
         // Each cookie sent is ended too, on the server, so a copy of one taken before is let in no longer.
         const std::string_view cookies = r.header("cookie");
-        if (!http::cookie_value(cookies, cookie_name).empty())
+        if (!http::cookie_value(cookies, name).empty())
         {
             const std::string dir = m_store.options().dir + "/.ui";
             if ((::mkdir(dir.c_str(), 0700) == 0 || errno == EEXIST) &&
                 (::mkdir((dir + "/revoked").c_str(), 0700) == 0 || errno == EEXIST))
             {
-                http::for_each_cookie(cookies, cookie_name, [&](std::string_view val) {
+                http::for_each_cookie(cookies, name, [&](std::string_view val) {
                     if (!replace_file(dir + "/revoked/" + sha256_hex(val).substr(0, 32), "", durability::data_and_dir)) {}
                     return false;
                 });
@@ -487,7 +530,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         }
         response out;
         out.status = 204;
-        out.headers.emplace_back("Set-Cookie", std::string(cookie_name) + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" + secure_attr);
+        out.headers.emplace_back("Set-Cookie", std::string(name) + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" + secure_attr);
         send_response(c, std::move(out));
         return;
     }
@@ -520,7 +563,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         m_floors[who] = {now, std::chrono::steady_clock::now()};
         response out;
         out.status = 204;
-        out.headers.emplace_back("Set-Cookie", std::string(cookie_name) + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" + secure_attr);
+        out.headers.emplace_back("Set-Cookie", std::string(name) + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" + secure_attr);
         send_response(c, std::move(out));
         return;
     }
@@ -556,7 +599,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         const bool remember = r.has_query("remember");
         const int64_t issued = wall::now_ms();
         expires = issued + (remember ? remember_ms : session_ms);
-        std::string cookie = std::string(cookie_name) + "=" + base64url::encode(key) + "." + std::to_string(issued) + "." +
+        std::string cookie = std::string(name) + "=" + base64url::encode(key) + "." + std::to_string(issued) + "." +
                              std::to_string(expires) + "." + m_auth->ui_session_mac(key, issued, expires) +
                              "; Path=/; HttpOnly; SameSite=Strict" + secure_attr;
         if (remember)

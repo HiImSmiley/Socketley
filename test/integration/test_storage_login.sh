@@ -18,6 +18,7 @@
 #     it says
 #   * the users listed to a non-admin with more than their names
 #   * a WebDAV client's Basic name and password not signing in
+#   * a session cookie another name under the domain planted taken over https for the browser's own
 #   * any of it lost by a restart, or not seen at once by the other shard
 # suite: isolated
 set -uo pipefail
@@ -75,8 +76,8 @@ def settle():
 iam, s3 = mk("iam", ROOT, region=""), mk("s3", ROOT)
 
 # The interface: a request and its status, body and the cookie it set.
-def ui(method, path, body=None, cookie=None, basic=None, ui_header=True):
-    h = {}
+def ui(method, path, body=None, cookie=None, basic=None, ui_header=True, headers=None):
+    h = dict(headers or {})
     if ui_header:
         h["X-Socketley-UI"] = "1"
     if cookie:
@@ -118,6 +119,29 @@ if phase == "main":
     check("a forged session cookie sent before the real one does not shut it out",
           ui("GET", "/~ui/session", cookie="skl_ui=Zm9y.1.9999999999999.00; " + alice)[0], 200)
     check("nor one sent after it", ui("GET", "/~ui/session", cookie=alice + "; skl_ui=Zm9y.1.9999999999999.00")[0], 200)
+    # A page on another name under the same domain (a bucket's website, say) can set a skl_ui of its own, sealed for a
+    # user its maker is, at a longer path the browser sends first. Over https the interface's cookie is its host's
+    # __Host- one, which no other name can set, and only that is read.
+    iam.create_user(UserName="tosser")
+    iam.create_login_profile(UserName="tosser", Password="tosserpassword1")
+    settle()
+    HTTPS = {"X-Forwarded-Proto": "https"}
+    st, _, sc = ui("POST", "/~ui/session", basic=("alice", "alicepassword1"), headers=HTTPS)
+    check("over https the interface's cookie is its host's own, Secure",
+          (st, sc.split("=")[0], "; Secure" in sc, "Domain" in sc, "Path=/;" in sc), (200, "__Host-skl_ui", True, False, True))
+    alice_h = sc.split(";")[0]
+    tosser = ui("POST", "/~ui/session", basic=("tosser", "tosserpassword1"), headers=HTTPS)[2].split(";")[0]
+    planted = "skl_ui=" + tosser.split("=", 1)[1]
+    who = lambda ck: (lambda r: json.loads(r[1]).get("user") if r[0] == 200 else r[0])(ui("GET", "/~ui/session", cookie=ck, headers=HTTPS))
+    check("alice's browser is alice", who(alice_h), "alice")
+    check("a session another name planted in front of hers does not make her its user", who(planted + "; " + alice_h), "alice")
+    check("nor signs in a browser that had not", who(planted), 401)
+    # Over plain http there is no __Host- cookie; two sessions of different users sent together let neither in.
+    alice_p = sign_in("alice", "alicepassword1")[1]
+    tosser_p = sign_in("tosser", "tosserpassword1")[1]
+    check("over plain http a session planted in front of another user's lets neither in",
+          ui("GET", "/~ui/session", cookie=tosser_p + "; " + alice_p)[0], 401)
+    check("while two of one user are that user", ui("GET", "/~ui/session", cookie=alice_p + "; " + alice_p)[0], 200)
     check("a WebDAV client's Basic name and password sign in", ui("PROPFIND", "/~dav/", basic=("alice", "alicepassword1"), ui_header=False)[0], 207)
 
     # A browser keeps Basic credentials as it keeps a cookie, and sends them with a form another site's page posts.
