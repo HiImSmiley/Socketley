@@ -9,8 +9,13 @@
 # was newer than the floor and named a grant nothing said was revoked: its access token was taken at /userinfo for an
 # hour, and a refresh family written after the fallback would refresh for thirty days.
 #
-# The window is hit by stopping the daemon, sending both exchanges, and letting it go on: both requests are then read
-# in one turn, the second's revocation made before the first's answer, whichever of the two the loop takes first.
+# The window is hit by stopping the provider's processes -- each runtime runs in a process of its own, each shard in one,
+# not in the daemon's -- sending both exchanges, waiting until both lie whole in the sockets' receive queues, and letting
+# them go on: two connections held by one process are then read in one turn, the second's revocation made before the
+# first's answer, whichever of the two the loop takes first, and exactly one exchange is refused.  On --shards the
+# two connections are placed on purpose: on one shard (the same turn), and on two shards, where either shard's word
+# can reach shard 0 first; when the revocation does, the family is not written and the first exchange is refused as
+# well (`?so.<grant>`), which is as right as its tokens being revoked after.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -30,8 +35,13 @@ T=$SOCKETLEY_TMPD
 P=$((SL_PORT_BASE + 1927))
 PS=$((SL_PORT_BASE + 1928))
 unset SOCKETLEY_CONFIG
-# The daemon is stopped for a moment below; it is let go on whatever ends the test.
-trap '[ -n "${SOCKETLEY_DPID:-}" ] && kill -CONT "$SOCKETLEY_DPID" 2>/dev/null; daemon_stop' EXIT
+# The providers' processes are stopped for a moment below; they are let go on whatever ends the test.
+let_go() {
+    [ -n "${SOCKETLEY_DPID:-}" ] || return 0
+    local p
+    for p in $(ps -o pid= --ppid "$SOCKETLEY_DPID" 2>/dev/null); do kill -CONT "$p" 2>/dev/null; done
+}
+trap 'let_go; daemon_stop' EXIT
 daemon_start "$BIN"
 printf 'wiki wikisecret http://127.0.0.1:9/cb\n' > "$T/clients"
 # One provider on one loop, and one on four shards, where the two exchanges may be taken at different shards and the
@@ -86,27 +96,113 @@ print("ok 32 codes used again, 32 grants revoked")
 code = code_of(req("GET", "/authorize?" + urllib.parse.urlencode(ask), cookie=cookie)[2])
 check("a 33rd code is given", bool(code), True)
 
-# Two connections, each answered once before, so the provider holds them both when the daemon is stopped.
-conns = []
-for _ in range(2):
+# Which process holds each of our connections' far ends, by the socket's inode; the runtime's processes are the
+# daemon's children, one per shard, and listen on the port.
+def children():
+    out = []
+    for t in os.listdir("/proc/%d/task" % pid):
+        try:
+            out += [int(x) for x in open("/proc/%d/task/%s/children" % (pid, t)).read().split()]
+        except OSError:
+            pass
+    return out
+def far_ends(locals_):
+    out = {}
+    for line in open("/proc/net/tcp").read().splitlines()[1:]:
+        f = line.split()
+        if int(f[1].split(":")[1], 16) == port and int(f[2].split(":")[1], 16) in locals_ and f[3] == "01":
+            out[int(f[2].split(":")[1], 16)] = (int(f[9]), int(f[4].split(":")[1], 16))
+    return out
+def holders():
+    by_inode = {}
+    for p in children():
+        try:
+            for fd in os.listdir("/proc/%d/fd" % p):
+                try:
+                    t = os.readlink("/proc/%d/fd/%s" % (p, fd))
+                except OSError:
+                    continue
+                if t.startswith("socket:["):
+                    by_inode[int(t[8:-1])] = p
+        except OSError:
+            pass
+    return by_inode
+def holder_of(c):
+    me = c.sock.getsockname()[1]
+    end = far_ends({me}).get(me)
+    return holders().get(end[0]) if end else None
+def opened():
+    # Answered once, so the provider has taken the connection when it is stopped.
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
     c.request("GET", "/jwks"); r = c.getresponse(); r.read()
-    conns.append(c)
-body = urllib.parse.urlencode(exchange_form(code))
-os.kill(pid, signal.SIGSTOP)
+    return c
+
+# Two connections held by one process, or with place == "apart" by two; the first found that fit are kept.
+place = sys.argv[4] if len(sys.argv) > 4 else "together"
+conns, spare = [], []
+for _ in range(64):
+    c = opened()
+    h = holder_of(c)
+    if h is None:
+        spare.append(c); continue
+    if not conns or (h == holder_of(conns[0])) == (place == "together"):
+        conns.append(c)
+    else:
+        spare.append(c)
+    if len(conns) == 2:
+        break
+for c in spare:
+    c.close()
+check("two connections are held as asked (%s)" % place, len(conns), 2)
+if len(conns) != 2:
+    sys.exit(0)
+body = urllib.parse.urlencode(exchange_form(code)).encode()
+ask_bytes = ("POST /token HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nAuthorization: %s\r\n"
+             "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n"
+             % (port, BASIC, len(body))).encode() + body
+stopped = children()
+def all_stopped():
+    for p in stopped:
+        try:
+            st = open("/proc/%d/stat" % p).read()
+        except OSError:
+            continue
+        if st[st.rindex(")") + 2] not in "Tt":
+            return False
+    return True
+mine = {c.sock.getsockname()[1] for c in conns}
+queued = False
+for p in stopped:
+    os.kill(p, signal.SIGSTOP)
 try:
+    end = time.time() + 10
+    while not all_stopped() and time.time() < end:
+        time.sleep(0.002)
     for c in conns:
-        c.request("POST", "/token", body=body, headers={"Authorization": BASIC,
-                                                         "Content-Type": "application/x-www-form-urlencoded"})
-    time.sleep(0.2)
+        c.sock.sendall(ask_bytes)
+    # Not let go before both exchanges lie whole in their sockets, however slowly this box moves them.
+    while time.time() < end:
+        q = far_ends(mine)
+        if len(q) == 2 and all(rx == len(ask_bytes) for _, rx in q.values()):
+            queued = True
+            break
+        time.sleep(0.002)
 finally:
-    os.kill(pid, signal.SIGCONT)
+    for p in stopped:
+        os.kill(p, signal.SIGCONT)
+check("both exchanges were queued whole while the provider was stopped", queued, True)
 answers = []
 for c in conns:
-    r = c.getresponse(); answers.append((r.status, json.loads(r.read() or b"{}"))); c.close()
+    r = http.client.HTTPResponse(c.sock, method="POST"); r.begin()
+    answers.append((r.status, json.loads(r.read() or b"{}"))); c.close()
 given = [a for st, a in answers if st == 200]
 refused = [a.get("error") for st, a in answers if st == 400]
-check("of the code exchanged twice in one turn, one exchange is refused", refused, ["invalid_grant"])
+if place == "together":
+    check("of the code exchanged twice in one turn, one exchange is refused", refused, ["invalid_grant"])
+else:
+    # Across two shards: the other gives tokens, revoked below, or is refused too when the revocation came first.
+    check("of the code exchanged at two shards at once, no more than one gives tokens",
+          (len(given) <= 1, len(given) + len(refused), set(refused)), (True, 2, {"invalid_grant"}))
 t = given[0] if given else {}
 if given:
     # Whatever the exchange that won gave is revoked: its access token and its refresh family.
@@ -118,9 +214,9 @@ else:
     print("ok neither exchange gave tokens")
 PY
 
-for pu in "$P ann" "$P bea" "$PS cid" "$PS dee" "$PS eli" "$PS fay"; do
+for pu in "$P ann together" "$P bea together" "$PS cid together" "$PS dee together" "$PS eli apart" "$PS fay apart"; do
     set -- $pu; u=$2
-    out=$(timeout 120 python3 "$T/reuse.py" "$1" "$SOCKETLEY_DPID" "$u" 2>&1)
+    out=$(timeout 120 python3 "$T/reuse.py" "$1" "$SOCKETLEY_DPID" "$u" "$3" 2>&1)
     while IFS= read -r line; do
         case "$line" in
             "ok "*) ok ;;
