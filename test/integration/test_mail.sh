@@ -85,7 +85,7 @@ mail_with() {
 }
 # An SMTP conversation from 127.0.0.2, a stranger to the runtime: smtp.py <port> <from> <to> <body> [starttls] [user pw]
 cat > "$T/smtp.py" <<'PY'
-import smtplib, ssl, sys, time
+import base64, smtplib, ssl, sys, time
 port, frm, to, body = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 opts = sys.argv[5:]
 s = smtplib.SMTP("127.0.0.1", port, source_address=("127.0.0.2", 0), timeout=10)
@@ -95,12 +95,13 @@ try:
         ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
         s.starttls(context=ctx); s.ehlo("client.test")
     if "login" in opts:
+        # One AUTH PLAIN, timed: smtplib's login tries the next mechanism offered after a 535, so its time was two
+        # answers, each a password hashed and a second waited.
         i = opts.index("login")
-        t0 = time.time()
-        try:
-            s.login(opts[i + 1], opts[i + 2])
-        except smtplib.SMTPAuthenticationError as e:
-            print("auth %d %.1f" % (e.smtp_code, time.time() - t0)); sys.exit(0)
+        t0 = time.monotonic()
+        code, _ = s.docmd("AUTH", "PLAIN " + base64.b64encode(("\0%s\0%s" % (opts[i + 1], opts[i + 2])).encode()).decode())
+        if code != 235 or "authonly" in opts:
+            print("auth %d %.2f" % (code, time.monotonic() - t0)); sys.exit(0)
     s.sendmail(frm, [to], body)
     print("sent")
 except smtplib.SMTPRecipientsRefused as e:
@@ -169,11 +170,15 @@ f=$(mail_with "from alice") && ok "which is delivered there" || bad "which is de
 f=$(mail_with "alias body")
 [ -n "$f" ] && ! grep -q '^Message-ID: ' "$f" && ok "while a stranger's message is passed on as it came" \
     || bad "while a stranger's message is passed on as it came" "$(head -12 "$f" 2>/dev/null)"
+# A second on top of what checking the password costs, which a right one, asked just before, takes alone: on a box
+# loaded by other tests the hashing alone took up to a second, and two answers of it (smtplib tries PLAIN, then
+# LOGIN) came past the three seconds this was once held to.  At least the second, and less than two over the right one.
+right=$(smtp "$SUB" alice@example.test carol@remote.test 'x' starttls login alice alicepass1 authonly)
 r=$(smtp "$SUB" alice@example.test carol@remote.test 'x' starttls login alice wrongpass)
-case "$r" in
-    "auth 535 "1.*|"auth 535 "2.*) ok "a wrong password is refused a second later" ;;
-    *) bad "a wrong password is refused a second later" "$r" ;;
-esac
+if [ "${right% *}" = "auth 235" ] && [ "${r% *}" = "auth 535" ] &&
+    awk -v w="${r##* }" -v c="${right##* }" 'BEGIN { exit !(w >= 1.0 && w < c + 2.0) }'; then
+    ok "a wrong password is refused a second later"
+else bad "a wrong password is refused a second later" "$r (a right one: $right)"; fi
 check "a user of --users may not send as another's address" \
     "$(smtp "$SUB" bob@example.test carol@remote.test 'x' starttls login alice alicepass1)" "sender 553"
 check "nor under a From header of another" "$(smtp "$SUB" alice@example.test carol@remote.test 'From: ceo@example.test
