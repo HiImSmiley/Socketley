@@ -32,10 +32,20 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 
-PASS=0; FAIL=0; TOTAL=0
+PASS=0; FAIL=0; TOTAL=0; SKIP=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
-tally() { while read -r verdict rest; do [ "$verdict" = ok ] && ok "$rest" || bad "${rest%%: *}" "${rest#*: }"; done; }
+# A check a missing tool keeps from running is said and counted, never passed: a line starting SKIP, which run_all lists.
+skip() { SKIP=$((SKIP+1)); echo "  SKIP ($2): $1"; }
+tally() {
+    while read -r verdict rest; do
+        case "$verdict" in
+            ok) ok "$rest" ;;
+            skip) skip "${rest%%$'\t'*}" "${rest#*$'\t'}" ;;
+            *) bad "${rest%%: *}" "${rest#*: }" ;;
+        esac
+    done
+}
 
 daemon_isolate mail_webmail
 T="$SOCKETLEY_TMPD"
@@ -84,6 +94,8 @@ import base64, hashlib, http.client, json, re, smtplib, socket, subprocess, sys,
 W, PI, P = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 def check(name, ok, info=""):
     print(("ok " if ok else "bad ") + name + ("" if ok else ": " + str(info)[:400].replace("\n", " ")))
+def skip(name, why):
+    print("skip " + name + "\t" + why)
 def http_(port, method, path, body=None, headers=None):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     c.request(method, path, body=body, headers=headers or {})
@@ -126,6 +138,11 @@ except FileNotFoundError:
     out = "no node"
 except (ValueError, subprocess.SubprocessError):
     out = None
+NODE_CSS = ("webmail CSS keeps no < that could end its <style>", "and with images blocked fetches nothing by image-set, a "
+            "prefix or an escape", "while @import goes and a shown image's url( stays")
+if out == "no node":
+    for name in NODE_CSS:
+        skip(name, "no node on PATH, which runs the page's own CSS cleaning")
 if out != "no node":
     fetch = re.compile(r"(url|image-set|image|src|cross-fade|element)\s*\(|\\|@import", re.I)
     check("webmail CSS keeps no < that could end its <style>", out and "<" not in out[0]["css"], out)
@@ -150,6 +167,11 @@ except FileNotFoundError:
     out = "no node"
 except (ValueError, subprocess.SubprocessError):
     out = None
+if out == "no node":
+    for name in ("with images blocked a remote image hidden by a control character, a backslash or a newline is dropped "
+                 "and counted", "a shown one goes by https, and a cid and a data: image are kept", "but no address of the "
+                 "page's own origin, whose GET would carry the reader's cookie, nor an SVG by data:, nor a cid that names no part"):
+        skip(name, "no node on PATH, which runs the page's own image checks")
 if out != "no node":
     check("with images blocked a remote image hidden by a control character, a backslash or a newline is dropped and counted",
           out and all(o["url"] is None and o["remote"] for o in out[:5]), out)
@@ -168,7 +190,8 @@ check("the frame refuses remote images while they are blocked, whatever the clea
 # and shown as the page shows it, in a frame with the page's sandbox and srcdoc. The full corpus is kept outside the
 # repository; these are the families it covers.
 import glob, os, shutil, tempfile, threading, http.server, socketserver, html as _html
-chrome = os.environ.get("SOCKETLEY_TEST_CHROME") or next((shutil.which(n) for n in ("chrome-headless-shell", "chromium",
+# SOCKETLEY_TEST_CHROME=none runs it as a machine without one.
+chrome = None if os.environ.get("SOCKETLEY_TEST_CHROME") == "none" else os.environ.get("SOCKETLEY_TEST_CHROME") or next((shutil.which(n) for n in ("chrome-headless-shell", "chromium",
          "chromium-browser", "google-chrome") if shutil.which(n)), None) or next(iter(sorted(glob.glob(
          # The user's own home, as the test runs under a HOME of its own.
          __import__("pwd").getpwuid(os.getuid()).pw_dir + "/.cache/ms-playwright/chromium_headless_shell-*/*/chrome-headless-shell"))), None)
@@ -192,6 +215,16 @@ BAD = ['<script>parent.HIT()</script>', '<img src=x onerror="parent.HIT()">', '<
 GOOD = ['<table width="600" bgcolor="#ffcc00" cellpadding="4"><tr><td style="color:#333" align="center"><a href="https://shop.test/x?a=1&amp;b=2">Buy</a></td></tr></table>',
         '<p><img src="cid:part1" alt="logo"> <a href="mailto:bob@example.test">mail</a> <a href="#top">top</a></p>',
         '<blockquote type="cite"><div class="gmail_quote">quoted</div></blockquote><style>.x{color:red}</style><span class="x">red</span>']
+IN_BROWSER = ("in a browser, the cleaner leaves nothing of %d known-bad pieces that runs, submits, embeds, clobbers, reaches "
+              "the page's origin or a remote address, or parses again into something else" % len(BAD),
+              "and keeps what mail is made of: tables and their colours, a web link opening apart, a cid image, mailto, a "
+              "place in the message, quotes as the folding finds them and a style element's CSS")
+# The page's frame not found is the page changed, which fails; no browser here is a tool missing, said and counted.
+check("the page shows a mail in a sandboxed frame the browser checks can copy", bool(sandbox), script[:200])
+if not chrome:
+    for name in IN_BROWSER:
+        skip(name, "no chromium: none on PATH, in SOCKETLEY_TEST_CHROME or ~/.cache/ms-playwright; "
+                   "python3 -m playwright install chromium-headless-shell")
 if chrome and sandbox:
     page_js = r"""
 window.HITS = []; window.HIT = () => HITS.push(window.CUR);
@@ -255,13 +288,10 @@ async function show(src) {
     srv.shutdown(); shutil.rmtree(ud, ignore_errors=True)
     m = re.search(r"RESULTS(\{.*?\})END", _html.unescape(dom), re.S)
     res = json.loads(m.group(1)) if m else None
-    check("in a browser, the cleaner leaves nothing of %d known-bad pieces that runs, submits, embeds, clobbers, reaches "
-          "the page's origin or a remote address, or parses again into something else" % len(BAD),
-          res and not res["hits"] and all(not b for b in res["bad"]),
+    check(IN_BROWSER[0], res and not res["hits"] and all(not b for b in res["bad"]),
           res and [(BAD[i][:60], b) for i, b in enumerate(res["bad"]) if b] or dom[-300:])
     g = res and res["good"]
-    check("and keeps what mail is made of: tables and their colours, a web link opening apart, a cid image, mailto, a "
-          "place in the message, quotes as the folding finds them and a style element's CSS", g and
+    check(IN_BROWSER[1], g and
           'bgcolor="#ffcc00"' in g[0]["body"] and 'href="https://shop.test/x?a=1&amp;b=2"' in g[0]["body"] and
           'target="_blank"' in g[0]["body"] and 'style="color:#333"' in g[0]["body"].replace(" ", "") and
           'src="/jmap/download/a/b/x.png"' in g[1]["body"] and 'href="mailto:bob@example.test"' in g[1]["body"] and
@@ -589,7 +619,7 @@ case "$session" in *'"apiUrl":"https://webmail.example.test'*) ok "behind it the
 # A tab come back to, over HTTP/2 through the entrance: its EventSource held, then its API calls at once, each one a
 # connect to the webmail the entrance has not pooled; their bodies wait on that connect and must still reach it.
 if ! python3 -c 'import h2' 2>/dev/null; then
-    echo "  SKIP: a tab's burst over HTTP/2 (the python h2 library is not installed)"
+    skip "a tab's burst over HTTP/2" "the python h2 library is not installed"
 else
 burst=$(python3 - "$GATE" <<'PY'
 import base64, json, socket, ssl, sys, time, h2.config, h2.connection, h2.events
@@ -629,5 +659,5 @@ PY
     || bad "a tab's API calls at once beside its EventSource all reach the webmail through the entrance" "$burst"
 fi
 
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $SKIP skipped)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1
