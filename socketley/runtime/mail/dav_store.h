@@ -30,6 +30,10 @@ public:
     static bool collection_ok(std::string_view name);
     // An entry's name: what a client picks, a UID and .ics or .vcf mostly; no '/', no leading dot, at most 255.
     static bool entry_ok(std::string_view name);
+    // A user's name as the one folder of the journal directory it names: bytes outside [A-Za-z0-9._@+-] and a
+    // leading dot written %XX, so "..", "." or a name with a slash in it (a provider's preferred_username) stays a
+    // folder of its own below the directory.
+    static std::string journal_user(std::string_view user);
 
     struct entry
     {

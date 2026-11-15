@@ -57,9 +57,33 @@ std::string dav_store::key_of(const std::string& user, const std::string& kind, 
     return ".dav/" + user + "/" + kind + "/" + coll + "/" + name;
 }
 
+std::string dav_store::journal_user(std::string_view user)
+{
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(user.size());
+    for (size_t i = 0; i < user.size(); ++i)
+    {
+        const auto u = static_cast<unsigned char>(user[i]);
+        const bool plain = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || u == '_' ||
+                           u == '@' || u == '+' || u == '-' || (u == '.' && i > 0);
+        if (plain)
+            out += static_cast<char>(u);
+        else
+        {
+            out += '%';
+            out += hex[u >> 4];
+            out += hex[u & 15];
+        }
+    }
+    return out;
+}
+
+// The user's name is escaped into the one folder it names, since the identity provider takes ".." for a name and a
+// journal path built from it raw was the directory above, where the user appended lines to a file of its choosing.
 std::string dav_store::journal_of(const std::string& user, const std::string& kind, const std::string& coll) const
 {
-    return m_dir + "/" + user + "/" + kind + "-" + coll + ".log";
+    return m_dir + "/" + journal_user(user) + "/" + kind + "-" + coll + ".log";
 }
 
 void dav_store::list_page(std::string prefix, std::string after, std::shared_ptr<std::vector<entry>> got,

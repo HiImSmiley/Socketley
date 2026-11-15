@@ -21,6 +21,7 @@
 #include "runtime/mail/mail_mbox.h"
 #include "runtime/mail/mail_mime.h"
 #include "runtime/mail/imap_store.h"
+#include "runtime/mail/dav_store.h"
 #include "runtime/mail/mail_reports.h"
 #include "runtime/mail/mail_verify.h"
 #include "runtime/mail/mail_rspamd.h"
@@ -826,4 +827,23 @@ TEST_CASE("reports: a DMARC report goes to another domain's address only where t
     CHECK(socketley::mail::dmarc_destinations("Origin.test", asked, r) ==
           std::vector<std::string>{"dmarc@origin.test", "ops@mail.origin.test", "x@vendor.test", "a@sub.origin.test",
                                    "b@origin.test"});
+}
+
+// Round 8b: the DAV journal path took the user's name raw, and the identity provider takes ".." for one.
+TEST_CASE("a DAV journal folder is the user's name escaped, never a way up")
+{
+    CHECK(dav_store::journal_user("alice") == "alice");
+    CHECK(dav_store::journal_user("a.b+c@example.test") == "a.b+c@example.test");
+    CHECK(dav_store::journal_user("..") == "%2E.");
+    CHECK(dav_store::journal_user(".") == "%2E");
+    CHECK(dav_store::journal_user(".hidden") == "%2Ehidden");
+    CHECK(dav_store::journal_user("a/../b") == "a%2F..%2Fb");
+    CHECK(dav_store::journal_user(std::string_view("a\0b", 3)) == "a%00b");
+    for (const char* u : {"..", ".", "a/b", "../../x", "%2e%2e"})
+    {
+        const std::string j = dav_store::journal_user(u);
+        CHECK(j.find('/') == std::string::npos);
+        CHECK(j != ".");
+        CHECK(j != "..");
+    }
 }
