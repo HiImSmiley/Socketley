@@ -1506,3 +1506,22 @@ TEST_CASE("a follower takes the read index its leader answers from a term it has
     CHECK(n.term() == 4);
     CHECK(n.leader() == 1);
 }
+
+TEST_CASE("a leader frame names the leader a joiner may hear, or none, and nothing between")
+{
+    namespace wire = raft::wire;
+    wire::frame f;
+    const wire::hello lead{0x1234, "a", "127.0.0.1:7000"};
+    REQUIRE(wire::decode(wire::encode_leader(lead), f));
+    CHECK(f.kind == wire::kind::leader);
+    CHECK(f.hi == lead);
+    REQUIRE(wire::decode(wire::encode_leader(wire::hello{}), f));
+    CHECK(f.kind == wire::kind::leader);
+    CHECK(f.hi.id == raft::no_node);
+    std::string why;
+    CHECK_FALSE(wire::decode(wire::encode_leader(wire::hello{0x1234, "", ""}), f, &why));
+    CHECK_FALSE(wire::decode(wire::encode_leader(wire::hello{raft::no_node, "a", ""}), f, &why));
+    // A leader frame is not a hello: the node it names did not say it.
+    const std::string as = wire::encode_leader(lead);
+    CHECK(as != wire::encode(lead));
+}

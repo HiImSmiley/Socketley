@@ -87,6 +87,8 @@ constexpr size_t outbound_cap = 8u * 1024u * 1024u;
 
 // The longest a hello's frame is, its name and address each at most 255 bytes, with room to spare.
 constexpr uint32_t max_hello_frame = 1024;
+// Joins a joiner sends to the node it dialled before it takes that node for an older version that names no leader.
+constexpr uint32_t legacy_after = 3;
 
 bool get_u64(std::string_view in, size_t& off, uint64_t& v)
 {
@@ -204,6 +206,8 @@ struct raft_host::link : io_handler
     phase          state = phase::connecting;
     raft::node_id  peer = raft::no_node;
     bool           hello_seen = false;
+    // The joiner's connection to the node it dialled, the one outbound link whose peer writes back (kind::leader).
+    bool           answered = false;
     std::string    addr, name;
     sockaddr_storage sa{};
     socklen_t      salen = 0;
@@ -313,18 +317,18 @@ struct raft_host::link : io_handler
                         return fail("TLS stream closed");
                     if (k == 0)
                         break;
-                    if (!outbound)
+                    if (!outbound || answered)
                         in.append(buf, static_cast<size_t>(k));
                 }
             }
             flush();
         }
-        else if (!outbound)
+        else if (!outbound || answered)
         {
             in.append(data, n);
         }
 
-        if (outbound || state != phase::ready)
+        if ((outbound && !answered) || state != phase::ready)
             return;
         size_t off = 0;
         while (state != phase::dead)
@@ -983,6 +987,8 @@ bool raft_host::on_frame(link& l, std::string_view payload)
         warn("refused a frame from " + (l.peer ? describe(l.peer) : std::string("an unidentified peer")) + ": " + why);
         return false;
     }
+    if (l.answered)
+        return on_seed_frame(l, f);
 
     if (!l.hello_seen)
     {
@@ -1031,6 +1037,9 @@ bool raft_host::on_frame(link& l, std::string_view payload)
     case wire::kind::message:
         if (f.msg.from != l.peer || f.msg.to != m_id)
             return false;
+        // Not yet admitted: the leader the node it asked named, and nobody else, may move its log and term.
+        if (!may_speak_for_cluster(l))
+            return true;
         // A stranger's vote request could still move this node's term, so only members and recorded nodes are heard,
         // or anyone before this node has a membership.
         if (!m_node->is_member(l.peer) && !m_book.count(l.peer) && !m_node->voters().empty())
@@ -1048,6 +1057,19 @@ bool raft_host::on_frame(link& l, std::string_view payload)
         // A newcomer's name is the one its hello was checked against, never a second one.
         if (f.req.id == l.peer && f.req.name != l.name)
             return false;
+        // Answered on the newcomer's own connection, which it dialled to this node's address: whose word it is to take
+        // until it is admitted. A newcomer of an older version reads nothing there and is not changed by it.
+        if (f.req.id == l.peer && !l.outbound)
+        {
+            wire::hello lead;
+            const raft::node_id who =
+                m_node->current_role() == raft::role::leader ? m_id : m_node->leader();
+            if (who == m_id)
+                lead = wire::hello{m_id, m_cfg.name, m_cfg.advertise};
+            else if (const member* mb = who != raft::no_node ? lookup(who) : nullptr)
+                lead = wire::hello{who, mb->name, mb->addr};
+            enqueue(&l, wire::encode_leader(lead));
+        }
         handle_join(std::string(payload), f.req.id, f.req.name, f.req.addr, f.req.voter);
         return true;
 
@@ -1077,13 +1099,48 @@ bool raft_host::on_frame(link& l, std::string_view payload)
         // Only a node still waiting to be admitted takes it to heart, and a member never stops on another's word.
         if (m_cfg.join.empty() || m_node->is_member(m_id) || l.peer == m_id)
             return false;
+        // Nor a joiner on the word of a node the one it asked did not name as the leader.
+        if (!may_speak_for_cluster(l))
+        {
+            warn("ignored a refusal from " + hex_id(l.peer) + " (" + l.name + "), which " + m_cfg.join +
+                 " did not name as the leader: " + f.no.why);
+            return false;
+        }
         fail_stop(f.no.why);
         return false;
 
     case wire::kind::hello:
+    case wire::kind::leader:
         return false;
     }
     return false;
+}
+
+bool raft_host::on_seed_frame(link& l, const wire::frame& f)
+{
+    // The node this one dialled writes back one thing, and only while this node waits to be admitted.
+    if (f.kind != wire::kind::leader || &l != m_join_link.get())
+        return false;
+    m_seed_spoke = true;
+    if (f.hi.id != m_vouched || f.hi.name != m_vouched_name)
+        debug(f.hi.id == raft::no_node ? m_cfg.join + " knows of no leader yet"
+                                       : m_cfg.join + " names " + hex_id(f.hi.id) + " (" + f.hi.name + ") as the leader");
+    // Itself it may not name: this node's word is not the cluster's.
+    m_vouched      = f.hi.id == m_id ? raft::no_node : f.hi.id;
+    m_vouched_name = m_vouched == raft::no_node ? std::string() : f.hi.name;
+    return true;
+}
+
+bool raft_host::may_speak_for_cluster(const link& l)
+{
+    if (m_cfg.join.empty() || m_node->is_member(m_id))
+        return true;
+    // A node of an older version answers no join; it is let be what it was, everyone's word taken, as before.
+    if (!m_seed_spoke && m_join_unanswered >= legacy_after)
+        return true;
+    // The id as the node dialled named it, and the name the peer's hello gave -- under TLS the one its certificate
+    // names -- as that node knows the leader by: a peer that only claims the leader's id is not the leader.
+    return m_vouched != raft::no_node && l.peer == m_vouched && l.name == m_vouched_name;
 }
 
 void raft_host::handle_command(const std::string& data)
@@ -1204,6 +1261,7 @@ void raft_host::try_join()
             return;
         // The target's id is not known yet, so its certificate is held to the address that was dialled.
         l->name = host;
+        l->answered = true;
         l->fd   = ::socket(l->sa.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (l->fd < 0)
             return;
@@ -1218,6 +1276,11 @@ void raft_host::try_join()
         }
         m_join_link = std::move(l);
     }
+    // Counted only over a connection that is up, so a node that cannot be reached is not taken for an older one.
+    if (!m_seed_spoke && m_join_link->state == link::phase::ready && m_join_unanswered < legacy_after &&
+        ++m_join_unanswered == legacy_after)
+        warn(m_cfg.join + " answered " + std::to_string(legacy_after) + " joins without naming the leader, as a node "
+             "of an older version does: until admitted, this node takes the cluster's word from any node");
     enqueue(m_join_link.get(), wire::encode(wire::join{m_id, m_cfg.name, m_cfg.advertise, true}));
 }
 

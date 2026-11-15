@@ -73,6 +73,15 @@ std::string encode(const hello& h)
     return w.take();
 }
 
+std::string encode_leader(const hello& h)
+{
+    writer w(kind::leader);
+    w.u64(h.id);
+    w.bytes(h.name.substr(0, max_label));
+    w.bytes(h.addr.substr(0, max_label));
+    return w.take();
+}
+
 std::string encode(const join& j)
 {
     writer w(kind::join);
@@ -132,6 +141,15 @@ bool decode(std::string_view payload, frame& out, std::string* why)
             return fail(why, "malformed hello");
         if (out.hi.id == no_node)
             return fail(why, "hello from node 0");
+        break;
+
+    case static_cast<uint8_t>(kind::leader):
+        out.kind = kind::leader;
+        if (!r.u64(out.hi.id) || !r.bytes(out.hi.name, max_label) || !r.bytes(out.hi.addr, max_label))
+            return fail(why, "malformed leader");
+        // No leader known is said with no name; a leader is said with the name it is known by.
+        if ((out.hi.id == no_node) != out.hi.name.empty())
+            return fail(why, "a leader without a name, or a name without a leader");
         break;
 
     case static_cast<uint8_t>(kind::join):

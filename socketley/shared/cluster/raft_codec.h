@@ -14,7 +14,8 @@ namespace socketley::raft::wire
 // A peer speaking another version is refused, never guessed at.
 inline constexpr uint8_t version = 1;
 
-enum class kind : uint8_t { message = 1, hello = 2, join = 3, command = 4, lease_req = 5, lease_grant = 6, refuse = 7 };
+enum class kind : uint8_t { message = 1, hello = 2, join = 3, command = 4, lease_req = 5, lease_grant = 6, refuse = 7,
+                        leader = 8 };
 
 // The first frame on every connection a node dials, naming who is speaking.
 struct hello
@@ -90,6 +91,10 @@ std::string encode(const join& j);
 std::string encode(const command& c);
 std::string encode(kind k, const lease& l);
 std::string encode(const refusal& r);
+// The answer of the node a joiner dialled, written back on the joiner's own connection: who leads the cluster as that
+// node knows it, id no_node and no name while it knows of none. A joiner takes the cluster's word before it is admitted
+// from that node alone, so this is how it learns whose word that is; carried in frame::hi.
+std::string encode_leader(const hello& h);
 
 // False on anything but one whole, well-formed payload of this version, with the reason in `why`.
 bool decode(std::string_view payload, frame& out, std::string* why = nullptr);

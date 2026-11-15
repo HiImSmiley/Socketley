@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 
 class event_loop;
+namespace socketley::raft::wire { struct frame; }
 
 // Everything `socketley daemon --raft-*` can say, judged before a host exists.
 struct raft_host_config
@@ -130,6 +131,10 @@ private:
     void enqueue(link* l, const std::string& payload);
 
     bool on_frame(link& l, std::string_view payload);
+    // A frame on the joiner's own connection to the node it dialled: that node's answer naming the leader.
+    bool on_seed_frame(link& l, const socketley::raft::wire::frame& f);
+    // Whether a node not yet admitted takes the cluster's word from the peer on `l`; any other node always does.
+    bool may_speak_for_cluster(const link& l);
     void handle_command(const std::string& data);
     socketley::cluster::view make_view();
     void drive_cluster();
@@ -207,6 +212,14 @@ private:
     clock::time_point m_last_tick{};
     uint64_t    m_ticks = 0;
     uint64_t    m_join_tried = 0;
+    // Before it is admitted, a joiner takes the cluster's word (messages, a refusal) only from the leader the node it
+    // dialled named on that connection (kind::leader): its id and the name its hello must carry.
+    socketley::raft::node_id m_vouched = socketley::raft::no_node;
+    std::string m_vouched_name;
+    // Whether the node dialled has answered a join at all, and how many joins went to it unanswered: one of an older
+    // version never does, and past `legacy_after` of them the joiner takes the cluster's word from any node, as before.
+    bool        m_seed_spoke = false;
+    uint32_t    m_join_unanswered = 0;
 
     io_request  m_pump_req{};
     bool        m_pump_armed = false;

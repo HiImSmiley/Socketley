@@ -77,6 +77,14 @@ void one_payload(std::string_view p)
                    "a hello did not survive a round trip");
         break;
     }
+    case wire::kind::leader:
+    {
+        again = wire::encode_leader(f.hi);
+        wire::frame g;
+        FUZZ_CHECK(wire::decode(again, g) && g.kind == wire::kind::leader && g.hi == f.hi,
+                   "a leader frame did not survive a round trip");
+        break;
+    }
     case wire::kind::join:
     {
         again = wire::encode(f.req);
