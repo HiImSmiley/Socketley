@@ -66,7 +66,11 @@ else
 fi
 
 "$BIN" ls 2>/dev/null | cat >"$SOCKETLEY_TMPD/ls.pipe"
-if cmp -s "$SOCKETLEY_TMPD/ls.file" "$SOCKETLEY_TMPD/ls.pipe"; then pass; else
+# The CREATED column ages between the two calls ("9 seconds ago" to "1 minute ago" under a sanitizer), so the ages and
+# the padding they set are left out of the comparison; a lost tail or line still shows.
+age='s/[0-9]+ (second|minute|hour|day)s? ago/AGE/g; s/ +/ /g'
+same_list() { cmp -s <(sed -E "$age" "$1") <(sed -E "$age" "$2"); }
+if same_list "$SOCKETLEY_TMPD/ls.file" "$SOCKETLEY_TMPD/ls.pipe"; then pass; else
     fail "the list through a pipe is the list into a file" \
         "$(wc -c <"$SOCKETLEY_TMPD/ls.pipe") bytes through the pipe, $SIZE into the file"
 fi
