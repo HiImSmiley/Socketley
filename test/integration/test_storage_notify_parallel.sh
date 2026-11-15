@@ -28,7 +28,13 @@ daemon_isolate notifypar
 T=$SOCKETLEY_TMPD
 P=$((SL_PORT_BASE + 1964)); HOOK=$((SL_PORT_BASE + 1965))
 unset SOCKETLEY_CONFIG
-trap 'kill $HOOK_PID 2>/dev/null; daemon_stop' EXIT
+# The storage's directory on tmpfs when the box has one: a change is answered once its events are synced to the
+# outbox, and a disk shared with builds took 25 to 100 ms a sync, so the hundred and five changes sent one after the
+# other took five seconds on their own and the deliveries could only trail them.
+F=$T
+if [ "$(stat -f -c %T /dev/shm 2>/dev/null)" = tmpfs ] && [ -w /dev/shm ]; then F=$(mktemp -d /dev/shm/socketley-notifypar-XXXXXX); fi
+trap 'kill $HOOK_PID 2>/dev/null; daemon_stop; [ "$F" != "$T" ] && rm -rf "$F"' EXIT
+[ "$F" = "$T" ] && echo "  note: no tmpfs, so the changes wait on the disk's syncs and the time below takes them in"
 # A receiver that takes 50 ms an event, and notes when each came, what about, and how many were open at once.
 python3 - "$HOOK" "$T/got" <<'PY' &
 import http.server, json, sys, threading, time
@@ -58,7 +64,7 @@ PY
 HOOK_PID=$!
 printf 'hook http://127.0.0.1:%s/events\n' "$HOOK" > "$T/targets"
 daemon_start "$BIN"
-"$BIN" create storage st -p "$P" --dir "$T/d" --anonymous --notify-targets "$T/targets" -s >/dev/null 2>&1
+"$BIN" create storage st -p "$P" --dir "$F/d" --anonymous --notify-targets "$T/targets" -s >/dev/null 2>&1
 U="http://127.0.0.1:$P"
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$U/")" != 000 ] && break; sleep 0.1; done
 curl -s -o /dev/null -X PUT "$U/bkt"
@@ -66,21 +72,36 @@ cfg='<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
 st=$(curl -s -o "$T/cfg.out" -w '%{http_code}' -X PUT --data-binary "$cfg" "$U/bkt?notification")
 [ "$st" = 200 ] || { bad "the bucket takes the configuration" "$st $(cat "$T/cfg.out")"; }
 
-# One object put, removed, put, removed and put, its events next to each other, then a hundred objects.
+# One object put, removed, put, removed and put, its events next to each other, then a hundred objects: all from
+# one process on one connection, so the events wait on the webhook and not on a hundred curls starting: on a loaded
+# box the curls and the disk took the whole three seconds the time below used to be measured over.
 t0=$(mono_ns)
-for n in 1 2 3 4 5; do
-    if [ $((n % 2)) = 1 ]; then printf 's' | curl -s -o /dev/null -X PUT --data-binary @- "$U/bkt/same"
-    else curl -s -o /dev/null -X DELETE "$U/bkt/same"; fi
-done
-for i in $(seq 1 100); do printf 'x' | curl -s -o /dev/null -X PUT --data-binary @- "$U/bkt/k$i"; done
+python3 - "$P" <<'PY2'
+import http.client, sys
+c = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=30)
+def go(method, key, body=None):
+    c.request(method, "/bkt/" + key, body=body)
+    r = c.getresponse(); r.read()
+    if r.status // 100 != 2: print("  %s %s: %d" % (method, key, r.status))
+for n in range(1, 6):
+    go("PUT", "same", b"s") if n % 2 else go("DELETE", "same")
+for i in range(1, 101):
+    go("PUT", "k%d" % i, b"x")
+PY2
+sent=$(( ($(mono_ns) - t0) / 1000000 ))
 want=105
 for _ in $(seq 1 300); do [ "$(wc -l < "$T/got" 2>/dev/null || echo 0)" -ge "$want" ] && break; sleep 0.05; done
-ms=$(( ($(mono_ns) - t0) / 1000000 ))
 got=$(wc -l < "$T/got" 2>/dev/null || echo 0)
 most=$(awk '{m = $4 > m ? $4 : m} END {print m + 0}' "$T/got")
 same=$(awk '$2 == "same" {printf "%s ", $3}' "$T/got")
 same_most=$(awk '{m = $5 > m ? $5 : m} END {print m + 0}' "$T/got")
-echo "  $got of $want events to a webhook that answers in 50 ms, in $ms ms, at most $most at once"
+# From the first event to the last as the receiver saw them come.  Sent one at a time, each waits out the answer to
+# the one before, so the last comes at least 50 ms for every event before it -- however fast the box -- and half
+# that is what the events of four lanes at once are held under.
+ms=$(awk 'NR == 1 {f = $1} {l = $1} END {printf "%d", (l - f) * 1000}' "$T/got")
+serial=$(( (want - 1) * 50 ))
+echo "  $got of $want events sent in $sent ms, to a webhook that answers in 50 ms, came over $ms ms, at most $most at once"
+echo "  one at a time they could not have come in under $serial ms"
 echo "  the one object's: $same"
 [ "$got" = "$want" ] || "$BIN" stats st 2>/dev/null | grep notify_
 [ "$got" = "$want" ] && ok || bad "every event is sent" "$got of $want"
@@ -89,8 +110,8 @@ echo "  the one object's: $same"
 [ "$same_most" = 1 ] && ok || bad "and one at a time" "$same_most of them at once"
 [ "$most" -ge 2 ] && [ "$most" -le 4 ] && ok || bad "side by side, at most four" "$most at once"
 if [ "$sanitized" = 1 ]; then echo "  SKIP [time]: milliseconds measure the sanitizer, not the deliveries"
-elif [ "$ms" -lt 3500 ]; then ok
-else bad "the events do not wait for each other's answers" "$ms ms"; fi
+elif [ "$ms" -lt $((serial / 2)) ]; then ok
+else bad "the events do not wait for each other's answers" "$ms ms, where half of one at a time is $((serial / 2))"; fi
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
