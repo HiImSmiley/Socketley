@@ -93,8 +93,15 @@ expect "a series of a 2 MiB label is not taken" "$(W "Bearer $KEY" long)" 204
 expect "and not stored" "$(N rw_long)" 0
 expect "64 labels of 56 KiB in all is a line's worth" "$(W "Bearer $KEY" many)" 204
 expect "and is stored" "$(N rw_many)" 1
-refused=$(S stats m 2>/dev/null | awk -F: '$1=="received_refused" {print $2}')
-[ "${refused:-0}" -ge 2 ] && ok || bad "stats count the refused samples" "received_refused ${refused:-none}"
+# The worker counts each refused sample as its request is answered, but `stats` is the daemon's copy, which the
+# worker sends on a quarter second after a change and later under load: asked until it says both, with a deadline,
+# and then exactly both -- the 5000 labels' sample and the 2 MiB label's, none of the stored series'.
+for _ in $(seq 1 200); do
+    refused=$(S stats m 2>/dev/null | awk -F: '$1=="received_refused" {print $2}')
+    [ "${refused:-0}" -ge 2 ] && break
+    sleep 0.1
+done
+expect "stats count the refused samples" "received_refused ${refused:-none}" "received_refused 2"
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
