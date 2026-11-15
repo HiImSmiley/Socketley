@@ -99,7 +99,6 @@ def drain(s):
         except Exception: return got
 print('A ' + ' '.join(drain(a)))
 print('B ' + ' '.join(drain(b)))
-print('D ' + ' '.join(drain(d)))
 " 2>/dev/null)
 A=$(printf '%s\n' "$OUT" | sed -n 's/^A //p')
 B=$(printf '%s\n' "$OUT" | sed -n 's/^B //p')
@@ -161,6 +160,9 @@ def drain(s):
 print('IDS ' + ' '.join(ids))
 print('C ' + ' '.join(drain(c)))
 print('B ' + ' '.join(drain(b)))
+# The newcomer, which a stale index would reach.  Its line was printed by the first script, which has no d, so
+# python stopped there with a NameError and FD below was empty whatever the newcomer received.
+print('D ' + ' '.join(drain(d)))
 " 2>/dev/null)
 read -r _ IA IB IC <<<"$(printf '%s\n' "$FOUT" | grep '^IDS')"
 FC=$(printf '%s\n' "$FOUT" | sed -n 's/^C //p')
