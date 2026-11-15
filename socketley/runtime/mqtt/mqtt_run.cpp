@@ -1251,6 +1251,26 @@ void mqtt_run::tick()
             late.push_back(c.get());
     for (conn* c : late)
         close_conn(*c);
+    if (m_idp && now >= m_next_standing_ms)
+    {
+        // A token's connection ends with its sign-in, as the token itself would at the next request (Keycloak's
+        // CVE-2026-96460: a disabled account kept what it had been let into).
+        m_next_standing_ms = now + 2000;
+        std::vector<conn*> gone;
+        for (auto& [id, c] : m_conns)
+        {
+            bool admin = false;
+            if (!c->idp_sub.empty() && !c->closing && !m_idp->holds(c->idp_sub, c->idp_signed_in_ms, admin))
+                gone.push_back(c.get());
+        }
+        for (conn* c : gone)
+        {
+            LOG_INFO(("mqtt " + std::string(m_owner.get_name()) + ": the sign-in of account " + c->idp_sub +
+                      " no longer holds, and its connection is closed").c_str());
+            c->idp_sub.clear();
+            close_conn(*c);
+        }
+    }
     if (now >= m_next_files_ms)
     {
         // Each tick, so a file changed is taken within two seconds as documented, not three.
@@ -1450,6 +1470,11 @@ void mqtt_run::authenticate(const auth_ask& ask, std::function<void(auth_answer)
             if (m_idp->check_bearer(*ask.password, who) &&
                 (!ask.username || ask.username->empty() || *ask.username == who.username || *ask.username == who.sub))
             {
+                if (const auto it = m_conns.find(ask.conn); it != m_conns.end())
+                {
+                    it->second->idp_sub = who.sub;
+                    it->second->idp_signed_in_ms = who.issued_ms;
+                }
                 finish(true, reason::success, who.username.empty() ? who.sub : who.username);
                 return;
             }

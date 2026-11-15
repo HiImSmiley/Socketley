@@ -139,6 +139,10 @@ private:
         // The broker asked it closed once what it owes has gone; the time it asked, for a peer that never reads.
         bool closing{false};
         int64_t closing_ms{0};
+        // The idp account an access token let this connection in as, and when it was signed in, asked again each few
+        // seconds: a connection outlives no disable, reset, removal or sign-out everywhere of its account.
+        std::string idp_sub;
+        int64_t idp_signed_in_ms{0};
         SSL* ssl{nullptr};
         bool handshaken{false};
         // The kernel holds the send key, and what is sent goes to the socket as plaintext, a payload as a slice of its
@@ -349,6 +353,7 @@ private:
     __kernel_timespec m_tick_ts{};
     bool m_tick_armed{false};
     int64_t m_next_files_ms{0};
+    int64_t m_next_standing_ms{0};
     // An accept refused with EMFILE waits a moment before the next, rather than spinning on the same failure.
     int64_t m_accept_paused_until_ms{0};
     int64_t m_next_persist_ms{0};

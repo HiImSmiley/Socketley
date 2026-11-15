@@ -5,6 +5,7 @@
 #
 # What each part would catch:
 #   * a wrong password, an unknown user or a forged token let in, or a right one refused
+#   * a connection a token let in outliving its account's disable
 #   * a password guessed at without end from one address, or its guesses shutting out another address or the entrance
 #   * mqtt-passwd writing a file the broker does not read, or one others can read
 #   * a users or rules file changed while running and not taken
@@ -315,6 +316,16 @@ if phase == "emptyacl":
             time.sleep(0.2)
         check("an acl file of no rules grants nothing", got, [0x87])
     guarded("emptyacl", emptyacl)
+if phase == "held":
+    # A connection an access token let in ends when its account is disabled, not at its own end.
+    def held():
+        tok = access_token("dave", "davepassword1")
+        c = connected(pa, "dave-held", password=tok)
+        truth("a token's connection stays open while its account stands", not c.closed_within(2.5))
+        subprocess.run([binary, "idp-user", "auth", "disable", "dave"], capture_output=True)
+        truth("and is closed within seconds of its account being disabled", c.closed_within(8))
+    guarded("held", held)
+
 if phase == "guessing":
     def guessing():
         # Ten wrong passwords from one address, and it is told nothing more, the right password included.
@@ -344,6 +355,7 @@ tally < <(run reread)
 printf '# every rule taken out\n' > "$T/acl"
 tally < <(run emptyacl)
 tally < <(run guessing)
+tally < <(run held)
 
 st=$("$BIN" stats a 2>&1)
 case "$st" in *"auth_refused:"*) ok ;; *) bad "stats count the refused sign-ins" "$st" ;; esac
