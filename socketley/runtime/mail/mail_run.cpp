@@ -1998,7 +1998,15 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
         r.m_pool.submit(r.cpu_lane(), [h = *hash, pw = std::move(secret), matched] {
                             *matched = socketley::crypto::password_matches(h, pw);
                         },
-                        [matched, user, finish] { finish(*matched ? account::yes : account::no, user); });
+                        [&r, alive = r.m_alive, me = id, h = *hash, matched, user, finish] {
+                            // Kept with the hash it matched, so the session ends once the file no longer holds it.
+                            if (conn* c = *alive && *matched ? r.find(me) : nullptr)
+                            {
+                                c->local_user = user;
+                                c->local_hash = h;
+                            }
+                            finish(*matched ? account::yes : account::no, user);
+                        });
         return;
     }
     if (r.m_idp)
@@ -2008,18 +2016,23 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
         {
             idp_user = true;
             user_email = who.email;
+            idp_sub = who.sub;
+            idp_signed_in_ms = who.issued_ms;
+            idp_sid = who.sid;
             finish(account::yes, who.username.empty() ? who.sub : who.username);
             return;
         }
         // A password, which only the idp runtime can check, on its own threads.
         const uint64_t me = id;
-        r.m_mailboxes->verify(user, secret, !guarded, [&r, me, finish](account a, std::string name, std::string email) {
+        r.m_mailboxes->verify(user, secret, !guarded, [&r, me, finish](account a, mailboxes::signed_in s) {
             if (conn* c = r.find(me); c && a == account::yes)
             {
                 c->idp_user = true;
-                c->user_email = std::move(email);
+                c->user_email = std::move(s.email);
+                c->idp_sub = std::move(s.sub);
+                c->idp_signed_in_ms = s.ms;
             }
-            finish(a, std::move(name));
+            finish(a, std::move(s.user));
         });
         return;
     }
@@ -3069,6 +3082,11 @@ void mail_run::tick()
             m_disk_low = room < std::max<uint64_t>(256ull << 20, 4 * m_owner.get_max_size());
         }
     }
+    if (now >= m_next_standing_ms)
+    {
+        m_next_standing_ms = now + 2000;
+        end_lapsed_sign_ins();
+    }
     if (now >= m_next_report_ms)
     {
         m_next_report_ms = now + 60000;
@@ -3082,6 +3100,48 @@ void mail_run::tick()
     tls_context::report_inbound_failures();
     settle();
     arm_tick();
+}
+
+void mail_run::end_lapsed_sign_ins()
+{
+    // A session signed in by a password or a token is asked about again, as JMAP's requests and an MQTT connection
+    // are: one whose account was disabled, reset, removed, given a new password or signed out everywhere since, or
+    // whose --users line is gone or holds another hash, ends now rather than when its client leaves (Keycloak's
+    // CVE-2026-96460 class: a disabled account kept what it had been let into).
+    std::vector<conn*> gone;
+    for (auto& [id, c] : m_conns)
+    {
+        if (c->closing || c->dead)
+            continue;
+        bool admin = false;
+        if (!c->idp_sub.empty() && !(m_idp && m_idp->holds(c->idp_sub, c->idp_signed_in_ms, c->idp_sid, admin)))
+            gone.push_back(c.get());
+        else if (!c->local_user.empty())
+        {
+            const std::string* h = m_users.value().hash_of(c->local_user);
+            if (!h || *h != c->local_hash)
+                gone.push_back(c.get());
+        }
+    }
+    for (conn* c : gone)
+    {
+        const std::string who = c->idp_sub.empty() ? "user " + c->local_user : "account " + c->idp_sub;
+        LOG_INFO(("mail " + std::string(m_owner.get_name()) + ": the sign-in of " + who +
+                  " no longer holds, and its session is closed").c_str());
+        c->idp_sub.clear();
+        c->local_user.clear();
+        c->local_hash.clear();
+        const bool talking = !(c->ssl && !c->handshaken);
+        if (c->imap && talking)
+            out(*c, "* BYE [UNAVAILABLE] " + m_hostname + " the account's sign-in no longer holds\r\n");
+        else if (c->smtp && talking)
+            out(*c, "421 4.7.0 " + m_hostname + " the account's sign-in no longer holds, closing\r\n");
+        else if (c->sieve && talking)
+            out(*c, "BYE \"the account's sign-in no longer holds\"\r\n");
+        else if (c->pop3 && talking)
+            out(*c, "-ERR [AUTH] the account's sign-in no longer holds\r\n");
+        close_soon(*c);
+    }
 }
 
 void mail_run::refresh_files()

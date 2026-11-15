@@ -1149,6 +1149,7 @@ void db_run::on_cqe(struct io_uring_cqe* cqe)
     if (req == &m_tick_req)
     {
         m_tick_armed = false;
+        m_tick_withdrawn = false;
         tick();
         return;
     }
@@ -1170,10 +1171,17 @@ void db_run::on_cqe(struct io_uring_cqe* cqe)
 // take, at most a minute ahead; an idle database with neither is woken by nothing.
 void db_run::arm_tick()
 {
-    if (m_tick_armed || m_stopped)
+    if (m_stopped)
         return;
-    int64_t delay = 0;
     const int64_t now = wall::now_sec_coarse();
+    if (m_tick_armed)
+    {
+        // Armed further than a second off while a connection is open: withdrawn, and its -ECANCELED runs the tick.
+        if (!m_tick_withdrawn && !m_http.empty() && m_tick_due > now + 1 && m_loop.submit_timeout_remove(&m_tick_req))
+            m_tick_withdrawn = true;
+        return;
+    }
+    int64_t delay = 0;
     const auto due = [&](int64_t at) {
         if (at <= 0)
             return;
@@ -1193,6 +1201,7 @@ void db_run::arm_tick()
     m_tick_req.type = op_timeout;
     m_tick_ts = {delay, 0};
     m_tick_armed = m_loop.submit_timeout(&m_tick_ts, &m_tick_req);
+    m_tick_due = now + delay;
 }
 
 void db_run::tick()
@@ -1216,6 +1225,7 @@ void db_run::tick()
     }
     for (const auto& c : stalled)
         m_http.close_conn(c);
+    end_lapsed_feeds();
     // A comment now and then, so a stream nothing changes on is not taken for a dead one.
     for (size_t i = 0; i < m_feeds.size(); ++i)
     {
@@ -1352,7 +1362,41 @@ std::string db_run::cors(const request& rq) const
     return "Vary: Origin\r\n";
 }
 
-bool db_run::who_of(const request& rq, principal& who, bool& by_cookie, std::string& refusal)
+void db_run::end_lapsed_feeds()
+{
+    // A stream is asked about again each tick, as every request is at its start, so one an account or a key opened
+    // ends with it rather than when its reader leaves (Keycloak's CVE-2026-96460 class).  The keys file read first,
+    // as a request would have.
+    std::string ignored;
+    reload_files(ignored);
+    std::vector<std::shared_ptr<conn>> gone;
+    for (const auto& c : m_feeds)
+    {
+        if (c->dead)
+            continue;
+        bool holds = true;
+        if (c->who.kind == principal::user)
+        {
+            bool admin = false;
+            holds = m_idp.holds(c->who.sub, c->rests_on.signed_in_ms, c->rests_on.sid, admin);
+        }
+        else if (c->who.kind == principal::key)
+            holds = std::any_of(m_keys.begin(), m_keys.end(), [&](const service_key& k) {
+                return k.name == c->who.sub && crypto::secure_equal(k.secret, c->rests_on.secret);
+            });
+        if (!holds)
+            gone.push_back(c);
+    }
+    for (const auto& c : gone)
+    {
+        LOG_INFO(("db " + std::string(m_owner.get_name()) + ": the sign-in of " +
+                  (c->who.kind == principal::key ? "key " : "account ") + c->who.sub +
+                  " no longer holds, and its stream is closed").c_str());
+        m_http.close_conn(c);
+    }
+}
+
+bool db_run::who_of(const request& rq, principal& who, bool& by_cookie, std::string& refusal, grounds* why_in)
 {
     by_cookie = false;
     if (!rq.authorization.empty())
@@ -1367,12 +1411,16 @@ bool db_run::who_of(const request& rq, principal& who, bool& by_cookie, std::str
             if (crypto::secure_equal(k.secret, token))
             {
                 who = principal{principal::key, k.name};
+                if (why_in)
+                    why_in->secret = k.secret;
                 return true;
             }
         socketley::idp::session_verifier::who w;
         if (m_idp.check_bearer(token, w))
         {
             who = principal{principal::user, w.sub};
+            if (why_in)
+                *why_in = grounds{w.issued_ms, w.sid, {}};
             return true;
         }
         refusal = "the bearer token is no key of this database and no access token of its provider";
@@ -1383,6 +1431,8 @@ bool db_run::who_of(const request& rq, principal& who, bool& by_cookie, std::str
     {
         who = principal{principal::user, w.sub};
         by_cookie = true;
+        if (why_in)
+            *why_in = grounds{w.issued_ms, w.sid, {}};
         return true;
     }
     who = principal{};
@@ -1420,7 +1470,8 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
                 allow + "Retry-After: " + std::to_string(left) + "\r\n");
         return;
     }
-    if (!who_of(rq, who, by_cookie, why))
+    grounds held;
+    if (!who_of(rq, who, by_cookie, why, &held))
     {
         m_wrong_keys.missed(from);
         respond(c, 401, error_body("bad_credentials", why), allow + "WWW-Authenticate: Bearer\r\n");
@@ -1537,6 +1588,7 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
             }
         }
         c->who = who;
+        c->rests_on = std::move(held);
         c->took_at = wall::now_sec_coarse();
         open_feed(c, rq, coll, !feed, path == "/_replicate");
         return;

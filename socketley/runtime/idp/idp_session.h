@@ -45,6 +45,8 @@ public:
         bool admin{false};
         // When the sign-in was given, in milliseconds, for holds() to ask about again.
         int64_t issued_ms{0};
+        // The session or grant it is of, which a sign-out of that one alone ends; empty for none.
+        std::string sid;
     };
 
     // The signed-in account a request's Cookie fields name, false when none does.
@@ -55,6 +57,8 @@ public:
     // Whether a sign-in check() or check_bearer() took, the account `sub` given it at `given_ms`, still holds by its
     // account's standing now, and with `admin` whether the account is an admin now; for what lives past one request.
     bool holds(const std::string& sub, int64_t given_ms, bool& admin);
+    // And not signed out on its own by the sid `sid` names, for a sign-in check() or check_bearer() gave a sid.
+    bool holds(const std::string& sub, int64_t given_ms, std::string_view sid, bool& admin);
 
     // The provider's issuer, where a CLI signs in, empty while its key is not known.
     std::string issuer();

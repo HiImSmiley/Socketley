@@ -41,10 +41,17 @@ public:
     // runtime and kept a minute, `unreachable` where it does not answer; without one, any name an alias gave is a
     // mailbox of that name.
     void find(const std::string& name, std::function<void(account, std::string, std::string)> done);
+    // Who a password signed in: the username, the address the account names, and the account's id and when the
+    // provider took the password, by its clock, for the session to be asked about again while it lasts.
+    struct signed_in
+    {
+        std::string user, email, sub;
+        int64_t ms{0};
+    };
     // Whether `password` is `user`'s, asked of the idp runtime, which hashes it, and counts the failures at the account
     // of a client mail does not guard itself (`unguarded`).
     void verify(const std::string& user, const std::string& password, bool unguarded,
-                std::function<void(account, std::string, std::string)> done);
+                std::function<void(account, signed_in)> done);
 
     // `e` into `user`'s `folder`, `head` put ahead of it and every Authentication-Results this host would have
     // written taken out of it; `done` with 250, or a 4xx or 5xx and why.

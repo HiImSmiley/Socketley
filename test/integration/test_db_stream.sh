@@ -5,6 +5,7 @@
 #
 # What each part would catch:
 #   * a change streamed before it is on the disk, twice, out of order, or to a reader who may not see it
+#   * a stream outliving the disable of the account it was opened for, or the key it was opened with
 #   * a stream that resumes from the last change it read missing one, or a page told nothing when they are gone
 #   * a document whose time came still answered, or its deletion never written or streamed
 #   * a replica that misses a change, takes a write, starts over after a restart of itself or of the one it copies,
@@ -136,6 +137,18 @@ class stream:
         return out
     def close(self):
         self.s.close()
+    def closed_within(self, wait):
+        # Whether the database ends the stream within `wait` seconds, what it says meanwhile read and let go.
+        end = time.time() + wait
+        while time.time() < end:
+            try:
+                if not self.s.recv(65536):
+                    return True
+            except socket.timeout:
+                pass
+            except OSError:
+                return True
+        return False
 
 if phase == "stream":
     ca, cb = sign_in("alice", "alicepassword1"), sign_in("bob", "bobpassword12")
@@ -174,6 +187,25 @@ if phase == "stream":
     gone.close()
     with open(tmpd + "/feed.last", "w") as f:
         f.write(str(evs[-1][0]))
+
+elif phase == "lapse":
+    # A stream outlives no sign-in it rests on: the account disabled, or the key taken out of --keys, ends it within
+    # seconds, as each request would be refused (Keycloak's CVE-2026-96460 class); another's stream goes on.
+    import os, subprocess
+    ca, cc = sign_in("alice", "alicepassword1"), sign_in("carl", "carlpassword12")
+    hers = stream(pd, "/c/chars/_feed", {"Cookie": ca})
+    his = stream(pd, "/c/chars/_feed", {"Cookie": cc})
+    temp = stream(pd, "/_feed", {"Authorization": "Bearer tempsecret0123456789abc"})
+    check("streams open for an account and a key", (hers.events(0, 0.5), his.events(0, 0.5), temp.events(0, 0.5),
+                                                    hers.status, his.status, temp.status), ([], [], [], 200, 200, 200))
+    check("and stay open while they stand", his.closed_within(2.5) or temp.closed_within(0.1), False)
+    subprocess.run([os.environ["BIN"], "idp-user", "auth", "disable", "carl"], capture_output=True)
+    check("an account's stream is closed within seconds of its account being disabled", his.closed_within(8), True)
+    with open(tmpd + "/keys", "w") as f:
+        f.write("backend streamsecret0123456789\n")
+    check("a key's stream is closed once the key is taken out of --keys", temp.closed_within(8), True)
+    db(pd, "PUT", "/c/chars/alice9", {"name": "Morgana"}, {"Cookie": ca})
+    check("while another account's stream goes on", [(e[1], e[2]["id"]) for e in hers.events(1)], [("put", "alice9")])
 
 elif phase == "ttl":
     ca = sign_in("alice", "alicepassword1")
@@ -242,6 +274,14 @@ PY
 
 tally < <(run stream)
 tally < <(run ttl)
+"$BIN" idp-user auth add carl --password carlpassword12 >/dev/null 2>&1
+printf 'backend streamsecret0123456789\ntemp tempsecret0123456789abc\n' > "$T/keys"
+export BIN
+for _ in $(seq 1 30); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer tempsecret0123456789abc' "http://127.0.0.1:$PD/c/notes/_none")" != 401 ] && break
+    sleep 0.1
+done
+tally < <(run lapse)
 stat_at_least data expired 1 && ok || bad "stats count the documents whose time came" "$(stat_of data expired)"
 
 # ── A replica, on a runtime of its own ────────────────────────────────────────

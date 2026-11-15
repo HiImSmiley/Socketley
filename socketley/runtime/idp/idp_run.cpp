@@ -3773,6 +3773,9 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         const std::string name = who ? std::string(who->username()) : std::string();
         const std::string email = who ? std::string(trusted_email(*who)) : std::string();
         const std::string quota = who ? std::string(who->field("mail_quota")) : std::string();
+        // The account's id and the moment it was asked, by this provider's clock, which its standing is stamped by: a
+        // mail session signed in by the password lasts only while the account's sign-ins from then on still hold.
+        const std::string signed_in = who ? who->id + "\t" + std::to_string(wall::now_ms()) : std::string();
         // A client mail does not guard itself, one on its machine or behind a forwarder there, is counted at the account
         // here, under a key of mail's own so a mail app with an old password never holds up its user's web sign-in.
         const bool counted = args.size() > 3 && args[3] == "unguarded";
@@ -3798,11 +3801,11 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         if (counted)
             hold_keys({acct});
         check_mail_password(who, args.size() > 2 ? args[2] : std::string(),
-                            [this, ticket, name, email, quota, acct, counted](bool ok) {
+                            [this, ticket, name, email, quota, signed_in, acct, counted](bool ok) {
             if (counted)
                 release({acct});
             if (ok)
-                answer_command(ticket, "ok " + name + "\t" + email + "\t" + quota);
+                answer_command(ticket, "ok " + name + "\t" + email + "\t" + quota + "\t" + signed_in);
             else if (counted)
                 return count_failed({acct}, wall::now_sec(), [this, ticket, acct] {
                     answer_command(ticket, "error: no");

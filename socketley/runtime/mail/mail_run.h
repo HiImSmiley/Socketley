@@ -233,6 +233,14 @@ private:
         // An idp user signed in, and the address the account names, which with its username are what it sends as.
         bool idp_user{false};
         std::string user_email;
+        // Who signed in on it, asked again every few seconds while it lasts, so a session outlives no disable, reset,
+        // removal, new password or sign-out everywhere of its account: the idp account and when the provider took its
+        // password or token, or the --users name and the hash it matched.
+        std::string idp_sub;
+        int64_t idp_signed_in_ms{0};
+        std::string idp_sid;
+        std::string local_user;
+        std::string local_hash;
         // Whether the user signed in on it may send as `a`: their username at one of the domains, the account's email,
         // or the username where it is an address.
         bool owns(const address& a) const;
@@ -350,6 +358,8 @@ private:
     void send_raw(conn& c, std::string_view bytes);
     void write_done(conn& c, int res);
     void close_soon(conn& c);
+    // The sessions whose sign-in no longer holds, told so in their protocol's words and closed.
+    void end_lapsed_sign_ins();
     void close_conn(conn& c);
     void settle();
     // A connection whose read or write the ring could not take now, tried again at the loop's turn.
@@ -536,6 +546,7 @@ private:
     __kernel_timespec m_tick_ts{};
     bool m_tick_armed{false};
     int64_t m_next_files_ms{0};
+    int64_t m_next_standing_ms{0};
 
     std::unordered_map<uint64_t, std::function<void(request_status, std::string_view)>> m_replies;
     // Requests out at once, under the request channel's bound for background work, so the one past it waits here

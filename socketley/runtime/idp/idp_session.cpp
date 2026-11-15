@@ -140,7 +140,7 @@ bool session_verifier::verified(std::string_view token, bool bearer, int64_t now
             return false;
         // An e-mail the provider does not vouch for is anyone's to claim, so it is not taken as the user's.
         out = who{c["sub"], c["preferred_username"], c["email_verified"] == "true" ? c["email"] : std::string(), s->admin,
-                  issued_ms(c)};
+                  issued_ms(c), c["sid"]};
         return true;
     }
     return false;
@@ -190,11 +190,16 @@ bool session_verifier::check_bearer(std::string_view token, who& out)
 
 bool session_verifier::holds(const std::string& sub, int64_t given_ms, bool& admin)
 {
+    return holds(sub, given_ms, {}, admin);
+}
+
+bool session_verifier::holds(const std::string& sub, int64_t given_ms, std::string_view sid, bool& admin)
+{
     if (!enabled() || sub.empty())
         return false;
     reload();
     const standing* s = standing_of(sub);
-    if (!s || !s->admits(given_ms))
+    if (!s || !s->admits(given_ms) || s->ended_session(sid))
         return false;
     admin = s->admin;
     return true;

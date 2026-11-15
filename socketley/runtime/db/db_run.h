@@ -81,6 +81,14 @@ public:
                    std::string_view if_match, std::string_view if_none_match, bool sibling = false);
 
 private:
+    // What a sign-in rests on, for a stream that lasts past its request to be asked about again: the provider's
+    // session or token (when it was given, and its sid), or the key's secret.
+    struct grounds
+    {
+        int64_t signed_in_ms{0};
+        std::string sid;
+        std::string secret;
+    };
     // A connection, and what it keeps when it streams changes.
     struct conn : socketley::http::server_conn
     {
@@ -90,6 +98,7 @@ private:
         bool replica{false};
         std::string coll;
         principal who;
+        grounds rests_on;
         // A whole copy being sent before the changes after it: the documents, and how far it has come.
         std::vector<copy_job::item> dump;
         size_t dump_at{0};
@@ -157,7 +166,10 @@ private:
     void respond(const std::shared_ptr<conn>& c, int status, std::string_view body, std::string_view extra = {},
                  uint64_t version = 0, bool head_only = false);
     std::string cors(const request& rq) const;
-    bool who_of(const request& rq, principal& who, bool& by_cookie, std::string& refusal);
+    bool who_of(const request& rq, principal& who, bool& by_cookie, std::string& refusal, grounds* why_in = nullptr);
+    // The streams whose sign-in no longer holds: the account disabled, reset, removed, given a new password or signed
+    // out since, or the key gone from --keys or given another secret.
+    void end_lapsed_feeds();
     void reload_files(std::string& why);
 
     // The disk: a sync begun when something waits on more than is there, and what then may be answered.
@@ -257,6 +269,11 @@ private:
     io_request m_tick_req{};
     __kernel_timespec m_tick_ts{};
     bool m_tick_armed{false};
+    // When the armed tick comes, and whether it is being withdrawn so it comes now: a connection opened while it was
+    // armed for a document's time or a backup, up to a minute ahead, is looked at within a second, as a stream's sign-in
+    // is asked about again.
+    int64_t m_tick_due{0};
+    bool m_tick_withdrawn{false};
 
     std::vector<waiter> m_waiting;
     uint64_t m_durable{0};

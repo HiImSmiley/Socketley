@@ -1,5 +1,7 @@
 #include "mail_mailbox.h"
 
+#include <charconv>
+
 #include "mail_compose.h"
 #include "mail_instance.h"
 #include "mail_run.h"
@@ -177,11 +179,11 @@ void mailboxes::find(const std::string& name, std::function<void(account, std::s
 }
 
 void mailboxes::verify(const std::string& user, const std::string& password, bool unguarded,
-                       std::function<void(account, std::string, std::string)> done)
+                       std::function<void(account, signed_in)> done)
 {
     if (m_idp.empty() || user.find('\n') != std::string::npos || password.find('\n') != std::string::npos)
     {
-        done(account::no, {}, {});
+        done(account::no, {});
         return;
     }
     std::string payload(socketley::idp::command_marker);
@@ -192,13 +194,34 @@ void mailboxes::verify(const std::string& user, const std::string& password, boo
         if (st != request_status::ok || !reply.starts_with("ok "))
         {
             // An account the idp holds up for its failures is one that cannot be checked now, not a wrong password.
-            done(st == request_status::ok && reply != "error: wait" ? account::no : account::unreachable, {}, {});
+            done(st == request_status::ok && reply != "error: wait" ? account::no : account::unreachable, {});
+            return;
+        }
+        // <user> TAB <email> TAB <quota> TAB <account id> TAB <milliseconds>, the last two read from the end.
+        std::string_view rest = reply.substr(3);
+        signed_in s;
+        const size_t t2 = rest.rfind('\t');
+        const size_t t1 = t2 == std::string_view::npos || t2 == 0 ? std::string_view::npos : rest.rfind('\t', t2 - 1);
+        if (t1 != std::string_view::npos)
+        {
+            const std::string_view ms = rest.substr(t2 + 1);
+            const auto [end, ec] = std::from_chars(ms.data(), ms.data() + ms.size(), s.ms);
+            if (ec == std::errc{} && end == ms.data() + ms.size())
+                s.sub = std::string(rest.substr(t1 + 1, t2 - t1 - 1));
+            rest = rest.substr(0, t1);
+        }
+        // A session the provider names no account for could never be asked about again, so it is not opened.
+        if (s.sub.empty() || s.ms <= 0)
+        {
+            done(account::unreachable, {});
             return;
         }
         known k;
-        take_answer(reply.substr(3), k);
+        take_answer(rest, k);
         m_quota[lower(k.user)] = k.quota;
-        done(account::yes, k.user, k.email);
+        s.user = std::move(k.user);
+        s.email = std::move(k.email);
+        done(account::yes, std::move(s));
     });
 }
 
