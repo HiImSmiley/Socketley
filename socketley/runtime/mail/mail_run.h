@@ -306,6 +306,7 @@ private:
         std::vector<std::string> addresses_of(const std::string& user) override;
         void submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts, std::string message,
                     std::function<void(bool, std::string)> done, int64_t hold_until_ms = 0) override;
+        bool may_submit(const std::string& user) override;
     };
     struct listener
     {

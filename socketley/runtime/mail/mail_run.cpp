@@ -2640,6 +2640,14 @@ bool mail_run::sends_on_as_own(const std::string& user, const std::string& own, 
     });
 }
 
+bool mail_run::conn::may_submit(const std::string& user)
+{
+    if (run->may_send("user:" + user))
+        return true;
+    ++run->m_rate_limited;
+    return false;
+}
+
 void mail_run::conn::submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts,
                             std::string message, std::function<void(bool, std::string)> done, int64_t hold_until_ms)
 {

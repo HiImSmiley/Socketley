@@ -2513,6 +2513,13 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                                                                                     std::to_string(m_cfg.max_rcpt));
                     return (*self)();
                 }
+                // As many a second as SMTP submission takes from this user (--rate-limit), and no more.
+                if (!m_hooks.may_submit(m_user))
+                {
+                    comma(j->not_created);
+                    j->not_created += q(cid) + ":" + set_error("rateLimit", "too many messages; try again later");
+                    return (*self)();
+                }
                 // The Bcc header does not go with the message (RFC 8621 7.5).
                 std::string message;
                 for (const auto& [n, v] : split_headers(head))

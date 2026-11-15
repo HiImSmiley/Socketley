@@ -190,6 +190,16 @@ void mail_run::imap_sieve_apply(const std::string& user, const std::shared_ptr<i
                     kept = true;
                     break;
                 }
+                // Each one sent on is a message the user sends, held to --rate-limit as SMTP submission is.
+                if (!may_send("user:" + user))
+                {
+                    ++m_rate_limited;
+                    LOG_WARN(("mail: the imapsieve script of " + user + "'s " + f->name +
+                              " sends on more messages a second than --rate-limit lets them send, so one is kept")
+                                 .c_str());
+                    kept = true;
+                    break;
+                }
                 queue_message(own, {a.arg}, "Delivered-To: " + own + "\r\n" + std::string(bytes), false, {},
                               [](bool, std::string) {});
                 break;

@@ -87,6 +87,8 @@ public:
         virtual std::string address_of(const std::string& user) = 0;
         // Every address they may send as, theirs first: the same name under each domain, and the aliases that are theirs.
         virtual std::vector<std::string> addresses_of(const std::string& user) { return {address_of(user)}; }
+        // Whether `user` may send another message now, by --rate-limit as SMTP submission holds them to it; takes one.
+        virtual bool may_submit(const std::string& /*user*/) { return true; }
         // A message queued to go from `from` to `rcpts`, answered with its spool id.
         // Held until `hold_until_ms` where that is later than now (FUTURERELEASE, RFC 4865).
         virtual void submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts,
