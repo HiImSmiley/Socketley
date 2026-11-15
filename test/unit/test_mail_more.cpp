@@ -203,6 +203,38 @@ TEST_CASE("POP3: a sign-in, STAT, LIST, UIDL, RETR dot-stuffed, TOP, DELE taken 
     CHECK(h.closed);
 }
 
+TEST_CASE("POP3: a USER given before STLS, which anyone between could have written, is not taken after it")
+{
+    pop_hooks h;
+    pop3_config cfg;
+    cfg.hostname = "mx.test";
+    cfg.tls_offered = true;
+    cfg.login_in_clear = true;
+    pop3_session s(cfg, h);
+    s.greet();
+    h.take();
+    s.input("USER alice\r\n");
+    CHECK(h.take() == "+OK send the password\r\n");
+    s.input("STLS\r\n");
+    CHECK(h.take() == "+OK begin TLS negotiation\r\n");
+    s.tls_started();
+    s.input("PASS pw\r\n");
+    CHECK(h.take().starts_with("-ERR USER first"));
+    s.input("STAT\r\n");
+    CHECK(h.take().starts_with("-ERR sign in first"));
+    // Nor an AUTH that waits for its response.
+    pop3_session s2(cfg, h);
+    s2.greet();
+    h.take();
+    s2.input("AUTH PLAIN\r\n");
+    h.take();
+    s2.tls_started();
+    s2.input("AGFsaWNlAHB3\r\n");
+    CHECK(h.take().starts_with("-ERR"));
+    s2.input("STAT\r\n");
+    CHECK(h.take().starts_with("-ERR sign in first"));
+}
+
 TEST_CASE("modified UTF-7: RFC 3501's example, an astral character, & and what does not decode")
 {
     using namespace socketley::mail;

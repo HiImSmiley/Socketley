@@ -45,6 +45,11 @@ void pop3_session::tls_started()
     m_waiting = false;
     m_in.clear();
     m_at = 0;
+    // Nothing said before TLS, which anyone between could have said, is taken after it (RFC 2595 4): a USER
+    // waiting for its PASS, or an AUTH waiting for its response.
+    m_pending_user.clear();
+    m_sasl = false;
+    m_sasl_mech.clear();
 }
 
 void pop3_session::capabilities()
