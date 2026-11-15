@@ -11453,7 +11453,7 @@ The delivery reports a sender asked for (RFC 3461) are kept with each recipient.
 
 Mail from one of its domains is signed with DKIM twice, both relaxed: rsa-sha256 under the selector, and ed25519-sha256 (RFC 8463) under *selector***-ed***.* The keys are made at the first start and kept in *state***/mail/***name***.dkim.***selector***.key** for every shard. To rotate a key, first name the new selector with **--dkim-next**, which makes its key pair and publishes it beside the old one. Once DNS has the new key, name the selector with **--dkim-selector**.
 
-Mail from other servers that the runtime sends on, as an alias does, is sealed with ARC (RFC 8617). The seal holds what the runtime's checks found, signed and sealed for its first domain. So the next hop can know what the message was when it arrived here.
+Mail from other servers that the runtime sends on, as an alias does, is sealed with ARC (RFC 8617). The seal holds what the runtime's checks found, signed and sealed for its first domain. So the next hop can know what the message was when it arrived here. Mail from another server whose From is in one of the runtime's domains and that did not pass DMARC here is not sent on to an address elsewhere: its recipients there fail with 550 5.7.1. Sent from this host, it would pass SPF for that domain at the next hop and align with the From, so the forgery would pass DMARC there.
 
 **Reports.** With **--reports**, the runtime sends the reports other domains ask for:
 
