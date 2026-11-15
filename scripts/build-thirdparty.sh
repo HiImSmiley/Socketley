@@ -22,8 +22,8 @@ LIBURING_TAG=liburing-2.15   # pinned deliberately: see thirdparty/liburing/READ
 OPENSSL_TAG=openssl-3.5.9
 # Kernel TLS, for a runtime that hands a connection's send key to the kernel; a _TAG, so a change rebuilds OpenSSL.
 OPENSSL_OPTIONS_TAG=enable-ktls
-NGHTTP3_TAG=v1.18.0
-NGTCP2_TAG=v1.25.0
+NGHTTP3_TAG=v1.19.0
+NGTCP2_TAG=v1.26.0
 PREMAKE_REF=v5.0.0-beta8   # scripts/premake5's version; not a _TAG, so a change here rebuilds no library in scripts/update.sh
 
 build_liburing() {
