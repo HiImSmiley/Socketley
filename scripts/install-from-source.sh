@@ -16,7 +16,7 @@
 #   build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl
 #                                 Dockerfile builder stage, ci.yml, release.yml
 #   liburing >= 2.7, from source  scripts/install-liburing.sh, which owns the pin
-#   thirdparty/luajit/libluajit.a scripts/build-thirdparty.sh luajit, as CI runs it
+#   thirdparty/luajit/libluajit.a scripts/build-thirdparty.sh luajit, the pinned commit from source
 #   premake5 gmake2, release_<arch>  release.yml; make/Makefile names the arch
 #   Linux 5.19                    README.md's Requirements, sdk/CMakeLists.txt:5
 #   x86_64 or aarch64             premake5.lua's target_arch; on aarch64 premake is built, with uuid-dev
@@ -402,7 +402,7 @@ if [ "$SKIP_DEPS" = 0 ] && [ "$IS_DEBIAN" = 0 ]; then
          "as capabilities rather than package names:" \
          "  a C++ compiler: GCC 12 or newer, and make" \
          "  OpenSSL headers and libraries (libssl, libcrypto)" \
-         "  LuaJIT: a static libluajit-5.1.a, or none and scripts/build-thirdparty.sh builds one" \
+         "  nothing for LuaJIT: scripts/build-thirdparty.sh builds its pinned commit from source" \
          "  git and a CA bundle, for the two source clones the build makes" \
          "" \
          "liburing is not on that list: scripts/install-liburing.sh builds the pinned release" \

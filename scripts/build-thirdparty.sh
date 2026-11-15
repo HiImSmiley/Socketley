@@ -25,6 +25,9 @@ OPENSSL_TAG=openssl-3.5.9
 OPENSSL_OPTIONS_TAG="enable-ktls no-cms no-siv"
 NGHTTP3_TAG=v1.19.0
 NGTCP2_TAG=v1.26.0
+# LuaJIT has no releases, only the rolling branch v2.1, so the pin is a commit; an archive names it as 2.1.<commit time>.
+LUAJIT_TAG=63c8f1a9b479ba5518cf6a170ff7729178bc3cfd
+LUAJIT_RELVER=2.1.1794386141
 PREMAKE_REF=v5.0.0-beta8   # scripts/premake5's version; not a _TAG, so a change here rebuilds no library in scripts/update.sh
 
 build_liburing() {
@@ -55,62 +58,50 @@ luajit_optimised() {
       | grep -qE 'mov +%rdi,[^,]*\(%r[sb]p\)|str +x0, *\[(sp|x29)'
 }
 
+# Checked in the artefact, as liburing is: an archive of another commit is another LuaJIT, however it got there.
+luajit_pinned() { strings -a "$1" 2>/dev/null | grep -qxF "LuaJIT $LUAJIT_RELVER"; }
+
+fetch_luajit() {
+  git init -q "$1" && git -C "$1" fetch -q --depth 1 https://github.com/LuaJIT/LuaJIT.git "$LUAJIT_TAG" \
+    && git -C "$1" checkout -q FETCH_HEAD
+}
+
 # libsocketley.so links LuaJIT too, which takes an archive built position-independent; the daemon keeps the faster one.
 build_luajit_pic() {
   echo "== luajit, position-independent"
   local dest="$ROOT/thirdparty/luajit/libluajit_pic.a"
-  if [ -f "$dest" ]; then echo "   already present, left alone"; return 0; fi
+  if [ -f "$dest" ] && luajit_pinned "$dest"; then echo "   $LUAJIT_RELVER already present, left alone"; return 0; fi
   local tmp; tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
-  git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git "$tmp" >/dev/null 2>&1 \
-    || { echo "   FAILED: could not clone LuaJIT"; return 2; }
+  fetch_luajit "$tmp" >/dev/null 2>&1 || { echo "   FAILED: could not fetch LuaJIT $LUAJIT_TAG"; return 2; }
   make -C "$tmp/src" -j"$(nproc)" BUILDMODE=static XCFLAGS=-DLUAJIT_ENABLE_GC64 CFLAGS="-O2 -fomit-frame-pointer -fPIC" libluajit.a \
        >/dev/null 2>&1 || { echo "   FAILED: LuaJIT build"; return 2; }
   cp "$tmp/src/libluajit.a" "$dest"
   echo "   built ($(stat -c%s "$dest") bytes)"
+  luajit_pinned "$dest" || { echo "   REFUSED: the archive built is not LuaJIT $LUAJIT_RELVER"; rm -f "$dest"; return 2; }
 }
 
 build_luajit() {
   echo "== luajit"
   local dest="$ROOT/thirdparty/luajit/libluajit.a"
   if [ -f "$dest" ]; then
-    if luajit_optimised "$dest"; then
-      echo "   already present, left alone"
+    if luajit_optimised "$dest" && luajit_pinned "$dest"; then
+      echo "   $LUAJIT_RELVER already present, left alone"
       return 0
     fi
-    echo "   present but compiled without optimisation, replaced"
+    echo "   present but not an optimised build of $LUAJIT_RELVER, replaced"
     rm -f "$dest"
   fi
 
-  # This used to print "NOT AUTOMATED" and tell the reader to copy the archive
-  # from another worktree.  A fresh clone has no other worktree, so the one
-  # person the script exists for was the one it could not help -- and the README
-  # sent them straight from `apt install libluajit-5.1-dev` into a build that
-  # ends in `cannot find -lluajit`.
-  #
-  # The distribution package is not a drop-in for that: premake links -lluajit
-  # and Ubuntu installs libluajit-5.1.a, so the name never matches however many
-  # -dev packages are present.  release.yml has always known this and copied the
-  # file across by hand; that step lives here now, where the documented build
-  # can reach it.
-  local sys
-  sys=$(find /usr/lib /usr/local/lib -name 'libluajit-5.1.a' 2>/dev/null | head -1)
-  if [ -n "$sys" ] && luajit_optimised "$sys"; then
-    cp "$sys" "$dest"
-    echo "   copied from $sys ($(stat -c%s "$dest") bytes)"
-    return 0
-  fi
-  [ -n "$sys" ] && echo "   $sys is not optimised, so it is not taken"
-
-  echo "   no system libluajit-5.1.a found, building from source"
+  # Always from source: the distribution's libluajit-5.1.a, which this used to copy, is whatever commit it packaged.
   local tmp; tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
-  git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git "$tmp" >/dev/null 2>&1 \
-    || { echo "   FAILED: could not clone LuaJIT"; return 2; }
+  fetch_luajit "$tmp" >/dev/null 2>&1 || { echo "   FAILED: could not fetch LuaJIT $LUAJIT_TAG"; return 2; }
   ( cd "$tmp" && make -j"$(nproc)" >/dev/null 2>&1 ) \
     || { echo "   FAILED: LuaJIT build"; return 2; }
   cp "$tmp/src/libluajit.a" "$dest"
   echo "   built from source ($(stat -c%s "$dest") bytes)"
+  luajit_pinned "$dest" || { echo "   REFUSED: the archive built is not LuaJIT $LUAJIT_RELVER"; rm -f "$dest"; return 2; }
   luajit_optimised "$dest" || { echo "   REFUSED: the archive built is not optimised"; rm -f "$dest"; return 2; }
 }
 
