@@ -1417,6 +1417,11 @@ void endpoint::drop(const std::shared_ptr<conn>& hc)
     // stream that take was for to its pull().
     for (auto& st : all)
         forget(std::move(st));
+    // And one the host let go of earlier in that take is in `doomed` already, out of the table walked above, still
+    // naming this connection: pull() gives its window back through the owner, which is freed once the caller lets go.
+    for (auto& st : doomed)
+        if (st->owner == hc.get())
+            st->owner = nullptr;
     for (const std::string& k : hc->cids)
         if (auto it = by_cid.find(k); it != by_cid.end() && it->second == hc)
             by_cid.erase(it);
