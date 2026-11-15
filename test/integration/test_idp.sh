@@ -37,6 +37,7 @@
 #     CVE-2026-109081); a password an admin set to be set again opening a mailbox
 #   * one of them still taking a cookie of an account disabled, removed, signed out everywhere or made to reset since,
 #     or the admin bit of one taken out of admins since; or a code given before a sign-out redeemed after it
+#   * an account disabled and enabled again finding the sessions from before its disable taken again
 #   * a cookie of an account renamed since still taken, carrying the old name another account may be given
 #   * a session signed out still taken from a copy of its cookie, or a sign-out ending the account's other sessions
 #   * another site's page signing its visitors out of the provider unasked
@@ -707,6 +708,22 @@ elif phase == "replay":
     check("a code signs in", (st, (h.get("Set-Cookie") or "").startswith("skl_idp=")), (302, True))
     json.dump({"code": code}, open(tmpd + "/lea.json", "w"))
 
+elif phase == "reenabled":
+    # A disable ends every session for good: enable lets the account sign in again, it does not bring back the
+    # sessions from before (Keycloak's CVE-2026-96460 class).
+    s = json.load(open(state_file))
+    P = "http://127.0.0.1:%s" % pp
+    gate = lambda c: at(P, "GET", "/gate/who", headers={"Accept": "application/json"}, cookie=c)[0]
+    fresh = cookie_of(req("POST", "/login", dict(rd="/", username="carol", password="carolpassword1"),
+                          headers={"X-Forwarded-For": "198.51.100.90"})[2])
+    check("an account enabled again signs in", bool(fresh), True)
+    end = time.time() + 3
+    while gate(fresh) != 200 and time.time() < end:
+        time.sleep(0.1)
+    check("and that sign-in is taken at the proxy", gate(fresh), 200)
+    check("but a session from before its disable is not", gate(s["later"]["carol"]), 401)
+    check("nor at the idp's own pages", req("GET", "/account", cookie=s["later"]["carol"])[0], 302)
+
 elif phase == "restarted":
     # First, while the code taken before the restart still holds.
     E = {"X-Forwarded-For": "198.51.100.71"}
@@ -750,6 +767,10 @@ expect "but not with one an admin set to be set again" \
     "$("$BIN" idp-user auth verify gina ginapassword1 2>&1 | cut -c1-3)" "err"
 [ -s "$T/erin.key" ] && ok || bad "a second step is turned on for the reset checks" "no key"
 tally < <(run after_cli)
+
+# Enabled again, carol's account signs in anew; what it held before the disable stays ended.
+"$BIN" idp-user auth enable carol >/dev/null 2>&1 && ok || bad "enable takes" "rc $?"
+tally < <(run reenabled)
 
 for u in gus ivy jon kim; do "$BIN" idp-user auth add "$u" --password "${u}password123" >/dev/null 2>&1; done
 "$BIN" idp-user auth totp kim on 2>&1 | sed -n 's/^key: //p' > "$T/kim.key"

@@ -4450,6 +4450,14 @@ bool idp_run::write_account(const std::string& id, const field_list& fields, std
             why = std::string(changed_meanwhile);
             return false;
         }
+    // Disabled or made to reset its password ends every sign-in it had for good, as a sign-out everywhere does: what
+    // `enable` or a new password lets in again is a new sign-in, never the sessions, tokens and refresh families from
+    // before (Keycloak's CVE-2026-96460 class).  Stamped here, where every change of an account is written.
+    if (std::any_of(set.begin(), set.end(), [](const auto& kv) {
+            return (kv.first == "disabled" || kv.first == "reset") && kv.second == "1";
+        }) &&
+        std::none_of(set.begin(), set.end(), [](const auto& kv) { return kv.first == "revoked_before"; }))
+        set.emplace_back("revoked_before", std::to_string(wall::now_ms()));
     if (!m_accounts.update(id, set, why))
         return false;
     // Signed out everywhere, disabled, reset, or its groups changed: its SSH certificates end now, not in hours, as one
