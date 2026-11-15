@@ -12,7 +12,8 @@
 #     bounced at all
 #   * a smarthost's 454 to AUTH bouncing everything queued for it; AUTH LOGIN not spoken; credentials in a URL
 #     not percent-decoded; smtps:// not TLS from the first byte; a password sent to a smarthost elsewhere in the
-#     clear
+#     clear; mail sent in the clear to a smarthost elsewhere whose STARTTLS was struck out of its EHLO, or to one
+#     whose name only begins with "127."
 #   * a flush of a sharded runtime trying only one shard's queue
 #   * an exchanger without PIPELINING sent what it cannot take, or a refusal at the end of the data not final
 #   * a script's on_rcpt that fails refusing the recipient for good
@@ -45,6 +46,7 @@ PL=$((SL_PORT_BASE+1969))
 PR4=$((SL_PORT_BASE+1970)); RELAY4=$((SL_PORT_BASE+1971))
 PR5=$((SL_PORT_BASE+1972)); RELAY5=$((SL_PORT_BASE+1973))
 PSH=$((SL_PORT_BASE+1974))
+PR6=$((SL_PORT_BASE+1975)); RELAY6=$((SL_PORT_BASE+1976)); PR7=$((SL_PORT_BASE+1977))
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
@@ -58,7 +60,7 @@ echo "=== Integration: a mail runtime's deliveries, final only where the answers
 # one554.test has only the 554 one; later.test does not exist for two seconds from the first question about it.
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
     two.test=MX:10:mx1.two.test two.test=MX:20:mx2.two.test mx1.two.test=127.0.0.4 mx2.two.test=127.0.0.5 \
-    one554.test=MX:10:mx1.two.test later.test=NXFOR:2 later.test=MX:10:mx.remote.test relay.test=127.0.0.6 \
+    one554.test=MX:10:mx1.two.test later.test=NXFOR:2 later.test=MX:10:mx.remote.test relay.test=127.0.0.6 127.relay.test=127.0.0.6 \
     broken.test=SERVFAIL nopipe.test=MX:10:mx.nopipe.test mx.nopipe.test=127.0.0.7 \
     dataref.test=MX:10:mx.dataref.test mx.dataref.test=127.0.0.8 \
     >/dev/null 2>&1 &
@@ -89,11 +91,14 @@ openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout "$T/relay.key"
 printf 'subjectAltName=IP:127.0.0.1\n' > "$T/relay.ext"
 openssl x509 -req -in "$T/relay.csr" -CA "$T/ca.pem" -CAkey "$T/ca.key" -CAcreateserial -days 2 -extfile "$T/relay.ext" \
     -out "$T/relay.pem" >/dev/null 2>&1
-mkdir -p "$T/relay4" "$T/relay5"
+mkdir -p "$T/relay4" "$T/relay5" "$T/relay6"
 python3 "$HERE/lib_smtp_sink.py" "$RELAY4" "$T/relay4" --implicit-tls "$T/relay.pem" "$T/relay.key" --auth 'tls:secret' \
     >/dev/null 2>&1 &
 PIDS+=($!)
 FAKESINK_ADDR=127.0.0.6 python3 "$HERE/lib_smtp_sink.py" "$RELAY5" "$T/relay5" --auth 'x:y' >/dev/null 2>&1 &
+PIDS+=($!)
+# A smarthost elsewhere whose EHLO has no STARTTLS, as one between strikes it out, and that takes mail unsigned-in.
+FAKESINK_ADDR=127.0.0.6 python3 "$HERE/lib_smtp_sink.py" "$RELAY6" "$T/relay6" >/dev/null 2>&1 &
 PIDS+=($!)
 # An exchanger without PIPELINING, and one that refuses at the end of the data.
 mkdir -p "$T/nopipe" "$T/dataref"
@@ -104,6 +109,7 @@ PIDS+=($!)
 export SOCKETLEY_MAIL_TLS_CA="$T/ca.pem"
 for p in "$SINK" "$RELAY" "$RELAY2" "$RELAY3" "$RELAY4"; do ready_tcp 127.0.0.1 "$p" || bad "the sink on $p listens" "-"; done
 ready_tcp 127.0.0.6 "$RELAY5" || bad "the smarthost without TLS listens" "-"
+ready_tcp 127.0.0.6 "$RELAY6" || bad "the smarthost without TLS or a password listens" "-"
 ready_tcp 127.0.0.7 "$SINK" || bad "the exchanger without PIPELINING listens" "-"
 ready_tcp 127.0.0.8 "$SINK" || bad "the exchanger that refuses the data listens" "-"
 ready_tcp 127.0.0.4 "$SINK" || bad "the 554 sink listens" "-"
@@ -119,13 +125,15 @@ printf 'list@example.test a@remote.test,b@remote.test\n' > "$T/aliases"
 "$BIN" create mail r3 -p "$PR3" --mail-domain example.test --relay "smtp://x:y@127.0.0.1:$RELAY3" -s >/dev/null 2>&1
 "$BIN" create mail r4 -p "$PR4" --mail-domain example.test --relay "smtps://tls:secret@127.0.0.1:$RELAY4" -s >/dev/null 2>&1
 "$BIN" create mail r5 -p "$PR5" --mail-domain example.test --relay "smtp://x:y@relay.test:$RELAY5" -s >/dev/null 2>&1
+"$BIN" create mail r6 -p "$PR6" --mail-domain example.test --relay "smtp://relay.test:$RELAY6" -s >/dev/null 2>&1
+"$BIN" create mail r7 -p "$PR7" --mail-domain example.test --relay "smtp://x:y@127.relay.test:$RELAY5" -s >/dev/null 2>&1
 "$BIN" create mail msh -p "$PSH" --mail-domain example.test --shards 3 -s >/dev/null 2>&1
 cat > "$T/broken.lua" <<'LUA'
 function on_rcpt(rcpt, default) error("the script broke") end
 LUA
 "$BIN" create mail ml -p "$PL" --mail-domain example.test --aliases "$T/aliases" --lua "$T/broken.lua" -s \
     >/dev/null 2>&1
-for p in "$P" "$PR" "$PR2" "$PR3" "$PR4" "$PR5" "$PSH" "$PL"; do
+for p in "$P" "$PR" "$PR2" "$PR3" "$PR4" "$PR5" "$PR6" "$PR7" "$PSH" "$PL"; do
     ready_tcp 127.0.0.1 "$p" || bad "the mail runtime on $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 done
 
@@ -242,6 +250,14 @@ id=$(send "$PR5" s@example.test u@far.test)
 wait_for "\"\$BIN\" mail r5 show $id 2>/dev/null | grep -c 'is not sent in the clear'" 1
 check "a smarthost elsewhere that offers no TLS is sent no password, and the mail waits" "$(state r5 "$id" u@far.test)" "waiting"
 check "and it is sent nothing" "$(ls "$T/relay5" | grep -c '\.eml$')" "0"
+id=$(send "$PR6" s@example.test v@far.test)
+wait_for "\"\$BIN\" mail r6 show $id 2>/dev/null | grep -c 'offers no STARTTLS'" 1
+check "a smarthost elsewhere whose STARTTLS is struck out is sent no mail in the clear, which waits" \
+      "$(state r6 "$id" v@far.test) $(ls "$T/relay6" | grep -c '\.eml$')" "waiting 0"
+id=$(send "$PR7" s@example.test w@far.test)
+wait_for "\"\$BIN\" mail r7 show $id 2>/dev/null | grep -c 'offers no STARTTLS'" 1
+check "nor one whose name only begins as a loopback address does, nor its password" \
+      "$(state r7 "$id" w@far.test) $(ls "$T/relay5" | grep -c '\.eml$')" "waiting 0"
 
 # ─── a script that fails ────────────────────────────────────────────────────
 r=$(python3 - "$PL" <<'PY'

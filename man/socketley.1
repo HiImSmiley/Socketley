@@ -18279,6 +18279,12 @@ The runtime reads the file again when it changes.
 .BI "\-\-relay " smtp\fR[\fBs\fR]\fB://\fR[\fIuser\fB:\fIpassword\fB@\fR]\fIhost\fR[\fB:\fIport\fR]
 A smarthost that all mail for other domains goes through.
 smtps:// speaks TLS from the first byte (465); smtp:// uses STARTTLS (587).
+A smarthost of smtp:// whose EHLO offers no STARTTLS, or that refuses it, is
+sent nothing, its password and its mail neither: the mail waits and is tried
+again, since anyone between can strike STARTTLS out of the answer.
+Only a smarthost on this machine, named by a loopback address or
+.BR localhost ,
+is spoken to in the clear.
 .TP
 .BI "\-\-submission " port
 A port where users send mail, with STARTTLS and a password.

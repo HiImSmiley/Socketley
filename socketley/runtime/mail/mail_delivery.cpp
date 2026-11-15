@@ -182,6 +182,16 @@ bool this_machine(const sockaddr_storage& a)
     return IN6_IS_ADDR_UNSPECIFIED(&v6) || std::memcmp(v6.s6_addr, mapped_any, 16) == 0;
 }
 
+// Whether the relay is named as this machine itself, where no one stands between: a loopback address written out,
+// or localhost, which the hosts file names. A name such as 127.mail.example.net is anyone's, whatever it begins with.
+bool relay_here(const std::string& host)
+{
+    if (host == "localhost")
+        return true;
+    endpoint e;
+    return literal_endpoint(host, 0, e) && socketley::is_loopback(e.addr);
+}
+
 }   // namespace
 
 struct delivery::out_conn
@@ -2800,7 +2810,7 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                     }
                 }
             }
-            const bool loopback = c.host == "localhost" || c.host.starts_with("127.") || c.host == "::1";
+            const bool loopback = relay_here(c.host);
             if (!c.ssl && c.starttls && m_tls)
             {
                 c.state = st::starttls;
@@ -2817,14 +2827,17 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                           move_on::host);
                 return;
             }
+            // smtp:// is STARTTLS to the relay: one whose EHLO says none, which anyone between can strike out of it,
+            // is not sent the mail, nor its password, in the clear (CVE-2026-107121's downgrade); one on this machine is.
+            if (m_relay && !c.ssl && !loopback)
+            {
+                ++m_tls_refused;
+                conn_fail(c, "451 4.7.5 the relay " + c.host + " offers no STARTTLS, which smtp:// speaks to it, so the "
+                             "mail is not sent in the clear", move_on::none);
+                return;
+            }
             if (m_relay && !m_relay_user.empty())
             {
-                if (!c.ssl && !loopback)
-                {
-                    conn_fail(c, "451 4.7.0 the relay " + c.host + " offers no TLS, and its password is not sent "
-                                 "in the clear", move_on::none);
-                    return;
-                }
                 if (!c.auth_plain && !c.auth_login)
                 {
                     conn_fail(c, "451 4.7.0 the relay " + c.host + " offers neither AUTH PLAIN nor LOGIN", move_on::none);
@@ -2852,6 +2865,12 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
         case st::starttls:
             if (code != 220)
             {
+                if (m_relay && !relay_here(c.host))
+                {
+                    ++m_tls_refused;
+                    conn_fail(c, "451 4.7.5 the relay " + c.host + " refused STARTTLS: " + said, move_on::none);
+                    return;
+                }
                 if (c.dane || c.sts == tls_policy::sts_mode::enforce)
                 {
                     ++m_tls_refused;
