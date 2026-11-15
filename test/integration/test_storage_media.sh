@@ -398,7 +398,7 @@ check "and its stream is not cut into that many segments" "$(code -m 10 -u "$A" 
 
 # A copied HEVC stream is tagged hvc1, as Apple's players take it.
 get "$T/hvc.mp4" -u "$A" "$U/~media/hls-copy/films/hdr.mp4/index.m3u8" >/dev/null
-for _ in $(seq 1 100); do curl -s -u "$A" "$U/~media/hls-copy/films/hdr.mp4/index.m3u8" | grep -q ENDLIST && break; sleep 0.1; done
+for _ in $(seq 1 100); do body_now=$(curl -s -u "$A" "$U/~media/hls-copy/films/hdr.mp4/index.m3u8") && grep -q ENDLIST <<<"$body_now" && break; sleep 0.1; done
 curl -s -u "$A" -o "$T/hvc.mp4" "$U/~media/hls-copy/films/hdr.mp4/init.mp4"
 check "a copied HEVC stream is hvc1" "$(grep -c hvc1 "$T/hvc.mp4") $(grep -c hev1 "$T/hvc.mp4")" "1 0"
 

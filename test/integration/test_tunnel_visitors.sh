@@ -268,7 +268,7 @@ PY
 )
 
 case "$("$BIN" stats t)" in *visitors_refused:[1-9]*) ok ;; *) bad "the refusals are counted" "$("$BIN" stats t 2>&1 | tr '\n' ' ')" ;; esac
-for _ in $(seq 1 50); do curl -s "http://127.0.0.1:$PM/metrics" | grep -q '^socketley_tunnel_visitors_refused_total{name="t"} [1-9]' && break; sleep 0.2; done
+for _ in $(seq 1 50); do body_now=$(curl -s "http://127.0.0.1:$PM/metrics") && grep -q '^socketley_tunnel_visitors_refused_total{name="t"} [1-9]' <<<"$body_now" && break; sleep 0.2; done
 M=$(curl -s "http://127.0.0.1:$PM/metrics")
 grep -q '^socketley_tunnel_visitors_refused_total{name="t"} [1-9]' <<<"$M" && grep -q '^socketley_tunnel_links{name="t"} 1$' <<<"$M" &&
     grep -q '^socketley_tunnel_bytes_out_total{name="home"} [1-9]' <<<"$M" && ok \

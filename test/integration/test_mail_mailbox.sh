@@ -215,7 +215,7 @@ n0=$(keys alice/INBOX | wc -l)
 printf 'Return-Path: <forged@evil.test>\r\nAuthentication-Results: (a comment) mail.example.test; dkim=pass header.d=forged.test\r\nAuthentication-Results: "mail.example.test"; spf=pass smtp.mailfrom=forged.test\r\nFrom: carol@else.test\r\nSubject: forged results\r\n\r\nforged\r\n' > "$T/m7"
 check "a message with results forged under this host's name is taken" "$(smtp "$P" carol@else.test alice@example.test "$T/m7")" "sent"
 wait_keys alice/INBOX $((n0 + 1))
-k=$(for x in $(keys alice/INBOX); do obj "$x" | grep -q 'forged results' && echo "$x"; done | head -1)
+k=$(for x in $(keys alice/INBOX); do body_now=$(obj "$x") && grep -q 'forged results' <<<"$body_now" && echo "$x"; done | head -1)
 body=$(obj "$k" | tr -d '\r')
 check "and keeps none of them, behind a comment or in quotes" "$(printf '%s\n' "$body" | grep -c 'forged.test')" "0"
 check "nor the sender's Return-Path beside its own" "$(printf '%s\n' "$body" | grep -c '^Return-Path:')" "1"
@@ -226,7 +226,7 @@ printf 'From: carol@else.test\r\nTo: team@example.test\r\nSubject: to the team\r
 check "mail for an alias of a user here is taken" "$(smtp "$P" carol@else.test team@example.test "$T/m6")" "sent"
 wait_keys alice/INBOX $((n0 + 1)) && ok "and filed in that user's mailbox, not sent out" \
     || bad "and filed in that user's mailbox, not sent out" "$(keys alice/INBOX) $(ls "$T/sink")"
-k=$(for x in $(keys alice/INBOX); do obj "$x" | grep -q 'for the team' && echo "$x"; done | head -1)
+k=$(for x in $(keys alice/INBOX); do body_now=$(obj "$x") && grep -q 'for the team' <<<"$body_now" && echo "$x"; done | head -1)
 check "under the address it came for" "$(obj "$k" | tr -d '\r' | sed -n 's/^Delivered-To: //p' | head -1)" "alice@example.test"
 
 # ─── the idp runtime away ───────────────────────────────────────────────────

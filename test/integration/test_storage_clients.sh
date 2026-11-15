@@ -174,7 +174,7 @@ else
 fi
 
 # ─── MinIO mc ───────────────────────────────────────────────────────────────
-if command -v mc >/dev/null 2>&1 && mc --version 2>/dev/null | grep -qi minio; then
+if command -v mc >/dev/null 2>&1 && version_text=$(mc --version 2>/dev/null) && grep -qi minio <<<"$version_text"; then
     export MC_CONFIG_DIR="$WORK/mc"
     step "mc: alias set" mc alias set sl "$EP" "$AK" "$SK" --api S3v4 --path on
     step "mc: mb" mc mb sl/mcb

@@ -66,7 +66,7 @@ worker_on_port() {
     for p in $(pgrep -x socketley 2>/dev/null); do
         grep -qz "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" "/proc/$p/environ" 2>/dev/null || continue
         [ "$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)" = "$SOCKETLEY_DPID" ] || continue
-        if ls -l "/proc/$p/fd" 2>/dev/null | grep -q "socket:" &&
+        if fds_now=$(ls -l "/proc/$p/fd" 2>/dev/null) && grep -q "socket:" <<<"$fds_now" &&
            ss -ltnpH "sport = :$port" 2>/dev/null | grep -q "pid=$p,"; then
             echo "$p"; return 0
         fi

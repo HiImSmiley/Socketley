@@ -115,7 +115,7 @@ for _ in $(seq 1 50); do [ "$(ask_once back)" = "echo back" ] && break; sleep 0.
 [ "$(ask_once back)" = "echo back" ] && ok || bad "and once it is back the service answers again" "$(ask_once back)"
 
 # The metrics say what was carried and what was dropped.
-for _ in $(seq 1 50); do curl -s "http://127.0.0.1:$PM/metrics" | grep -q '^socketley_tunnel_datagrams_dropped_total{name="t"} [1-9]' && break; sleep 0.2; done
+for _ in $(seq 1 50); do body_now=$(curl -s "http://127.0.0.1:$PM/metrics") && grep -q '^socketley_tunnel_datagrams_dropped_total{name="t"} [1-9]' <<<"$body_now" && break; sleep 0.2; done
 M=$(curl -s "http://127.0.0.1:$PM/metrics")
 grep -q '^socketley_tunnel_datagrams_total{name="t"} [1-9]' <<<"$M" && grep -q '^socketley_tunnel_datagrams_dropped_total{name="t"} [1-9]' <<<"$M" \
     && ok || bad "the metrics count datagrams carried and dropped" "$(echo "$M" | grep -E 'tunnel_(datagrams|flows)' | head -4)"

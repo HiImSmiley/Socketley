@@ -183,7 +183,7 @@ ready_tcp 127.0.0.1 "$P" >/dev/null
 check "a record a crash cut is not a message" "$?" "1"
 check "and the messages before it are kept" "$(kept)" "2"
 # A move the spool made since may have put a whole record after the cut one, which makes it one damaged in the middle.
-tail -n +"$from" "$SOCKETLEY_DLOG" | grep -qE "cut short by a crash while it was written|was damaged on disk, and is dropped" \
+log_since=$(tail -n +"$from" "$SOCKETLEY_DLOG") && grep -qE "cut short by a crash while it was written|was damaged on disk, and is dropped" <<<"$log_since" \
     && ok "and the log says one was dropped" || bad "and the log says one was dropped" "$(grep -i 'mail' "$SOCKETLEY_DLOG" | tail -3)"
 
 # ─── a record damaged in the middle of a segment ────────────────────────────
@@ -211,7 +211,7 @@ for i in 1 2; do
     "$BIN" mail s show "${mids[$i]}" >/dev/null 2>&1
     check "and the one after it, $((i+1)), is kept" "$?" "0"
 done
-tail -n +"$from" "$SOCKETLEY_DLOG" | grep -q "was damaged on disk, and is dropped; the messages after it are kept" \
+log_since=$(tail -n +"$from" "$SOCKETLEY_DLOG") && grep -q "was damaged on disk, and is dropped; the messages after it are kept" <<<"$log_since" \
     && ok "and the log says one was damaged" || bad "and the log says one was damaged" "$(grep -i 'mail' "$SOCKETLEY_DLOG" | tail -3)"
 for i in 1 2; do "$BIN" mail s drop "${mids[$i]}" >/dev/null 2>&1; done
 
