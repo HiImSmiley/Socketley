@@ -1065,22 +1065,23 @@ void server_instance::rebuild_http_cache()
                 const auto mism = std::mismatch(m_http_base.begin(), m_http_base.end(),
                                                 real.begin(), real.end());
                 beneath = !cec && mism.first == m_http_base.end();
+                // Opened, without openat2, as above: by a descriptor read below, and never held by a FIFO.
+                if (beneath)
+                    cfd = ::open(real.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
             }
-            if (!beneath)
+            if (!beneath || cfd < 0)
                 continue;
         }
 
         // Read through the descriptor that was checked, because opening the path again reads whatever it names by then.
         std::string content;
         struct stat cst{};
-        if ((cfd >= 0 ? ::fstat(cfd, &cst) : ::stat(entry.path().c_str(), &cst)) != 0 || !S_ISREG(cst.st_mode))
+        if (::fstat(cfd, &cst) != 0 || !S_ISREG(cst.st_mode))
         {
-            if (cfd >= 0)
-                ::close(cfd);
+            ::close(cfd);
             continue;
         }
         const std::string etag = socketley::http::etag_of(socketley::file_stamp::of(cst));
-        if (cfd >= 0)
         {
             char rbuf[65536];
             ssize_t n;
@@ -1090,14 +1091,6 @@ void server_instance::rebuild_http_cache()
             ::close(cfd);
             if (n < 0)
                 continue;
-        }
-        else
-        {
-            std::ifstream f(entry.path(), std::ios::binary);
-            if (!f.is_open())
-                continue;
-            content.assign((std::istreambuf_iterator<char>(f)),
-                            std::istreambuf_iterator<char>());
         }
 
         // Detect content type

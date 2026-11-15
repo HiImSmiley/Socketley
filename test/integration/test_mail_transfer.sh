@@ -188,6 +188,30 @@ while read -r verdict name; do
     case "$verdict" in ok) ok "$name" ;; bad) bad "${name%%:*}" "${name#*:}" ;; esac
 done < <(grep -E '^(ok|bad) ' "$T/check.out" || echo "bad the client ran: $(tail -5 "$T/check.out")")
 
+# A file of the folder named for import swapped for a FIFO between the walk, which saw a regular file, and the read:
+# opened without O_NONBLOCK the read held its lane of the daemon's pool, and the import with it, until something wrote
+# to the FIFO (round 8c).  The folder an operator imports from may be one another account can change.
+mkdir -p "$T/swapdir"
+cp "$T/cr.mbox" "$T/swapdir/a.mbox"
+mkfifo "$T/swapdir/b"
+python3 - "$T/swapdir/a.mbox" "$T/swapdir/b" <<'PY' &
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+a, b = sys.argv[1].encode(), sys.argv[2].encode()
+while libc.renameat2(-100, a, -100, b, 2) == 0:
+    pass
+PY
+SWAP=$!
+hung=""
+for _ in $(seq 1 20); do
+    out=$(timeout 10 "$BIN" mail m import carol "$T/swapdir" 2>&1); rc=$?
+    [ "$rc" -eq 124 ] && { hung="the import hung: $out"; break; }
+done
+kill "$SWAP" 2>/dev/null; wait "$SWAP" 2>/dev/null
+for f in "$T/swapdir/a.mbox" "$T/swapdir/b"; do [ -p "$f" ] && { ( exec 3>"$f" ) & sleep 0.3; kill $! 2>/dev/null; }; done
+[ -z "$hung" ] && ok "a file swapped for a FIFO between the walk and the read holds no import" \
+    || bad "a FIFO in place of an mbox" "$hung"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

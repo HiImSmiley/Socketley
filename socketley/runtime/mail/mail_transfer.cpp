@@ -484,10 +484,19 @@ struct importer : std::enable_shared_from_this<importer>
         const uint64_t from = offset;
         pool.submit(lane,
                     [got, why, end, name, from] {
-                        const int fd = ::open(name.c_str(), O_RDONLY | O_CLOEXEC);
+                        // O_NONBLOCK: the walk saw a regular file, but a FIFO put in its place since (the folder
+                        // may be anyone's) would hold this open, and the lane behind it, until something wrote to it.
+                        const int fd = ::open(name.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
                         if (fd < 0)
                         {
                             *why = "the daemon cannot read " + name + ": " + std::strerror(errno);
+                            return;
+                        }
+                        struct stat st{};
+                        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+                        {
+                            ::close(fd);
+                            *why = name + " is no longer a regular file";
                             return;
                         }
                         got->resize(piece);
