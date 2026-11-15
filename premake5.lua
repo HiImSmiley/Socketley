@@ -377,6 +377,10 @@ project "socketley_bash"
         "socketley/shared/ipc/daemon_client.cpp",
         "socketley/shared/persist/paths.cpp"
     }
+    -- Two symbols out and the statically linked C++ runtime kept inside, so `enable -f` binds what bash asks for and
+    -- looks nothing else up by name: exported, the runtime cost each shell ~1,000 lookups at load.
+    buildoptions { "-ffunction-sections", "-fdata-sections" }
+    linkoptions { "-Wl,--version-script=../socketley/bash/socketley_bash.map", "-Wl,--gc-sections" }
     filter "system:linux"
         defines { "SOCKETLEY_LINUX" }
     filter "configurations:Release"

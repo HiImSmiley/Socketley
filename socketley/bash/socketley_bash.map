@@ -1,0 +1,4 @@
+{
+    global: socketley_builtin; socketley_struct;
+    local: *;
+};

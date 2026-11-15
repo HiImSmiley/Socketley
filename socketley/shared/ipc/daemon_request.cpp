@@ -7,8 +7,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
 
 namespace socketley {
 
@@ -102,13 +102,14 @@ int daemon_exchange(int fd, std::string_view command, std::string& data, bool& s
         // said here because this is the only place that knows a frame went out
         // to a daemon that predates framing.
         if (framed)
-            std::cerr << "the daemon did not answer a length-framed command.\n"
-                         "  Commands carrying a newline — a message, a value, an "
-                         "imported document — are\n"
-                         "  sent this way.  A daemon started before this build "
-                         "does not read them;\n"
-                         "  restart it (`socketley version` reports a daemon "
-                         "running an earlier build).\n";
+            std::fputs("the daemon did not answer a length-framed command.\n"
+                       "  Commands carrying a newline — a message, a value, an "
+                       "imported document — are\n"
+                       "  sent this way.  A daemon started before this build "
+                       "does not read them;\n"
+                       "  restart it (`socketley version` reports a daemon "
+                       "running an earlier build).\n",
+                       stderr);
         return ipc_unreachable;
     }
 
@@ -174,31 +175,33 @@ int daemon_request_failure(const std::string& socket_path, int rc)
 {
     if (rc == ipc_no_answer)
     {
-        std::cerr << "the daemon at " << socket_path
-                  << " took the command and has not answered in 5s\n"
+        std::fprintf(stderr,
+                     "the daemon at %s took the command and has not answered in 5s\n"
                      "  It is busy, not gone.  A start, a reload or a cache verb "
                      "that waits on a\n"
                      "  worker holds the daemon while it waits, and this command's "
                      "answer is lost\n"
                      "  when it comes.  `socketley ls` says what happened, once "
-                     "the daemon is free.\n";
+                     "the daemon is free.\n",
+                     socket_path.c_str());
         return 2;
     }
 
     if (rc == ipc_cut_short)
     {
-        std::cerr << "the daemon at " << socket_path
-                  << " closed the connection before its answer was whole\n";
+        std::fprintf(stderr, "the daemon at %s closed the connection before its answer was whole\n",
+                     socket_path.c_str());
         return 2;
     }
     if (rc == ipc_stranger)
     {
-        std::cerr << "the daemon socket at " << socket_path
-                  << " is held by a process of another user\n"
-                     "  Nothing was sent to it. Point SOCKETLEY_SOCKET at a path you own.\n";
+        std::fprintf(stderr,
+                     "the daemon socket at %s is held by a process of another user\n"
+                     "  Nothing was sent to it. Point SOCKETLEY_SOCKET at a path you own.\n",
+                     socket_path.c_str());
         return 2;
     }
-    std::cerr << "failed to connect to daemon\n";
+    std::fputs("failed to connect to daemon\n", stderr);
     return 2;
 }
 
