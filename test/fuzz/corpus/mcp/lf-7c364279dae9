@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":12,"method":"tools/castringll","params":{"name":"typed","arguments":{"path":"../etc/passwd"},"_meta":{"s":{}}}}
