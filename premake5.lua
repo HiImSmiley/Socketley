@@ -74,7 +74,8 @@ workspace "Socketley"
         local script = io.readfile("scripts/build-thirdparty.sh") or ""
         local want = {}
         for _, pin in ipairs({ "OPENSSL_TAG", "OPENSSL_OPTIONS_TAG", "NGHTTP3_TAG", "NGTCP2_TAG" }) do
-            table.insert(want, script:match("\n" .. pin .. "=(%S+)") or "?")
+            -- A pin of several words is quoted, as OPENSSL_OPTIONS_TAG is.
+            table.insert(want, script:match("\n" .. pin .. '="([^"\n]*)"') or script:match("\n" .. pin .. "=(%S+)") or "?")
         end
         want = table.concat(want, " ")
         local built = (io.readfile("thirdparty/ngtcp2/.built") or ""):gsub("%s+$", "")

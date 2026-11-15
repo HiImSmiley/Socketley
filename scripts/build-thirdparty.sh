@@ -21,7 +21,8 @@ LIBURING_TAG=liburing-2.15   # pinned deliberately: see thirdparty/liburing/READ
 # Pinned as liburing is: a release that changes under the build is a different build. OpenSSL 3.5 is an LTS line.
 OPENSSL_TAG=openssl-3.5.9
 # Kernel TLS, for a runtime that hands a connection's send key to the kernel; a _TAG, so a change rebuilds OpenSSL.
-OPENSSL_OPTIONS_TAG=enable-ktls
+# CMS and the SIV modes are left out: socketley calls neither, and an advisory about code not built needs no release.
+OPENSSL_OPTIONS_TAG="enable-ktls no-cms no-siv"
 NGHTTP3_TAG=v1.19.0
 NGTCP2_TAG=v1.26.0
 PREMAKE_REF=v5.0.0-beta8   # scripts/premake5's version; not a _TAG, so a change here rebuilds no library in scripts/update.sh
