@@ -118,4 +118,4 @@ PY
 tally < <(run)
 
 echo "  Results: $PASS/$((PASS + FAIL)) passed ($FAIL failed)"
-[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
+[ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

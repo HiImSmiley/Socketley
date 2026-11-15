@@ -315,4 +315,4 @@ expect "with two shards" "$(stats_of auth | grep -c '^shard:')" 2
 tally < <(run restarted)
 
 echo "  Results: $PASS/$((PASS + FAIL)) passed ($FAIL failed)"
-[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
+[ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }
