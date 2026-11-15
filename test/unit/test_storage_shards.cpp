@@ -13,6 +13,7 @@
 #include "shared/loop/file_io.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -2869,4 +2870,28 @@ TEST_CASE("an object's metadata in memory keeps every value through copies, move
     erase_if(f.extra, [](const auto&) { return true; });
     CHECK(f.extra.empty());
     CHECK(f.extra == object_meta{}.extra);
+}
+
+TEST_CASE("a lifecycle rule names at most as many tags as an object can have, and is read in time linear in its body")
+{
+    // 95,000 tags in one rule fit the 4 MiB body; each was checked against every one before it, on the storage's
+    // loop: 21 s for one PUT.
+    std::string tags;
+    for (int i = 0; i < 95000; ++i)
+        tags += "<Tag><Key>k" + std::to_string(i) + "</Key><Value></Value></Tag>";
+    const std::string doc = "<LifecycleConfiguration><Rule><ID>r</ID><Filter><And><Prefix>x</Prefix>" + tags +
+                            "</And></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"
+                            "</LifecycleConfiguration>";
+    lifecycle_config c;
+    s3_error err;
+    const auto start = std::chrono::steady_clock::now();
+    CHECK_FALSE(parse_lifecycle(doc, c, err));
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+    std::string ten;
+    for (int i = 0; i < 10; ++i)
+        ten += "<Tag><Key>k" + std::to_string(i) + "</Key><Value>v</Value></Tag>";
+    CHECK(parse_lifecycle("<LifecycleConfiguration><Rule><ID>r</ID><Filter><And>" + ten +
+                              "</And></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"
+                              "</LifecycleConfiguration>",
+                          c, err));
 }

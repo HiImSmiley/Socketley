@@ -113,6 +113,13 @@ bool filter_condition(const xml_node& k, lifecycle_rule& r, s3_error& err)
             err = fail("MalformedXML");
             return false;
         }
+        // No more than an object can carry: a rule naming more takes no object, and each was checked against every one
+        // before it, so 100,000 of them in a 4 MiB body held the loop for 21 s.
+        if (r.tags.size() >= max_object_tags)
+        {
+            err = fail("InvalidArgument", "A rule's filter may name at most 10 tags, as many as an object can have");
+            return false;
+        }
         for (const auto& t : r.tags)
             if (t.first == key->text)
             {
