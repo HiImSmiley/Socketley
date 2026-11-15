@@ -3305,6 +3305,11 @@ def h2session_seeds():
         "settings_window_shrinks": seed(1 | answer_chunked, 0, fr(HEADERS, 5, 1, get) +
                                         fr(SETTINGS, 0, 0, struct.pack(">HI", 4, 0)) + fr(WU, 0, 0, struct.pack(">I", 70000)) +
                                         fr(SETTINGS, 0, 0, struct.pack(">HI", 4, 65535))),
+        # A stream the client widened, then an INITIAL_WINDOW_SIZE that takes it past 2^31-1: refused before any
+        # window moves (libFuzzer found it left that stream past the bound).
+        "settings_window_past_max": seed(1 | answer_chunked, 8, fr(HEADERS, 5, 0x15, get) +
+                                         fr(WU, 0, 0x15, struct.pack(">I", 0x01780000)) +
+                                         fr(SETTINGS, 0, 0, struct.pack(">HI", 4, 0x7fff0000))),
         "window_updates": seed(1 | answer_chunked, 0, fr(HEADERS, 5, 1, get) + fr(WU, 0, 0, b"\0\0\0\0") +
                                fr(WU, 0, 1, b"\0\0\0\0")),
         "window_overflow": seed(1, 0, fr(WU, 0, 0, struct.pack(">I", 0x7fffffff)) * 2),

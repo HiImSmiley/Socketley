@@ -4,10 +4,12 @@
 #include "doctest.h"
 
 #include <chrono>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
+#include "shared/http/h2_driver.h"
 #include "shared/http/h2_frame.h"
 #include "shared/http/hpack.h"
 
@@ -333,4 +335,54 @@ TEST_CASE("Huffman strings: the table decoder says what the bit-by-bit definitio
         if (ra && rb)
             CHECK(a == b);
     }
+}
+
+namespace
+{
+namespace h2 = socketley::h2;
+
+struct h2_node
+{
+    std::unique_ptr<h2::stream> h2s{new h2::stream};
+};
+}   // namespace
+
+// Found by fuzz_h2_session under libFuzzer: a WINDOW_UPDATE on a stream, then SETTINGS INITIAL_WINDOW_SIZE 0x7fff0000.
+TEST_CASE("a SETTINGS that would take one stream's window past 2^31-1 is refused whole, and moves nothing")
+{
+    using handle = std::shared_ptr<h2_node>;
+    h2::session<handle> s;
+    // One stream with a body waiting at the default window, one the client already widened by 0x01780000.
+    auto quiet = std::make_shared<h2_node>();
+    quiet->h2s->sid = 1;
+    quiet->h2s->tx = "body";
+    auto wide = std::make_shared<h2_node>();
+    wide->h2s->sid = 3;
+    wide->h2s->send_win = h2::default_window + 0x01780000;
+    s.streams.emplace(1, quiet);
+    s.streams.emplace(3, wide);
+
+    std::string frame;
+    h2::put_settings(frame, {{h2::MAX_FRAME_SIZE, 32768}, {h2::INITIAL_WINDOW_SIZE, 0x7fff0000u}});
+    const h2::outcome got = h2::settings_in(s, std::string_view(frame).substr(h2::head_len));
+
+    CHECK(got.kind == h2::outcome::what::conn_error);
+    CHECK(got.code == h2::FLOW_CONTROL_ERROR);
+    CHECK(wide->h2s->send_win == h2::default_window + 0x01780000);
+    CHECK(quiet->h2s->send_win == h2::default_window);
+    CHECK(s.rr.empty());
+    CHECK(s.peer_init_win == h2::default_window);
+    CHECK(s.peer_max_frame == h2::default_frame);
+    CHECK(s.ctl.empty());
+    CHECK_FALSE(s.got_settings);
+
+    // The same frame with room on every stream is taken whole: both windows move, the waiting body is queued.
+    wide->h2s->send_win = h2::default_window;
+    const h2::outcome ok = h2::settings_in(s, std::string_view(frame).substr(h2::head_len));
+    CHECK(ok.kind == h2::outcome::what::taken);
+    CHECK(wide->h2s->send_win == 0x7fff0000);
+    CHECK(quiet->h2s->send_win == 0x7fff0000);
+    CHECK(s.rr.size() == 1);
+    CHECK(s.peer_max_frame == 32768);
+    CHECK(s.got_settings);
 }

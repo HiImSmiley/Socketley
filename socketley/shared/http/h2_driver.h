@@ -49,8 +49,9 @@ template <class S>
 outcome settings_in(session<S>& s, std::string_view pl)
 {
     // The frame's last INITIAL_WINDOW_SIZE moves the streams once: a frame of 2,730 of them walked every stream 2,730
-    // times, whether the value changed or not.
+    // times, whether the value changed or not.  Its MAX_FRAME_SIZE is taken only with the rest, too.
     int64_t init_win = -1;
+    uint32_t max_frame = s.peer_max_frame;
     for (size_t i = 0; i + 6 <= pl.size(); i += 6)
     {
         const uint16_t id = static_cast<uint16_t>(static_cast<uint8_t>(pl[i]) << 8 | static_cast<uint8_t>(pl[i + 1]));
@@ -67,24 +68,30 @@ outcome settings_in(session<S>& s, std::string_view pl)
         {
             if (v < default_frame || v > 16777215)
                 return outcome::conn(PROTOCOL_ERROR);
-            s.peer_max_frame = std::min<uint32_t>(v, 64 * 1024);
+            max_frame = std::min<uint32_t>(v, 64 * 1024);
         }
     }
-    // Every open stream's window moves by the difference, and may go below zero.
+    // Every open stream's window moves by the difference, and may go below zero -- but past 2^31-1 on any one of
+    // them refuses the frame (RFC 9113 6.9.2) before a single window has moved.  Checked as it was applied, the error
+    // left the stream that overflowed past the bound, and the streams walked before it queued under a window the
+    // refused frame had given them.
     if (init_win >= 0 && init_win != static_cast<int64_t>(s.peer_init_win))
     {
         const int64_t delta = init_win - static_cast<int64_t>(s.peer_init_win);
+        if (delta > 0)
+            for (const auto& [sid, h] : s.streams)
+                if (state_of(h).send_win + delta > max_window)
+                    return outcome::conn(FLOW_CONTROL_ERROR);
         s.peer_init_win = static_cast<uint32_t>(init_win);
         for (auto& [sid, h] : s.streams)
         {
             stream& st = state_of(h);
             st.send_win += delta;
-            if (st.send_win > max_window)
-                return outcome::conn(FLOW_CONTROL_ERROR);
             if (delta > 0 && st.tx_left())
                 enqueue(s, st);
         }
     }
+    s.peer_max_frame = max_frame;
     s.got_settings = true;
     put_settings_ack(s.ctl);
     return outcome::taken();
