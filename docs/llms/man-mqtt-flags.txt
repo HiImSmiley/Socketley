@@ -113,7 +113,7 @@ The accounts that sign in with a password, one *user***:***hash* per line, as **
 
 ### `--idp runtime`
 
-The idp runtime whose access tokens, given as the password, sign clients in. It takes only tokens given to a client that **--idp-audience** names.
+The idp runtime whose access tokens, given as the password, sign clients in. It takes only tokens given to a client that **--idp-audience** names. A connection a token let in is closed within a few seconds once its account is disabled, reset, removed or signed out everywhere, rather than kept for as long as the client stays.
 
 ### `--idp-audience clients`
 

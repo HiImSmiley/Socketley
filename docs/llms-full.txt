@@ -2277,6 +2277,12 @@ A test aid that sets how many milliseconds a shard of a mail runtime, other than
 
 Inherited by worker processes, which have no command line of their own.
 
+#### `SOCKETLEY_MAIL_JMAP_AUTH_MS`
+
+A test aid that sets how many milliseconds a JMAP connection takes the Authorization it checked again without checking it. After this time the next request on the connection has its password or bearer token checked again, so an account disabled or a token expired is refused on a connection it signed in on. Default: one minute.
+
+Inherited by worker processes, which have no command line of their own.
+
 #### `SOCKETLEY_IDP_CLIENT_CA`
 
 A test aid that names a file of CA certificates for checking the client metadata documents an idp fetches. The certificate served with each such document is checked against this file. Default: the system's CA certificates.
@@ -5701,7 +5707,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Cluster mode](man-cluster-mode.txt)
 - [Installation](man-installation.txt)
 - [State persistence](man-state-persistence.txt)
-- [Environment](man-environment.txt) (95 entries)
+- [Environment](man-environment.txt) (96 entries)
 - [Files](man-files.txt)
 - [SDK](man-sdk.txt) (3 entries)
 - [Limitations](man-limitations.txt)
@@ -11265,7 +11271,7 @@ The accounts that sign in with a password, one *user***:***hash* per line, as **
 
 ### `--idp runtime`
 
-The idp runtime whose access tokens, given as the password, sign clients in. It takes only tokens given to a client that **--idp-audience** names.
+The idp runtime whose access tokens, given as the password, sign clients in. It takes only tokens given to a client that **--idp-audience** names. A connection a token let in is closed within a few seconds once its account is disabled, reset, removed or signed out everywhere, rather than kept for as long as the client stays.
 
 ### `--idp-audience clients`
 
@@ -11674,7 +11680,7 @@ A file of addresses the runtime accepts besides the users' own. Each line is *ad
 
 ### `--relay smtp[s]://[user:password@]host[:port]`
 
-A smarthost that all mail for other domains goes through. smtps:// speaks TLS from the first byte (465); smtp:// uses STARTTLS (587).
+A smarthost that all mail for other domains goes through. smtps:// speaks TLS from the first byte (465); smtp:// uses STARTTLS (587). A smarthost of smtp:// whose EHLO offers no STARTTLS, or that refuses it, is sent nothing, its password and its mail neither: the mail waits and is tried again, since anyone between can strike STARTTLS out of the answer. Only a smarthost on this machine, named by a loopback address or **localhost**, is spoken to in the clear.
 
 ### `--submission port`
 
@@ -14875,6 +14881,12 @@ Inherited by worker processes, which have no command line of their own.
 ### `SOCKETLEY_MAIL_LET_GO_MS`
 
 A test aid that sets how many milliseconds a shard of a mail runtime, other than the first, keeps a user's index in memory after nothing on that shard asked for it. The index is read again from its files when it is next asked for. Default: ten minutes.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_JMAP_AUTH_MS`
+
+A test aid that sets how many milliseconds a JMAP connection takes the Authorization it checked again without checking it. After this time the next request on the connection has its password or bearer token checked again, so an account disabled or a token expired is refused on a connection it signed in on. Default: one minute.
 
 Inherited by worker processes, which have no command line of their own.
 

@@ -333,7 +333,7 @@ A file of addresses the runtime accepts besides the users' own. Each line is *ad
 
 ### `--relay smtp[s]://[user:password@]host[:port]`
 
-A smarthost that all mail for other domains goes through. smtps:// speaks TLS from the first byte (465); smtp:// uses STARTTLS (587).
+A smarthost that all mail for other domains goes through. smtps:// speaks TLS from the first byte (465); smtp:// uses STARTTLS (587). A smarthost of smtp:// whose EHLO offers no STARTTLS, or that refuses it, is sent nothing, its password and its mail neither: the mail waits and is tried again, since anyone between can strike STARTTLS out of the answer. Only a smarthost on this machine, named by a loopback address or **localhost**, is spoken to in the clear.
 
 ### `--submission port`
 

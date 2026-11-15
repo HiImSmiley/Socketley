@@ -226,6 +226,12 @@ A test aid that sets how many milliseconds a shard of a mail runtime, other than
 
 Inherited by worker processes, which have no command line of their own.
 
+### `SOCKETLEY_MAIL_JMAP_AUTH_MS`
+
+A test aid that sets how many milliseconds a JMAP connection takes the Authorization it checked again without checking it. After this time the next request on the connection has its password or bearer token checked again, so an account disabled or a token expired is refused on a connection it signed in on. Default: one minute.
+
+Inherited by worker processes, which have no command line of their own.
+
 ### `SOCKETLEY_IDP_CLIENT_CA`
 
 A test aid that names a file of CA certificates for checking the client metadata documents an idp fetches. The certificate served with each such document is checked against this file. Default: the system's CA certificates.
