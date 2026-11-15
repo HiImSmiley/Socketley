@@ -286,7 +286,32 @@ async def main():
     check("and gathering it costs the entrance no more than 64 MiB of peak memory (%d -> %d MiB)" % (before, after),
           after - before < 64, True)
 
+    # A body that stops: past the entrance's --backend-timeout (2 s here) the request is the client's to have lost,
+    # and the stream is reset as a cancelled request, HTTP/2's CANCEL -- it was reset with H3_INTERNAL_ERROR, which
+    # told the client the server had failed.
+    async with connection("echo.example.com") as c:
+        st = c.begin("echo.example.com", "/stall", "POST", None, [(b"content-length", b"20")], b"a" * 10)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(st["done"].wait(), 10)
+        check("a body that stops past --backend-timeout is reset as a cancelled request (0x10c)",
+              hex(st["reset"]) if st["reset"] is not None else st["headers"], hex(0x10c))
+
     if PORT2:
+        # A body that pauses longer than the QUIC idle timeout the client asked for, 2 s, and shorter than the
+        # entrance's own --backend-timeout of 30: the entrance keeps the connection alive while the request is open,
+        # where QUIC used to end it without a word at its idle timeout while HTTP/1.1 waited.
+        async with connection("echo.example.com", PORT2, idle=2.0) as c:
+            st = c.begin("echo.example.com", "/pause", "POST", None, [(b"content-length", b"20")], b"a" * 10)
+            await asyncio.sleep(4)
+            if c._quic._close_event is None:
+                c.h3.send_data(st["sid"], b"b" * 10, end_stream=True)
+                c.transmit()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(st["done"].wait(), 10)
+            check("a body paused past the client's 2 s QUIC idle timeout, within the entrance's bounds, is answered",
+                  (st["headers"] or {}).get(b":status", b"").decode() + " " + b"".join(st["body"]).decode(),
+                  "200 len=20")
+
         # An upload faster than its backend reads: held while the backend's queue is over the watermark, as a TCP
         # client's reads are, rather than forwarded until the queue reached --write-buffer and the request was cut off.
         size = 32 << 20

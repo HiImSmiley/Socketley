@@ -311,6 +311,16 @@ ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref)
     return static_cast<conn*>(ref->user_data)->q;
 }
 
+// Half the idle timeout the two sides agreed on, the shorter of this side's and the client's (RFC 9000 10.1), which
+// is how often a connection with a request open says it is still there.
+uint64_t keep_alive_of(const conn& hc)
+{
+    uint64_t idle = idle_timeout_ns;
+    if (const ngtcp2_transport_params* p = ngtcp2_conn_get_remote_transport_params(hc.q); p && p->max_idle_timeout)
+        idle = std::min<uint64_t>(idle, p->max_idle_timeout);
+    return std::max<uint64_t>(idle / 2, 100 * NGTCP2_MILLISECONDS);
+}
+
 }   // namespace
 
 // ─── The endpoint ───────────────────────────────────────────────────────────
@@ -1195,6 +1205,14 @@ void endpoint::write(const std::shared_ptr<conn>& hc)
             return nwrite;
         }
     };
+    // A connection with a request open is the host's to time, not QUIC's: a body paused for longer than the idle
+    // timeout -- this side's 30 s, or less if the client asked for less -- is one the host's own bounds may still
+    // allow (the entrance's --idle-timeout and --backend-timeout, storage's 60 s body stall), and QUIC ended it
+    // without a word at that timeout while HTTP/1.1 waited.  So while a stream is open this side sends a PING at
+    // half the idle timeout the two agreed on, which the client acknowledges; a client that has gone answers none,
+    // and the connection still ends one idle timeout after the last packet it sent.  With none open, nothing is
+    // sent and an idle connection goes as before.
+    ngtcp2_conn_set_keep_alive_timeout(hc->q, hc->streams.empty() ? UINT64_MAX : keep_alive_of(*hc));
     // Bursts while ngtcp2 has packets to give and its pacing lets them go; it says when the next may.
     for (int round = 0; round < 64 && !hc->dead; ++round)
     {
@@ -1651,13 +1669,13 @@ bool answer_end(stream& st)
     if (st.gone || !st.owner || !st.owner->h)
         return false;
     conn& hc = *st.owner;
-    st.end_pending = true;
+    // An answer with no head cannot end; the host lets go of the stream instead, and gone() resets it as a request
+    // cancelled -- HTTP/2's CANCEL.  It was reset here with H3_INTERNAL_ERROR first, whose code won, so a client
+    // whose own body stalled past the entrance's --backend-timeout was told the server had failed; and the end is
+    // not marked pending, or gone() would take the stream for a whole answer and reset nothing at all.
     if (!st.submitted)
-    {
-        // An answer with no head would be a broken stream; this one simply ends.
-        ngtcp2_conn_shutdown_stream(hc.q, 0, st.sid, NGHTTP3_H3_INTERNAL_ERROR);
         return false;
-    }
+    st.end_pending = true;
     // A body still coming that the answer did not need is not read.
     if (!st.remote_closed)
         ngtcp2_conn_shutdown_stream_read(hc.q, 0, st.sid, NGHTTP3_H3_NO_ERROR);

@@ -85,8 +85,9 @@ class Client(QuicConnectionProtocol):
                 self.waiting.pop(e.stream_id, None)
                 st["done"].set()
 
-    async def request(self, method, path, body=None, headers=(), stop_after=None):
-        """The answer as (status, body); with stop_after, only sends that much of the body and abandons the stream."""
+    async def request(self, method, path, body=None, headers=(), stop_after=None, pause=0):
+        """The answer as (status, body); with stop_after, only sends that much of the body and abandons the stream;
+        with pause, waits that long after the first piece of the body before the rest."""
         sid = self._quic.get_next_available_stream_id()
         hs = [(b":method", method.encode()), (b":scheme", b"https"), (b":authority", AUTH.encode()),
               (b":path", path.encode())] + [(k.encode(), v.encode()) for k, v in headers]
@@ -108,8 +109,8 @@ class Client(QuicConnectionProtocol):
                     return None
                 self.h3.send_data(sid, piece, end_stream=last)
                 self.transmit()
-                await asyncio.sleep(0)
-                if last:
+                await asyncio.sleep(pause if sent == len(piece) else 0)
+                if last or self._quic._close_event is not None:
                     break
         self.transmit()
         await asyncio.wait_for(st["done"].wait(), 60)
@@ -119,8 +120,10 @@ class Client(QuicConnectionProtocol):
 
 
 @contextlib.asynccontextmanager
-async def connection():
+async def connection(idle=None):
     cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN, max_stream_data=16 << 20, max_data=64 << 20)
+    if idle is not None:
+        cfg.idle_timeout = idle
     cfg.load_verify_locations(CA)
     cfg.server_name = "localhost"
     loop = asyncio.get_running_loop()
@@ -177,6 +180,16 @@ async def main():
         st, data = await c.request("GET", "/hthree/big")
         check("after downloads cut off, the object is still read whole", (st, hashlib.sha256(data).hexdigest()),
               ("200", digest))
+
+    # An upload that pauses for 4 s, past the 2 s QUIC idle timeout this client asks for and well within the 60 s a
+    # body may stall here: the connection is kept alive while the request is open, where QUIC used to end it at its
+    # idle timeout without a word while HTTP/1.1 waited.
+    got = "closed"
+    with contextlib.suppress(asyncio.TimeoutError):
+        async with connection(idle=2.0) as c:
+            r = await asyncio.wait_for(c.request("PUT", "/hthree/paused", big[:600000], pause=4), 30)
+            got = r[0] if r else "abandoned"
+    check("an upload paused past the client's 2 s QUIC idle timeout is stored", got, "200")
 
 
 asyncio.run(main())
