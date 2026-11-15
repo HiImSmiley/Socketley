@@ -153,6 +153,14 @@ BEPID=$!
 # second ignores.
 cat > "$LUA" <<'LUAEOF'
 filters = {
+    -- A filter that drops a client by closing it and says nothing: the request it held must go nowhere, as a
+    -- returned answer's would not, rather than on to the backend from a connection already given back.
+    function(req)
+        if string.find(req.path, "/hangup", 1, true) then
+            self.close_client(req.client_id)
+        end
+    end,
+
     function(req)
         if req.headers["x-mark-me"] then
             return {
@@ -454,6 +462,19 @@ print("P4 REMOVED %s %s" % (st, body))
 st, _, body = request("/kept", extra="X-Internal-Trust: kept-me\r\n")
 print("P4 KEPT %s %s" % (st, body))
 
+# ── phase 4b: a filter that closes its client and says nothing ─────────────
+#
+# Twenty of them: each must end the connection with no answer, and send the backend nothing.
+hb_acc, hb_bytes = counters()
+answered = 0
+for _ in range(20):
+    st, _, _ = request("/hangup")
+    if st.startswith("HTTP/"):
+        answered += 1
+ha_acc, ha_bytes = counters()
+print("P4B BYTES %d %d" % (hb_bytes, ha_bytes))
+print("P4B ANSWERED %d" % answered)
+
 # ── phase 5: still serving ─────────────────────────────────────────────────
 st, _, body = request("/after-storm")
 print("P5 AFTER %s %s" % (st, body))
@@ -548,6 +569,10 @@ check "a filter may not set the response framing" \
 check "the filter's body is the one sent" \
     '^P1 BODY denied by filter$' \
     "$(grep -m1 '^P1 BODY' "$OUT" 2>/dev/null || echo 'no result')"
+
+unchanged "a filter that closes its client sends the backend nothing of its request" "P4B BYTES"
+check "and the client is closed unanswered" '^P4B ANSWERED 0$' \
+    "$(grep -m1 '^P4B ANSWERED' "$OUT" 2>/dev/null || echo 'no result')"
 
 # The vacuity guard: the counters above CAN move.
 check "an allowed request is served" \

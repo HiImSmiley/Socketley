@@ -4172,6 +4172,10 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
         if (SOCKETLEY_UNLIKELY(lua() && lua()->has_filters()) &&
             run_request_filters(conn))
             return;   // answered by a filter; no backend was ever chosen
+        // A filter that said nothing but called self.close_client() has ended the connection under this call, its
+        // struct back in the pool and its path cleared: the request it held goes nowhere, as the script asked.
+        if (SOCKETLEY_UNLIKELY(conn->closing))
+            return;
 
         // A FastCGI proxy decides here which script answers, or answers itself; nothing reaches the interpreter that
         // is not a script beneath --root.
@@ -4180,6 +4184,9 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
 
         // Select and connect to backend
         auto* target = select_and_resolve_backend(conn);
+        // on_route may have closed the client as a filter may.
+        if (SOCKETLEY_UNLIKELY(conn->closing))
+            return;
         if (SOCKETLEY_UNLIKELY(!target))
         {
             send_error(conn, "503 Service Unavailable", "Service Unavailable\n");
@@ -11264,6 +11271,11 @@ bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         }
     }
 #endif
+
+    // A hook that closed the client, or its backend, by self.close_client() before it answered: neither struct is
+    // this pair's any more, and what it gave back is sent to no one.
+    if (SOCKETLEY_UNLIKELY(conn->closing || bconn->closing))
+        return false;
 
     // To an application server the request goes as FastCGI records, written from what would have been sent as HTTP.
     if (SOCKETLEY_UNLIKELY(!conn->ex.fcgi_script.empty()))
