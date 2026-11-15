@@ -37,7 +37,8 @@ bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; fi; }
 has() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "'$3' not in: $2" ;; esac; }
 
-cleanup() { daemon_stop; }
+SLOW_PID=""
+cleanup() { [ -n "$SLOW_PID" ] && kill "$SLOW_PID" 2>/dev/null; daemon_stop; }
 trap cleanup EXIT
 
 echo "=== Integration: the entrance speaks HTTP/2 and HTTP/3 ==="
@@ -301,7 +302,36 @@ case "$alt" in *h3=*) ok "an answer over TCP names the HTTP/3 port in Alt-Svc ($
                   *) bad "Alt-Svc" "got '$alt'" ;; esac
 
 cp "$T/big.txt" "$T/one/big.txt"
-h3out=$(python3 "$HERE/lib_proxy_http3.py" "$E" "$T/e.pem" "$T/big.txt" 2>&1)
+# A second entrance that waits on a backend for 30 s and holds a quarter of a megabyte for one: what a request may
+# take there is the entrance's to bound, and HTTP/3 must not end it sooner or at the queue's bound.  Behind it, through
+# a proxy that waits as long and holds as little, a backend that reads nothing of a request for three seconds.
+E2=$((P+7))
+cat >"$T/slow.py" <<'PY'
+import socket, sys, threading, time
+def serve(c):
+    time.sleep(3)
+    f = c.makefile("rb"); f.readline(); n = 0
+    while True:
+        h = f.readline()
+        if h in (b"\r\n", b""): break
+        k, _, v = h.partition(b":")
+        if k.strip().lower() == b"content-length": n = int(v)
+    got = len(f.read(n)); out = b"len=%d" % got
+    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(out) + out); c.close()
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096); s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(16)
+while True:
+    c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+python3 "$T/slow.py" $((P+9)) & SLOW_PID=$!
+"$BIN" create proxy slow -p $((P+8)) --backend "127.0.0.1:$((P+9))" --domain slow.example.com --backend-timeout 0 \
+    --write-buffer 256K -s >/dev/null 2>&1
+"$BIN" create proxy ent2 -p "$E2" --tls --cert "$T/e.pem" --key "$T/e.key" --backend-timeout 30 --write-buffer 256K \
+    -s >/dev/null 2>&1
+for _ in $(seq 1 60); do f=$(find "$T" -name 'routes-ent2' | head -1)
+    [ -n "$f" ] && grep -q slow.example.com "$f" && grep -q echo.example.com "$f" && break; sleep 0.2; done
+h3out=$(python3 "$HERE/lib_proxy_http3.py" "$E" "$T/e.pem" "$T/big.txt" "$E2" 2>&1)
 echo "$h3out" | sed -n 's/^  \(PASS\|FAIL\|SKIP\)/  \1/p'
 h3p=$(echo "$h3out" | sed -n 's/^Results: \([0-9]*\) passed.*/\1/p')
 h3f=$(echo "$h3out" | sed -n 's/^Results: [0-9]* passed, \([0-9]*\) failed/\1/p')

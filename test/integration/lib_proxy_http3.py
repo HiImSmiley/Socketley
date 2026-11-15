@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """HTTP/3 against an entrance proxy, spoken with aioquic over QUIC.
-usage: lib_proxy_http3.py PORT CAFILE BIGFILE
+usage: lib_proxy_http3.py PORT CAFILE BIGFILE [PORT2]
+
+PORT2 is an entrance with --backend-timeout 30 and --write-buffer 256K, in front of slow.example.com, whose backend
+reads nothing of a request for three seconds.
 
 What it holds down is what forced the entrance to read the frames at all: each stream is routed by its own
 `:authority`, so two names on ONE connection reach their two different runtimes, and a stream naming a name the
@@ -35,6 +38,7 @@ if int(aioquic.__version__.split(".")[0]) < 1:
 
 PORT = int(sys.argv[1])
 CA, BIG = sys.argv[2], sys.argv[3]
+PORT2 = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 PASS = FAIL = 0
 
 
@@ -72,16 +76,19 @@ class Client(QuicConnectionProtocol):
                 self.waiting.pop(e.stream_id, None)
                 st["done"].set()
 
-    def begin(self, authority, path, method="GET", body=None):
-        """Opens a stream and returns its state; the answer is awaited with finish()."""
+    def begin(self, authority, path, method="GET", body=None, extra=(), part=None):
+        """Opens a stream and returns its state; the answer is awaited with finish().  `part` is a first piece of a
+        body sent without its end, the rest left to the caller."""
         sid = self._quic.get_next_available_stream_id()
         hs = [(b":method", method.encode()), (b":scheme", b"https"),
-              (b":authority", authority.encode()), (b":path", path.encode())]
-        st = {"headers": None, "body": [], "done": asyncio.Event(), "reset": None}
+              (b":authority", authority.encode()), (b":path", path.encode())] + list(extra)
+        st = {"headers": None, "body": [], "done": asyncio.Event(), "reset": None, "sid": sid}
         self.waiting[sid] = st
-        self.h3.send_headers(sid, hs, end_stream=body is None)
+        self.h3.send_headers(sid, hs, end_stream=body is None and part is None)
         if body is not None:
             self.h3.send_data(sid, body, end_stream=True)
+        elif part is not None:
+            self.h3.send_data(sid, part, end_stream=False)
         self.transmit()
         return st
 
@@ -97,8 +104,10 @@ class Client(QuicConnectionProtocol):
 
 
 @contextlib.asynccontextmanager
-async def connection(server_name):
+async def connection(server_name, port=None, idle=None):
     cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN, max_stream_data=16 << 20, max_data=64 << 20)
+    if idle is not None:
+        cfg.idle_timeout = idle
     cfg.load_verify_locations(CA)
     cfg.server_name = server_name
     loop = asyncio.get_running_loop()
@@ -106,7 +115,7 @@ async def connection(server_name):
     sock.bind(("127.0.0.1", 0))
     transport, proto = await loop.create_datagram_endpoint(lambda: Client(QuicConnection(configuration=cfg)), sock=sock)
     try:
-        proto.connect(("127.0.0.1", PORT))
+        proto.connect(("127.0.0.1", port or PORT))
         await asyncio.wait_for(proto.wait_connected(), 3)
         yield proto
     finally:
@@ -276,6 +285,19 @@ async def main():
           "431" if isinstance(got, bytes) and b"431" in got[:16] else got, "431")
     check("and gathering it costs the entrance no more than 64 MiB of peak memory (%d -> %d MiB)" % (before, after),
           after - before < 64, True)
+
+    if PORT2:
+        # An upload faster than its backend reads: held while the backend's queue is over the watermark, as a TCP
+        # client's reads are, rather than forwarded until the queue reached --write-buffer and the request was cut off.
+        size = 32 << 20
+        async with connection("slow.example.com", PORT2) as c:
+            st = c.begin("slow.example.com", "/up", "POST", b"u" * size, [(b"content-length", b"%d" % size)])
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(st["done"].wait(), 60)
+            check("a 32 MiB upload to a backend that reads nothing for 3 s arrives whole",
+                  ("reset 0x%x" % st["reset"]) if st["reset"] is not None else
+                  (st["headers"] or {}).get(b":status", b"").decode() + " " + b"".join(st["body"]).decode(),
+                  "200 len=%d" % size)
 
     print("Results: %d passed, %d failed" % (PASS, FAIL))
     return FAIL

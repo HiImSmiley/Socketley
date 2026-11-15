@@ -177,10 +177,15 @@ void proxy_instance::h3_start_stream(socketley::h3::stream& st, socketley::mux::
 
 // ─── A stream's body in ─────────────────────────────────────────────────────
 
+// A stream's body waits while its backend's queue is over the watermark, as a TCP client's read is not re-armed
+// then: handle_backend_write arms it again once the queue drains, which pulls what was held.  Without this every
+// DATA frame was forwarded as it came, the queue grew to --write-buffer in front of a backend slower than the client,
+// and the request was cut off at that bound -- a reset where HTTP/1.1 is only slowed -- inside the take that pull()
+// was still running.
 bool proxy_instance::h3_can_take(socketley::h3::stream& st)
 {
     auto* child = h3_child(st);
-    return child && !child->closing && child->partial.size() < read_buffer_bytes();
+    return child && !child->closing && child->partial.size() < read_buffer_bytes() && !backend_backpressured(child);
 }
 
 void proxy_instance::h3_take(socketley::h3::stream& st, const char* d, size_t n)
