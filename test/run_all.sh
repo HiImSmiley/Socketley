@@ -305,6 +305,7 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_mail_sessions)  corpus=mailsessions ;;
         fuzz_h2_session)     corpus=h2session ;;
         fuzz_state_json)     corpus=statejson ;;
+        fuzz_edit_merge)     corpus=editmerge ;;
         fuzz_ws_reassembly)  corpus=wsreassembly ;;
         fuzz_resp_dispatch)  corpus=respdispatch ;;
         fuzz_sieve_budget)   corpus=sievebudget ;;
