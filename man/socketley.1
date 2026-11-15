@@ -1310,6 +1310,14 @@ every runtime that accepts them.
 ends every session and refresh token the account holds;
 .B passwd
 does too.
+So do
+.B disable
+and
+.BR "set reset=1" ,
+for good:
+.B enable
+lets the account sign in again, but brings back none of the sessions, tokens
+or refresh tokens it held before it was disabled.
 .B show
 prints the fields. It shows the password only as set, never its hash.
 .IP
@@ -16021,7 +16029,10 @@ and kept in the state directory, so a restart signs nobody out. A refresh token
 is read back only by the provider, and is signed HS256 under a secret made from
 that key. A refresh token is good once. A refresh gives the next token of its
 sign-in, which is kept with the account. A refresh token used a second time ends
-that sign-in, including its newest token.
+that sign-in, including its newest token, and every access token its refreshes
+gave, at
+.BR /userinfo
+and at every runtime that verifies them, the newest one included.
 An authorization code is good once and lives a minute. If the client it was given
 to exchanges it a second time, the exchange is refused with
 .B invalid_grant
@@ -16519,6 +16530,12 @@ the right key included. Behind the entrance the address is the client's;
 .TP
 .BI "\-\-idp " runtime
 The idp runtime whose accounts own documents.
+A stream of changes is closed within a few seconds once its account is
+disabled, made to reset its password, removed, given a new password or signed
+out everywhere, or its session signed out; one opened with a key, once that key
+is taken out of
+.B \-\-keys
+or given another secret.
 .TP
 .BI "\-\-idp\-audience " clients
 The ids of the idp's clients whose access tokens the runtime takes,
@@ -18240,6 +18257,10 @@ bounces.
 .BI "\-\-idp " runtime
 The idp runtime whose users have mailboxes here and sign in to send and read
 mail.
+An IMAP, POP3, submission or ManageSieve session is closed within a few seconds
+once its account is disabled, made to reset its password, removed, given a new
+password or signed out everywhere, whether it signed in with a password or an
+access token.
 .TP
 .BI "\-\-idp\-audience " clients
 The comma\-separated ids of the idp clients whose access tokens the runtime
@@ -18277,6 +18298,8 @@ It holds a name and a scrypt hash, one account per line, as
 .B socketley mqtt passwd
 writes them.
 The runtime reads the file again when it changes.
+A session signed in with a line that is then removed, or given another
+password, is closed within a few seconds.
 .TP
 .BI "\-\-aliases " file
 A file of addresses the runtime accepts besides the users' own.

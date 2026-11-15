@@ -313,7 +313,7 @@ Sends mail that has no sender from no-reply@. That address accepts no mail but b
 
 ### `--idp runtime`
 
-The idp runtime whose users have mailboxes here and sign in to send and read mail.
+The idp runtime whose users have mailboxes here and sign in to send and read mail. An IMAP, POP3, submission or ManageSieve session is closed within a few seconds once its account is disabled, made to reset its password, removed, given a new password or signed out everywhere, whether it signed in with a password or an access token.
 
 ### `--idp-audience clients`
 
@@ -325,7 +325,7 @@ The storage runtime, and optionally its bucket, that holds the mailboxes. A burs
 
 ### `--users file`
 
-A file of accounts that sign in to send mail. It holds a name and a scrypt hash, one account per line, as **socketley mqtt passwd** writes them. The runtime reads the file again when it changes.
+A file of accounts that sign in to send mail. It holds a name and a scrypt hash, one account per line, as **socketley mqtt passwd** writes them. The runtime reads the file again when it changes. A session signed in with a line that is then removed, or given another password, is closed within a few seconds.
 
 ### `--aliases file`
 

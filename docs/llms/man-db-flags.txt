@@ -71,7 +71,7 @@ Service keys for backends, one per line: *name secret*. The secret must be at le
 
 ### `--idp runtime`
 
-The idp runtime whose accounts own documents.
+The idp runtime whose accounts own documents. A stream of changes is closed within a few seconds once its account is disabled, made to reset its password, removed, given a new password or signed out everywhere, or its session signed out; one opened with a key, once that key is taken out of **--keys** or given another secret.
 
 ### `--idp-audience clients`
 
