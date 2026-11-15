@@ -1089,8 +1089,7 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
     // What duplicate saw is kept once the actions are taken, off the loop.
     if (sieve_store* store = m_run.filters(); store && !out.seen.empty())
         m_run.pool().submit(0, [store, user, seen = out.seen, now = wall::now_ms() / 1000] {
-            for (const auto& [key, seconds] : seen)
-                store->keep_seen(user, key, seconds, now);
+            store->keep_seen(user, seen, now);
         }, [] {});
     if (reject)
     {

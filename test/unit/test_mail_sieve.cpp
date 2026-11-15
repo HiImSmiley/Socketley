@@ -2,13 +2,17 @@
 #include "thread_cpu.h"
 
 #include <chrono>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/mail_mime.h"
 #include "runtime/mail/mail_sieve.h"
+#include "runtime/mail/mail_sieve_store.h"
 
 using namespace socketley::mail;
 using sieve::action;
@@ -1046,4 +1050,107 @@ TEST_CASE("sieve: a string of many \"${\" and no \"}\" is put together in one pa
     const auto took = thread_cpu_now() - start;
     CHECK(o.error.empty());
     CHECK(took < std::chrono::seconds(1));
+}
+
+namespace
+{
+// A script whose `duplicate` names per_level^levels different IDs of one length behind one long handle: each level
+// sets its digit and includes the next, the last one asks.
+sieve::outcome many_duplicates(int levels, int per_level, size_t handle, std::chrono::nanoseconds& took)
+{
+    std::map<std::string, std::string> files;
+    std::string all;
+    for (int l = 1; l <= levels; ++l)
+        all += std::string(all.empty() ? "" : ", ") + "\"v" + std::to_string(l) + "\"";
+    files["L" + std::to_string(levels + 1)] = "require [\"include\", \"variables\", \"duplicate\"];\nglobal [\"h\", " + all +
+                                              "];\nif duplicate :handle \"${h}\" :uniqueid \"" +
+                                              [&] {
+                                                  std::string id;
+                                                  for (int l = 1; l <= levels; ++l)
+                                                      id += "${v" + std::to_string(l) + "}";
+                                                  return id;
+                                              }() +
+                                              "\" { }\n";
+    for (int l = 1; l <= levels; ++l)
+    {
+        std::string s = "require [\"include\", \"variables\"];\nglobal \"v" + std::to_string(l) + "\";\n";
+        for (int d = 0; d < per_level; ++d)
+            s += "set \"v" + std::to_string(l) + "\" \"" + static_cast<char>('a' + d) + "\"; include \"L" +
+                 std::to_string(l + 1) + "\";\n";
+        files["L" + std::to_string(l)] = s;
+    }
+    const std::string main = "require [\"include\", \"variables\"];\nglobal \"h\";\nset \"h\" \"" +
+                             std::string(handle, 'x') + "\";\ninclude \"L1\";\n";
+    std::string err;
+    const auto s = sieve::script::compile(main, err, [&](bool, std::string_view name, std::string& text) {
+        const auto it = files.find(std::string(name));
+        if (it == files.end())
+            return false;
+        text = it->second;
+        return true;
+    });
+    INFO(err);
+    REQUIRE(s);
+    const std::string bytes = crlf_lines(plain);
+    const auto start = thread_cpu_now();
+    sieve::outcome o = s->run({bytes, "alice@example.org", "me@example.com"}, {});
+    took = thread_cpu_now() - start;
+    return o;
+}
+}   // namespace
+
+TEST_CASE("sieve: duplicate finds an ID the run saw already without walking every one before it")
+{
+    // Each ID was compared with every one kept before it: 10,000 IDs of one length behind a 4 KiB handle, by include
+    // re-running scripts, cost seconds of a CPU lane thread, and nothing but the step count bounded how many.
+    std::chrono::nanoseconds took{};
+    const sieve::outcome many = many_duplicates(4, 10, 4096, took);
+    MESSAGE("10,000 IDs behind a 4 KiB handle: " << std::chrono::duration<double>(took).count() << " s, kept "
+                                                 << many.seen.size() << ", error \"" << many.error << "\"");
+    CHECK(took < std::chrono::milliseconds(500));
+    // What one run may ask about is what the store remembers at all, 10,000 IDs, and 1 MiB of them.
+    CHECK(many.error.find("more than 10,000 IDs, or 1 MiB") != std::string::npos);
+    // 10,000 short ones are asked about and kept, quickly.
+    const sieve::outcome kept = many_duplicates(4, 10, 64, took);
+    MESSAGE("10,000 IDs behind a 64 byte handle: " << std::chrono::duration<double>(took).count() << " s");
+    CHECK(kept.error.empty());
+    CHECK(kept.seen.size() == 10000);
+    CHECK(took < std::chrono::milliseconds(500));
+    // One more is past what may be asked.
+    const sieve::outcome past = many_duplicates(3, 22, 8, took);
+    CHECK(past.error.find("more than 10,000 IDs") != std::string::npos);
+}
+
+TEST_CASE("sieve: what one message's duplicate tests saw is kept without folding the memory again for each")
+{
+    // A memory already full, and one message's 10,000 IDs kept as a delivery handed them over, one by one: past
+    // 10,000 every key sorted the whole memory, wrote it out again (about 600 KB) and read it back in.
+    const std::string dir = "/tmp/test-mail-sieve-dup-" + std::to_string(::getpid());
+    std::filesystem::remove_all(dir);
+    {
+        sieve_store store(dir);
+        for (int i = 0; i < 10000; ++i)
+            store.keep_seen("alice", std::string("h\0old-", 6) + std::to_string(i), 7 * 86400, 1000 + i);
+        const auto start = thread_cpu_now();
+        for (int i = 0; i < 10000; ++i)
+            store.keep_seen("alice", std::string("h\0id-", 5) + std::to_string(i), 7 * 86400, 20000 + i);
+        const auto took = thread_cpu_now() - start;
+        MESSAGE("10,000 IDs kept one by one into a full memory: " << std::chrono::duration<double>(took).count()
+                                                                 << " s");
+        CHECK(took < std::chrono::seconds(5));
+        // The newest are remembered and the memory holds no more than it may.
+        CHECK(store.seen("alice", std::string("h\0id-9999", 9), 20001));
+        CHECK_FALSE(store.seen("alice", std::string("h\0old-0", 7), 20001));
+        // As a delivery hands them over now: one run's IDs in one append.
+        std::vector<std::pair<std::string, uint32_t>> run;
+        for (int i = 0; i < 10000; ++i)
+            run.emplace_back(std::string("h\0run-", 6) + std::to_string(i), 7 * 86400 + 30000);
+        const auto at = thread_cpu_now();
+        store.keep_seen("alice", run, 20000);
+        const auto once = thread_cpu_now() - at;
+        MESSAGE("10,000 IDs kept in one go: " << std::chrono::duration<double>(once).count() << " s");
+        CHECK(once < std::chrono::milliseconds(150));
+        CHECK(store.seen("alice", std::string("h\0run-0", 7), 20001));
+    }
+    std::filesystem::remove_all(dir);
 }

@@ -480,28 +480,41 @@ bool sieve_store::recall(const std::string& user, const char* kind, const std::s
 bool sieve_store::remember(const std::string& user, const char* kind, const std::string& hash, int64_t until,
                            int64_t now_s)
 {
+    return remember(user, kind, std::vector<std::pair<std::string, int64_t>>{{hash, until}}, now_s);
+}
+
+bool sieve_store::remember(const std::string& user, const char* kind,
+                           const std::vector<std::pair<std::string, int64_t>>& entries, int64_t now_s)
+{
     memory& mem = memory_of(user, kind);
     const std::string path = user_dir(user) + "/." + kind;
-    const std::string line = std::to_string(until) + " " + hash + "\n";
+    std::string lines;
+    for (const auto& [hash, until] : entries)
+        lines += std::to_string(until) + " " + hash + "\n";
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-    // An append is one write of a short line, which no other shard's append cuts into.
-    const bool ok = fd >= 0 && socketley::write_all(fd, line.data(), line.size());
+    // An append is one write, which no other shard's append cuts into: one line, or what one message's duplicate saw.
+    const bool ok = fd >= 0 && socketley::write_all(fd, lines.data(), lines.size());
     if (fd >= 0)
         ::close(fd);
     if (!ok)
         return false;
-    int64_t& u = mem.until[hash];
-    u = std::max(u, until);
-    // Folded once it holds twice what is live, or more than may be kept: the newest kept, the rest let go.
+    for (const auto& [hash, until] : entries)
+    {
+        int64_t& u = mem.until[hash];
+        u = std::max(u, until);
+    }
+    // Folded once it holds twice what is live, or more than may be kept: the newest kept, the rest let go -- down to
+    // seven eighths of what may be kept, so the next entries are appended and not folded each again.  At the bound,
+    // every entry folded the whole memory and wrote it out: one message's 12,000 duplicate IDs took minutes.
     std::erase_if(mem.until, [now_s](const auto& e) { return e.second <= now_s; });
-    if (mem.lines + 1 > 2 * mem.until.size() + 1000 || mem.until.size() > max_memory)
+    if (mem.lines + entries.size() > 2 * mem.until.size() + 1000 || mem.until.size() > max_memory)
     {
         std::vector<std::pair<int64_t, std::string>> live;
         for (const auto& [h, t] : mem.until)
             live.emplace_back(t, h);
         std::sort(live.begin(), live.end(), std::greater<>());
         if (live.size() > max_memory)
-            live.resize(max_memory);
+            live.resize(max_memory - max_memory / 8);
         std::string text;
         for (const auto& [t, h] : live)
             text += std::to_string(t) + " " + h + "\n";
@@ -509,8 +522,8 @@ bool sieve_store::remember(const std::string& user, const char* kind, const std:
             mem = {};
         return true;
     }
-    ++mem.lines;
-    mem.read += line.size();
+    mem.lines += entries.size();
+    mem.read += lines.size();
     return true;
 }
 
@@ -540,15 +553,26 @@ bool sieve_store::seen(const std::string& user, std::string_view key, int64_t no
 
 void sieve_store::keep_seen(const std::string& user, std::string_view key, uint32_t seconds, int64_t now_s)
 {
+    keep_seen(user, std::vector<std::pair<std::string, uint32_t>>{{std::string(key), seconds}}, now_s);
+}
+
+void sieve_store::keep_seen(const std::string& user, const std::vector<std::pair<std::string, uint32_t>>& keys,
+                            int64_t now_s)
+{
+    if (keys.empty())
+        return;
     const user_lock lock(user_dir(user));
     std::lock_guard<std::mutex> g(m_mu);
-    const std::string hash = hash_of(key);
+    std::vector<std::pair<std::string, int64_t>> entries;
+    entries.reserve(keys.size());
+    for (const auto& [key, seconds] : keys)
+        entries.emplace_back(hash_of(key), now_s + seconds);
     bool ok = true;
     // What other shards appended is read first, so remember() extends the cursor from the end of the file.
-    recall(user, "duplicate", hash, now_s, ok);
+    recall(user, "duplicate", entries.front().first, now_s, ok);
     if (!ok || !lock.held())
         return;
-    if (!remember(user, "duplicate", hash, now_s + seconds, now_s)) {}
+    if (!remember(user, "duplicate", entries, now_s)) {}
 }
 
 }   // namespace socketley::mail

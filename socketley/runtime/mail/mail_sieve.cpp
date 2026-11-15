@@ -38,6 +38,9 @@ constexpr size_t max_added_headers = 64;
 // What duplicate keeps an ID for when the script names no time, and the most it may name (RFC 7352 3.1).
 constexpr uint64_t duplicate_default_s = 12 * 3600;
 constexpr uint64_t duplicate_max_s = 7 * 86400;
+// The IDs one run may ask duplicate about, and their bytes: as many as the store remembers for a user at all.
+constexpr size_t max_duplicate_ids = 10000;
+constexpr size_t max_duplicate_bytes = 1u << 20;
 // What one step buys: bytes scanned or decoded, and turns of the wildcard matcher.
 constexpr uint64_t bytes_per_step = 512;
 constexpr uint64_t glob_per_step = 256;
@@ -2352,6 +2355,14 @@ struct runner
     size_t added{0};
     std::deque<std::string> owned;
     std::vector<std::pair<std::string, uint32_t>> seen_ids;
+    // Every ID this run asked duplicate about: what the store answered, and whether it is among seen_ids.
+    struct asked_id
+    {
+        bool dup{false};
+        bool held{false};
+    };
+    std::unordered_map<std::string, asked_id, string_hash, string_equal> asked_ids;
+    size_t asked_bytes{0};
     std::unordered_map<std::string, std::unique_ptr<socketley::regex>, string_hash, string_equal> regexes;
 
     bool headers_read{false};
@@ -2988,10 +2999,28 @@ struct runner
         std::string key = handle;
         key += '\0';
         key += id;
-        const bool dup = c.seen && c.seen(key);
-        const auto held = std::find_if(seen_ids.begin(), seen_ids.end(), [&](const auto& s) { return s.first == key; });
-        if ((!dup || t.last) && held == seen_ids.end())
+        // Found by its hash, charged its length: each ID was compared with every one kept before it, quadratic in
+        // the IDs a run names (include re-runs a script, and each run of it may name others), and the store's file
+        // was asked again for each test.  The store's answer cannot change within a run, so it is asked once.
+        if (!step(t.line, key.size() / bytes_per_step))
+            return false;
+        auto it = asked_ids.find(key);
+        if (it == asked_ids.end())
+        {
+            if (asked_ids.size() >= max_duplicate_ids || asked_bytes + key.size() > max_duplicate_bytes)
+            {
+                fail(t.line, "duplicate asked about more than 10,000 IDs, or 1 MiB of them, in one run");
+                return false;
+            }
+            asked_bytes += key.size();
+            it = asked_ids.emplace(key, asked_id{c.seen && c.seen(key), false}).first;
+        }
+        const bool dup = it->second.dup;
+        if ((!dup || t.last) && !it->second.held)
+        {
+            it->second.held = true;
             seen_ids.emplace_back(std::move(key), static_cast<uint32_t>(t.limit));
+        }
         return dup;
     }
 

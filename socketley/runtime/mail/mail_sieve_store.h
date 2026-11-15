@@ -65,6 +65,8 @@ public:
     // Whether duplicate kept `key` for `user` and it has not run out; and keeping it for `seconds` more.
     bool seen(const std::string& user, std::string_view key, int64_t now_s);
     void keep_seen(const std::string& user, std::string_view key, uint32_t seconds, int64_t now_s);
+    // What one run's duplicate tests saw, kept in one append under one lock, as sieve::outcome::seen holds it.
+    void keep_seen(const std::string& user, const std::vector<std::pair<std::string, uint32_t>>& keys, int64_t now_s);
 
 private:
     std::string user_dir(const std::string& user) const;
@@ -103,6 +105,8 @@ private:
     // where the file cannot be read.
     bool recall(const std::string& user, const char* kind, const std::string& hash, int64_t now_s, bool& ok);
     bool remember(const std::string& user, const char* kind, const std::string& hash, int64_t until, int64_t now_s);
+    bool remember(const std::string& user, const char* kind,
+                  const std::vector<std::pair<std::string, int64_t>>& entries, int64_t now_s);
     memory& memory_of(const std::string& user, const char* kind);
 
     std::mutex m_mu;
