@@ -94,7 +94,7 @@ Where alert notices go: **webhook**, **mail** and **events**, comma-separated. T
 
 ### `--receive`
 
-Accepts Prometheus remote_write at **POST /api/v1/write**. Each request is a Snappy-compressed WriteRequest of up to 16 MiB. Its samples are stored as they come, and the refused ones are counted in **stats**. A Prometheus, a Grafana Agent or another metrics runtime behind a firewall can then send what it has, instead of being scraped.
+Accepts Prometheus remote_write at **POST /api/v1/write**. Each request is a Snappy-compressed WriteRequest of up to 16 MiB. Its samples are stored as they come, and the refused ones are counted in **stats**. With **--keys** or **--idp**, a write needs a key, or the access token of an admin of the idp; a browser's cookie never writes (403). A series is taken only as a scraped line would be: at most 64 labels, a name of at most 256 bytes, and 64 KiB of names and values in all; a larger series' samples are counted as refused. A Prometheus, a Grafana Agent or another metrics runtime behind a firewall can then send what it has, instead of being scraped.
 
 ### `--logs, --no-logs`
 

@@ -328,7 +328,7 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write. Types: metrics. |
+| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write, with a key or an admin's token when guarded. Types: metrics. |
 
 **Archive**
 

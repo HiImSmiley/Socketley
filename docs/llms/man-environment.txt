@@ -346,7 +346,7 @@ Inherited by worker processes, which have no command line of their own.
 
 ### `SOCKETLEY_WRITE_STALL_SECS`
 
-A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset, and how many a storage's client may before its connection or stream is let go. The range is 1 to 86400. Default: 120 seconds.
+A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset, and how many a storage's client, or a db's stream of changes, may before its connection or stream is let go. The range is 1 to 86400. Default: 120 seconds.
 
 Inherited by worker processes, which have no command line of their own.
 
@@ -413,6 +413,12 @@ Inherited by worker processes, which have no command line of their own.
 ### `SOCKETLEY_MEDIA_CACHE_MB`
 
 Sets the size in MiB beyond which a storage runtime removes the media it made from *dir*/.media/. It removes the least recently requested media first. Default: 10240. The medium made last is kept even when it alone is larger, and no medium is removed while it is being made.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MEDIA_MEMORY_MB`
+
+Sets the memory in MiB that each ffmpeg a storage runtime starts may take (its data size), 0 for no bound. Default: half the machine's memory, 1024 at least. Each such ffmpeg is also the first process the kernel ends when memory runs out, so a crafted medium costs its own job and not the daemon.
 
 Inherited by worker processes, which have no command line of their own.
 

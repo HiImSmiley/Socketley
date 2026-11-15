@@ -2397,7 +2397,7 @@ Inherited by worker processes, which have no command line of their own.
 
 #### `SOCKETLEY_WRITE_STALL_SECS`
 
-A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset, and how many a storage's client may before its connection or stream is let go. The range is 1 to 86400. Default: 120 seconds.
+A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset, and how many a storage's client, or a db's stream of changes, may before its connection or stream is let go. The range is 1 to 86400. Default: 120 seconds.
 
 Inherited by worker processes, which have no command line of their own.
 
@@ -2464,6 +2464,12 @@ Inherited by worker processes, which have no command line of their own.
 #### `SOCKETLEY_MEDIA_CACHE_MB`
 
 Sets the size in MiB beyond which a storage runtime removes the media it made from *dir*/.media/. It removes the least recently requested media first. Default: 10240. The medium made last is kept even when it alone is larger, and no medium is removed while it is being made.
+
+Inherited by worker processes, which have no command line of their own.
+
+#### `SOCKETLEY_MEDIA_MEMORY_MB`
+
+Sets the memory in MiB that each ffmpeg a storage runtime starts may take (its data size), 0 for no bound. Default: half the machine's memory, 1024 at least. Each such ffmpeg is also the first process the kernel ends when memory runs out, so a crafted medium costs its own job and not the daemon.
 
 Inherited by worker processes, which have no command line of their own.
 
@@ -3643,7 +3649,7 @@ Every flag a metrics runtime takes, by group.
 
 | flag | value | what it does |
 |---|---|---|
-| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write. |
+| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write, with a key or an admin's token when guarded. |
 
 **Archive**
 
@@ -4938,7 +4944,7 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write. Types: metrics. |
+| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write, with a key or an admin's token when guarded. Types: metrics. |
 
 **Archive**
 
@@ -5695,7 +5701,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Cluster mode](man-cluster-mode.txt)
 - [Installation](man-installation.txt)
 - [State persistence](man-state-persistence.txt)
-- [Environment](man-environment.txt) (94 entries)
+- [Environment](man-environment.txt) (95 entries)
 - [Files](man-files.txt)
 - [SDK](man-sdk.txt) (3 entries)
 - [Limitations](man-limitations.txt)
@@ -11056,7 +11062,7 @@ Every shard answers reads and queries. Writes wait for one disk, so the shards t
 
 Every request a reading shard takes reads the log on first. A shard that holds a stream is also told by shard 0 of each change that reaches the disk, so the stream hears of it before the next request. **stats** counts these messages in shard 0's **nudges**.
 
-**Changes, as they happen.** **GET** */c/***collection***/_feed* is a stream of Server-Sent Events, which a browser reads with **EventSource**. Each change is sent once it is on the disk, numbered by the change. A change is an event **put** with **{"collection":..,"id":..,"owner":..,"version":..,"doc":{..}}** or an event **delete** with **{"collection":..,"id":..,"deleted":true}**. The reader sees only what it may read, as with a query: an account sees its own documents of an owner collection. **GET /_feed** streams the changes of every collection, to a key. A stream that broke resumes from the last change it read, with **Last-Event-ID** (or **?since=**). While a stream is open on any shard, and for two minutes after the last one closed, the database keeps about 32 MiB of changes on every shard, so a stream that resumes may reach any of them. With no stream near, shard 0 keeps about 1 MiB and a shard reading its log keeps none. A stream resuming from an older change is told **reset** and should read again what it shows. **stats** gives each shard's **history_bytes**. A comment every fifteen seconds keeps a quiet stream from looking dead.
+**Changes, as they happen.** **GET** */c/***collection***/_feed* is a stream of Server-Sent Events, which a browser reads with **EventSource**. Each change is sent once it is on the disk, numbered by the change. A change is an event **put** with **{"collection":..,"id":..,"owner":..,"version":..,"doc":{..}}** or an event **delete** with **{"collection":..,"id":..,"deleted":true}**. The reader sees only what it may read, as with a query: an account sees its own documents of an owner collection. **GET /_feed** streams the changes of every collection, to a key. One address holds at most 32 streams open at once on each shard (a key's are not counted; behind the entrance, the address is the client it names); one more is answered **429**. A stream whose reader takes nothing of what it is sent for two minutes is closed. A stream that broke resumes from the last change it read, with **Last-Event-ID** (or **?since=**). While a stream is open on any shard, and for two minutes after the last one closed, the database keeps about 32 MiB of changes on every shard, so a stream that resumes may reach any of them. With no stream near, shard 0 keeps about 1 MiB and a shard reading its log keeps none. A stream resuming from an older change is told **reset** and should read again what it shows. **stats** gives each shard's **history_bytes**. A comment every fifteen seconds keeps a quiet stream from looking dead.
 
 **Documents with a time to go.** A collection whose schema line names **ttl:***field* loses a document once that field's number, in seconds since 1970, has passed. From that moment the document is answered as absent. Its deletion is written and streamed within the minute.
 
@@ -12018,7 +12024,7 @@ Where alert notices go: **webhook**, **mail** and **events**, comma-separated. T
 
 ### `--receive`
 
-Accepts Prometheus remote_write at **POST /api/v1/write**. Each request is a Snappy-compressed WriteRequest of up to 16 MiB. Its samples are stored as they come, and the refused ones are counted in **stats**. A Prometheus, a Grafana Agent or another metrics runtime behind a firewall can then send what it has, instead of being scraped.
+Accepts Prometheus remote_write at **POST /api/v1/write**. Each request is a Snappy-compressed WriteRequest of up to 16 MiB. Its samples are stored as they come, and the refused ones are counted in **stats**. With **--keys** or **--idp**, a write needs a key, or the access token of an admin of the idp; a browser's cookie never writes (403). A series is taken only as a scraped line would be: at most 64 labels, a name of at most 256 bytes, and 64 KiB of names and values in all; a larger series' samples are counted as refused. A Prometheus, a Grafana Agent or another metrics runtime behind a firewall can then send what it has, instead of being scraped.
 
 ### `--logs, --no-logs`
 
@@ -14992,7 +14998,7 @@ Inherited by worker processes, which have no command line of their own.
 
 ### `SOCKETLEY_WRITE_STALL_SECS`
 
-A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset, and how many a storage's client may before its connection or stream is let go. The range is 1 to 86400. Default: 120 seconds.
+A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset, and how many a storage's client, or a db's stream of changes, may before its connection or stream is let go. The range is 1 to 86400. Default: 120 seconds.
 
 Inherited by worker processes, which have no command line of their own.
 
@@ -15059,6 +15065,12 @@ Inherited by worker processes, which have no command line of their own.
 ### `SOCKETLEY_MEDIA_CACHE_MB`
 
 Sets the size in MiB beyond which a storage runtime removes the media it made from *dir*/.media/. It removes the least recently requested media first. Default: 10240. The medium made last is kept even when it alone is larger, and no medium is removed while it is being made.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MEDIA_MEMORY_MB`
+
+Sets the memory in MiB that each ffmpeg a storage runtime starts may take (its data size), 0 for no bound. Default: half the machine's memory, 1024 at least. Each such ffmpeg is also the first process the kernel ends when memory runs out, so a crafted medium costs its own job and not the daemon.
 
 Inherited by worker processes, which have no command line of their own.
 
