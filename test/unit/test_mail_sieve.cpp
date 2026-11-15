@@ -956,3 +956,94 @@ TEST_CASE("sieve: a zone a variable gives that is no zone fails the run")
 if currentdate :zone "${z}" "year" "2020" { discard; })");
     CHECK(o.error.find("zone") != std::string::npos);
 }
+
+// Round 7: what a run costs beyond the steps it counted.  Each case took seconds of CPU on the old code, which charged
+// the walk and not the work behind it.
+TEST_CASE("sieve: deleteheader takes many headers out in one pass")
+{
+    // A stranger's message of 120,000 headers, every other one named as the user's rule deletes: an erase each, each
+    // moving the rest of the list, was quadratic.
+    std::string message;
+    for (int i = 0; i < 60000; ++i)
+        message += "X-Tag: a\nY: b\n";
+    message += "Subject: s\n\nbody\n";
+    const auto start = thread_cpu_now();
+    const outcome o = run("require \"editheader\";\ndeleteheader \"X-Tag\";", message);
+    const auto took = thread_cpu_now() - start;
+    CHECK(o.error.empty());
+    REQUIRE(o.header);
+    CHECK(o.header->find("X-Tag") == std::string::npos);
+    CHECK(o.header->find("Subject: s") != std::string::npos);
+    CHECK(took < std::chrono::seconds(1));
+}
+
+TEST_CASE("sieve: a :matches pattern of many stars is charged its length on every value")
+{
+    // 60 KiB of stars put together from a variable, against 100,000 short values: the pattern's own walk was not
+    // counted, only the value's.
+    std::string script = "require \"variables\";\nset \"s\" \"****************\";\n";
+    for (int i = 0; i < 8; ++i)
+        script += "set \"s\" \"${s}${s}\";\n";
+    script += "if header :matches \"x\" \"";
+    for (int i = 0; i < 15; ++i)
+        script += "${s}";
+    script += "b\" { discard; }\n";
+    std::string message;
+    for (int i = 0; i < 100000; ++i)
+        message += "X:\n";
+    message += "\nbody\n";
+    const auto start = thread_cpu_now();
+    const outcome o = run(script, message);
+    const auto took = thread_cpu_now() - start;
+    CHECK(summary(o) == "keep");
+    CHECK(took < std::chrono::seconds(1));
+}
+
+TEST_CASE("sieve: a regex compiled again and again is charged each time")
+{
+    // 65 expressions of 4 KiB, one more than the cache holds, against a value each: every one was compiled again for
+    // every value, uncounted.
+    std::string script = "require \"regex\";\nif header :regex \"x\" [";
+    for (int i = 0; i < 65; ++i)
+        script += std::string(i ? ", " : "") + "\"([a-y]|[b-z]|(ab)){900}c" + std::to_string(i) + "\"";
+    script += "] { discard; }\n";
+    std::string message;
+    for (int i = 0; i < 3000; ++i)
+        message += "X: a\n";
+    message += "\nbody\n";
+    const auto start = thread_cpu_now();
+    const outcome o = run(script, message);
+    const auto took = thread_cpu_now() - start;
+    INFO(o.error);
+    CHECK(summary(o) == "keep");
+    CHECK(took < std::chrono::seconds(1));
+}
+
+TEST_CASE("sieve: a string of many \"${\" and no \"}\" is put together in one pass")
+{
+    // Each "${" looked for its "}" to the end of the string: 30,000 of them in an included script run 300 times.
+    std::map<std::string, std::string> files;
+    std::string opens;
+    for (int i = 0; i < 30000; ++i)
+        opens += "${";
+    files["s"] = "require \"variables\";\nset \"a\" \"" + opens + "\";\n";
+    std::string main = "require \"include\";\n";
+    for (int i = 0; i < 300; ++i)
+        main += "include \"s\";\n";
+    std::string err;
+    const auto s = sieve::script::compile(main, err, [&](bool, std::string_view name, std::string& text) {
+        const auto it = files.find(std::string(name));
+        if (it == files.end())
+            return false;
+        text = it->second;
+        return true;
+    });
+    INFO(err);
+    REQUIRE(s);
+    const std::string bytes = crlf_lines(plain);
+    const auto start = thread_cpu_now();
+    const outcome o = s->run({bytes, "alice@example.org", "me@example.com"}, {});
+    const auto took = thread_cpu_now() - start;
+    CHECK(o.error.empty());
+    CHECK(took < std::chrono::seconds(1));
+}

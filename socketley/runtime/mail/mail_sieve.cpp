@@ -4,6 +4,8 @@
 #include <array>
 #include <deque>
 #include <functional>
+#include <ranges>
+#include <tuple>
 #include <unordered_map>
 
 #include "mail_compose.h"
@@ -40,6 +42,7 @@ constexpr uint64_t duplicate_max_s = 7 * 86400;
 constexpr uint64_t bytes_per_step = 512;
 constexpr uint64_t glob_per_step = 256;
 constexpr uint64_t regex_per_step = 512;
+constexpr uint64_t regex_compile_per_step = 32;
 
 // ─── capabilities ──────────────────────────────────────────────────────────
 
@@ -2225,7 +2228,8 @@ glob_pat glob_compile(std::string_view pat)
 }
 
 // Whether `s` matches the wildcard pattern `g`, with one backtrack point on the last star so a pattern costs at
-// most its length times the string's; `work` counts the steps and gives up past `budget`.
+// most its length times the string's; `work` counts the steps, the captures cleared and the stars left at the end
+// among them, and gives up past `budget`.
 bool glob(const glob_pat& g, std::string_view s, bool fold, std::vector<std::pair<size_t, size_t>>* caps,
           uint64_t& work, uint64_t budget)
 {
@@ -2233,7 +2237,10 @@ bool glob(const glob_pat& g, std::string_view s, bool fold, std::vector<std::pai
     const std::vector<uint32_t>& wild = g.wild;
     const uint32_t nwild = g.nwild;
     if (caps)
+    {
         caps->assign(nwild, {0, 0});
+        work += nwild;
+    }
     const auto step = [&](size_t at) { return fold ? utf8_len(s, at) : size_t{1}; };
     constexpr size_t none = static_cast<size_t>(-1);
     size_t pi = 0, si = 0, star = none, star_si = 0;
@@ -2279,6 +2286,8 @@ bool glob(const glob_pat& g, std::string_view s, bool fold, std::vector<std::pai
     }
     while (pi < p.size() && p[pi].k == 1)
     {
+        if (++work > budget)
+            return false;
         if (caps)
             (*caps)[wild[pi]] = {s.size(), s.size()};
         ++pi;
@@ -2428,6 +2437,8 @@ struct runner
             return s.s;
         scratch.clear();
         size_t i = 0;
+        // The "}" after a "${" is the one after every "${" before it, so the string is read once however many it holds.
+        size_t close = 0;
         while (i < s.s.size())
         {
             const size_t at = s.s.find("${", i);
@@ -2437,7 +2448,8 @@ struct runner
                 break;
             }
             scratch.append(s.s, i, at - i);
-            const size_t close = s.s.find('}', at + 2);
+            if (close != std::string::npos && close < at + 2)
+                close = s.s.find('}', at + 2);
             const std::optional<std::string_view> v =
                 close == std::string::npos ? std::nullopt
                                            : reference(std::string_view(s.s).substr(at + 2, close - at - 2));
@@ -2670,6 +2682,10 @@ struct runner
                     auto re = std::make_unique<socketley::regex>();
                     if (!regex_ok(key, fold, why, *re))
                         return fail(line, "the regular expression \"" + std::string(key) + "\" " + why);
+                    // Compiling is charged as running is, by the program made: a script of more expressions than
+                    // the cache holds compiles each again for every value.
+                    if (!step(line, 1 + re->program_size() / regex_compile_per_step))
+                        return false;
                     if (regexes.size() >= 64)
                         regexes.clear();
                     it = regexes.emplace(id, std::move(re)).first;
@@ -2709,6 +2725,9 @@ struct runner
                 auto it = globs.find(std::string(key));
                 if (it == globs.end())
                 {
+                    // A pattern read again, once the cache let it go, is charged again.
+                    if (!step(line, key.size() / glob_per_step))
+                        return false;
                     if (globs.size() >= 256)
                         globs.clear();
                     it = globs.emplace(std::string(key), glob_compile(key)).first;
@@ -3504,18 +3523,29 @@ struct runner
         where.line = k.line;
         where.index = k.index;
         where.last = k.last;
-        std::vector<size_t> at = occurrences(name, where);
-        // The last first, so each erase leaves the places still to erase where they were.
-        for (auto it = at.rbegin(); it != at.rend() && ok(); ++it)
+        const std::vector<size_t> at = occurrences(name, where);
+        // Marked first and taken out in one pass: an erase each moved every header after it, which a stranger's
+        // message of many headers made quadratic.
+        constexpr uint8_t gone = 2;
+        bool any = false;
+        for (const size_t i : at)
         {
-            const size_t i = *it;
+            if (!ok())
+                return;
             if (k.has_flags && !compare({header_text(i)}, patterns, k.m, k.line))
                 continue;
-            headers.erase(headers.begin() + static_cast<ptrdiff_t>(i));
-            decoded.erase(decoded.begin() + static_cast<ptrdiff_t>(i));
-            have_decoded.erase(have_decoded.begin() + static_cast<ptrdiff_t>(i));
-            edited = true;
+            have_decoded[i] = gone;
+            any = true;
         }
+        if (!ok() || !any)
+            return;
+        auto rows = std::views::zip(headers, decoded, have_decoded);
+        const auto tail = std::ranges::remove_if(rows, [](const auto& r) { return std::get<2>(r) == gone; });
+        const auto left = static_cast<size_t>(tail.begin() - rows.begin());
+        headers.resize(left);
+        decoded.resize(left);
+        have_decoded.resize(left);
+        edited = true;
     }
 
     // The header block as editheader left it, its blank line ending it.
