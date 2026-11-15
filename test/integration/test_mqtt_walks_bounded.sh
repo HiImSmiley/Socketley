@@ -27,6 +27,8 @@ P=$((SL_PORT_BASE + 1760))
 PS=$((SL_PORT_BASE + 1761))
 trap 'daemon_stop' EXIT
 daemon_start "$BIN"
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 
 "$BIN" create mqtt wk -p "$P" --anonymous -s >/dev/null 2>&1 \
     && ok || bad "a broker is made" "$(tail -3 "$SOCKETLEY_DLOG")"
@@ -40,8 +42,8 @@ for _ in $(seq 1 50); do
 done
 
 run() {
-    PYTHONPATH="$HERE" python3 - "$1" "$2" "$BIN" 2>&1 <<'PY'
-import itertools, json, subprocess, sys, time
+    SANITIZED=$sanitized PYTHONPATH="$HERE" python3 - "$1" "$2" "$BIN" 2>&1 <<'PY'
+import itertools, json, os, subprocess, sys, time
 from lib_mqtt import *
 phase, port, binary = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 
@@ -65,8 +67,11 @@ if phase == "retained":
         held = ping_ms(other)
         print("    a ping behind a SUBSCRIBE of %d filters over 20,000 retained: %.1f ms (alone %.1f ms)" %
               (len(filters), held, base))
-        truth("a SUBSCRIBE of 1,024 filters each matching 20,000 retained messages holds the loop under 300 ms",
-              held < 300, "%.1f ms" % held)
+        if os.environ.get("SANITIZED") == "1":
+            print("  SKIP [stall]: a loop held in milliseconds measures the sanitizer, not the walk")
+        else:
+            truth("a SUBSCRIBE of 1,024 filters each matching 20,000 retained messages holds the loop under 300 ms",
+                  held < 300, "%.1f ms" % held)
         n = len(sub.messages(100, 3))
         truth("the subscriber is sent retained messages", n > 0, n)
     guarded("retained", retained)
