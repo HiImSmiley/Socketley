@@ -145,7 +145,11 @@ struct feed_visitor
     {
         if (!f.m_logs || from != f.m_log_cursor)
             return false;
-        first_logs = from == 0;
+        // The first section after a start is the daemon's newest lines, some of them kept before the restart: those up
+        // to the store's last line as the section begins are skipped. Measured against each line just appended
+        // instead, it dropped every line sharing a millisecond with the one before it -- a worker's two lines about
+        // one failure, the daemon's two about it.
+        kept_until = from == 0 ? f.m_logs->last_t() : INT64_MIN;
         f.m_log_cursor = next;
         return true;
     }
@@ -153,8 +157,7 @@ struct feed_visitor
     void log(const worker_proto::series_log_line& l)
     {
         const int64_t t = static_cast<int64_t>(l.at_ms);
-        // The first lines after a start are the daemon's newest, some of them kept before the restart.
-        if (first_logs && t <= f.m_logs->last_t())
+        if (t <= kept_until)
             return;
         // A line about a runtime names it as `runtime '<name>'` or `<type> '<name>'` after its tags, and is that
         // runtime's whichever process wrote it: the daemon, or a worker passing on the daemon's state.
@@ -166,7 +169,7 @@ struct feed_visitor
         f.m_log_counts[{std::string(rt), std::string(l.level)}].n += 1;
     }
 
-    bool first_logs{false};
+    int64_t kept_until{INT64_MIN};
 
     void gone(uint32_t id)
     {

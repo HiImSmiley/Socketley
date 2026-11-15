@@ -5,6 +5,7 @@
 #
 # What each part would catch:
 #   * a line of the daemon's or a worker's that never reaches the store, or reaches it twice after a restart
+#   * of the lines a runtime is given as it starts, one dropped for sharing a millisecond with the line before it
 #   * a line of the daemon's own about a runtime not under that runtime's name
 #   * a selector, a line filter or a regex filter that takes the wrong lines
 #   * a metric query over lines (count_over_time, rate, sum by) that counts wrong, or an answer Grafana cannot read
@@ -41,10 +42,15 @@ echo '-- fine' > "$T/s.lua"
 S create server broke -p $((P+2)) --lua "$T/s.lua" -s >/dev/null
 echo 'this is not lua (' > "$T/s.lua"
 S stop broke >/dev/null; S start broke >/dev/null 2>&1
-# The worker's own error comes first and the daemon's comes when it sees the worker go, so the wait is for the latter,
-# which every check below reads.
-for _ in $(seq 1 300); do S metrics m logs '{name="broke", level="error"}' 2>/dev/null | grep -q "runtime 'broke': .*exited unexp" && break; sleep 0.1; done
-sleep 1.2
+# The worker's own error comes first, and the daemon's two lines when it sees the worker go: a warning that it exited
+# and the error that it refused its configuration. The wait is for what the checks below read -- that error, that
+# warning, and the error counted for the rules -- with a deadline, since under load each comes later.
+logged() {
+    S metrics m logs '{name="broke", level="error"}' 2>/dev/null | grep -q "\[ERROR\] runtime 'broke': " &&
+    S metrics m logs '{name="broke"}' 2>/dev/null | grep -q 'exited unexpectedly' &&
+    S metrics m query 'socketley_log_lines_total{name="broke",level="error"}' 2>/dev/null | grep -qE ' [1-9][0-9]*$'
+}
+for _ in $(seq 1 300); do logged && break; sleep 0.1; done
 
 # ── the lines, and the CLI ──────────────────────────────────────────────────
 A=$(S metrics m logs)
@@ -58,6 +64,23 @@ hasnt "and leaves the others out" "$(S metrics m logs '{level="error"}')" 'daemo
 has "a line filter" "$(S metrics m logs '{job="socketley"} |= "script error"')" 'script error'
 hasnt "a negative one" "$(S metrics m logs '{name="broke"} != "script"')" 'script error'
 has "a regex one, found anywhere in the line" "$(S metrics m logs '{name="broke"} |~ "exit.d unexp"')" 'exited unexpectedly'
+
+# ── what a runtime started later is given ────────────────────────────────────
+# Its first look is the daemon's newest lines, broke's failure among them: the worker's two lines about it, and the
+# daemon's two, each pair as a rule in one millisecond. Every line the daemon wrote is kept, the second of a pair too.
+sed -n '/\[INFO\] daemon started/,$p' "$SOCKETLEY_DLOG" > "$T/dlog"
+S create metrics late -p $((P+3)) --every 1s --logs -s >/dev/null
+unkept() {
+    S metrics late logs --limit 5000 > "$T/late" 2>/dev/null
+    python3 - "$T/dlog" "$T/late" <<'PY'
+import collections, sys
+want = collections.Counter(open(sys.argv[1], errors="replace").read().splitlines())
+have = collections.Counter(open(sys.argv[2], errors="replace").read().splitlines())
+print("\n".join(l for l, n in want.items() if have[l] < n))
+PY
+}
+for _ in $(seq 1 100); do missing=$(unkept); [ -z "$missing" ] && break; sleep 0.1; done
+[ -s "$T/dlog" ] && [ -z "$missing" ] && ok || bad "a runtime started later keeps every line before it" "$(printf '%s' "$missing" | head -c 400)"
 
 # ── Loki's API, as Grafana asks it ──────────────────────────────────────────
 R=$(L query_range '{name="broke", level="error"}')
@@ -75,13 +98,18 @@ has "a runtime without --logs keeps none" "$(L query_range '{job="socketley"}' -
 # ── a restart takes no line twice ───────────────────────────────────────────
 S metrics m logs --limit 5000 > "$T/before"
 S stop m >/dev/null; S start m >/dev/null
-sleep 2.5
-S metrics m logs --limit 5000 > "$T/after"
 n=$(wc -l < "$T/before")
+# Waited for until the restart's own lines are there after what was kept, with a deadline.
+for _ in $(seq 1 100); do
+    S metrics m logs --limit 5000 > "$T/after"
+    tail -n +$((n+1)) "$T/after" | grep -q "metrics 'm'" && break
+    sleep 0.1
+done
 # Oldest first, so what was kept is the start of what is kept now, and the lines of the restart come after it.
 if [ "$n" -gt 0 ] && head -n "$n" "$T/after" | cmp -s - "$T/before"; then ok
 else bad "every line kept before a restart is there once after it" "$(diff "$T/before" <(head -n "$n" "$T/after") | head -5)"; fi
 has "and the restart's own lines after them" "$(tail -n +$((n+1)) "$T/after")" "metrics 'm'"
+hasnt "and none of the lines before it a second time" "$(tail -n +$((n+1)) "$T/after")" 'daemon started'
 has "the files are kept" "$(S metrics m stats)" '^log_files:[1-9]'
 
 # ── who reads the log through an idp ────────────────────────────────────────
