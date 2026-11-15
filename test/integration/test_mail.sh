@@ -7,6 +7,7 @@
 #
 # A mail server is judged by the mail it takes that it should not, and the mail it loses:
 #   * mail for an alias not handed to the alias's domain's exchanger, or handed on without a Received line
+#   * a stranger's mail From one of its domains, DMARC not passed, sent on to an alias elsewhere
 #   * a stranger let relay through it, or mail taken for a user that does not exist
 #   * a message submitted without a Date or Message-ID sent on without them
 #   * send of "-1" to a server taken as mail flags, a message past the channel's bound lost, a colon path misread
@@ -130,17 +131,20 @@ check "a stranger's mail to an alias is taken" "$(smtp "$P" carol@else.test info
 
 alias body')" "sent"
 f=$(mail_with "alias body") && ok "and handed to the alias's domain's exchanger" || bad "and handed to the alias's domain's exchanger" "nothing at the sink"
+[ -n "$f" ] && ! grep -q '^DKIM-Signature:' "$f" && grep -q '^ARC-Seal:' "$f" \
+    && ok "and sent on sealed by ARC, not signed as this runtime's domain" \
+    || bad "and sent on sealed by ARC, not signed as this runtime's domain" "$(grep -E '^(DKIM-Signature|ARC-Seal):' "$f" 2>/dev/null)"
+[ -n "$f" ] && grep -q '^rcpt bob@remote.test' "$f" && ok "for the alias's address" || bad "for the alias's address" "$(head -3 "$f" 2>/dev/null)"
+[ -n "$f" ] && grep -q 'by mail.example.test (socketley) with ESMTP id' "$f" && ok "under a Received line of its own" \
+    || bad "under a Received line of its own" "$(grep -m2 Received "$f" 2>/dev/null)"
+# From one of its domains, which DMARC did not pass, it is delivered nowhere else: sent on from an SRS address of
+# example.test, the next hop's SPF would pass for that domain and align with the From.
 check "a stranger's mail From one of its domains is taken for an alias" "$(smtp "$P" carol@else.test info@example.test 'From: ceo@example.test
 Subject: forged
 
 forged alias body')" "sent"
-f=$(mail_with "forged alias body")
-[ -n "$f" ] && ! grep -q '^DKIM-Signature:' "$f" && grep -q '^ARC-Seal:' "$f" \
-    && ok "and sent on sealed by ARC, not signed as that domain" \
-    || bad "and sent on sealed by ARC, not signed as that domain" "$(grep -E '^(DKIM-Signature|ARC-Seal):' "$f" 2>/dev/null)"
-[ -n "$f" ] && grep -q '^rcpt bob@remote.test' "$f" && ok "for the alias's address" || bad "for the alias's address" "$(head -3 "$f" 2>/dev/null)"
-[ -n "$f" ] && grep -q 'by mail.example.test (socketley) with ESMTP id' "$f" && ok "under a Received line of its own" \
-    || bad "under a Received line of its own" "$(grep -m2 Received "$f" 2>/dev/null)"
+sleep 1.5
+check "but not sent on, which from here would pass the next hop's DMARC" "$(grep -l "forged alias body" "$T"/sink/* 2>/dev/null | wc -l)" "0"
 check "a stranger may not relay through it" "$(smtp "$P" carol@else.test dave@other.test 'Subject: x
 
 x')" "rcpt 554"

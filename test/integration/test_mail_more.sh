@@ -10,6 +10,7 @@
 #   * LMTP answering once for all recipients rather than once each, or taking EHLO
 #   * a stranger let in on its first try under --greylist, or kept out once it came back
 #   * forwarded mail sent on under the stranger's own address, so SPF at the far end fails it
+#   * a stranger's message with a From of this domain that DMARC did not pass forwarded, aligned with SPF here
 #   * a bounce to the rewritten address not taken, or a forged one taken
 #   * the MTA-STS policy not served, or served for a domain not its own
 #   * mail to user+tag@ refused rather than delivered to user
@@ -327,6 +328,18 @@ for _ in $(seq 1 100); do f=$(grep -l "forwarded on" "$T"/sink/* 2>/dev/null | h
 srs=$(sed -n 's/^from //p' "$f" 2>/dev/null | head -1)
 [[ "$srs" == SRS0=*=b.test=hal@example.test ]] && ok "forwarded mail goes on from an SRS address of this domain" \
     || bad "forwarded mail goes on from an SRS address of this domain" "$srs"
+# A stranger's message whose From is of this domain, which DMARC did not pass, is not forwarded: from here it would
+# pass SPF for this domain and align, so the next hop's DMARC would pass the forgery.
+python3 - "$P" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0)); s.ehlo("x")
+for sender in ("bob@example.test", "hal@b.test"):
+    s.sendmail(sender, ["info@example.test"], "From: Bob <bob@example.test>\r\nTo: info@example.test\r\n"
+               "Subject: wire it\r\n\r\nforged as ours by %s\r\n" % sender)
+PY
+sleep 2
+check "a stranger's message with a From of this domain that DMARC did not pass is not forwarded" \
+    "$(grep -l "forged as ours" "$T"/sink/* 2>/dev/null | wc -l)" "0"
 r=$(python3 - "$P" "$srs" <<'PY'
 import smtplib, sys
 s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0)); s.ehlo("x")

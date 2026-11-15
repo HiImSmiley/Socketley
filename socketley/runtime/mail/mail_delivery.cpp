@@ -68,6 +68,36 @@ std::string lower(std::string_view s)
     return out;
 }
 
+// Whether `e` came as mail of this runtime's own domains may: from a signed-in user, this machine or this runtime,
+// handed over unchecked (LMTP, whose front checked it), or with DMARC passed for the domain its From names. A stranger's
+// message whose From is one of ours that DMARC did not pass here (none, or fail under p=none or quarantine) is still
+// delivered, but not sent on from here.
+bool arrived_as_own(const spool_entry& e)
+{
+    if (!e.user.empty() || e.bounce || e.peer == "127.0.0.1" || e.peer == "::1" || e.peer == "local" || e.auth.empty())
+        return true;
+    // "; dmarc=<result>" is written once, by this host; a sender's names hold no ';'.
+    constexpr std::string_view passed = "; dmarc=pass";
+    const size_t p = e.auth.find(passed);
+    return p != std::string::npos &&
+           (p + passed.size() == e.auth.size() || e.auth[p + passed.size()] == ' ' || e.auth[p + passed.size()] == ';');
+}
+
+// The domain of the From DMARC was judged for here, as inbound_result::header() wrote it; empty where none was.
+std::string_view checked_from_domain(std::string_view auth)
+{
+    const size_t d = auth.find("; dmarc=");
+    if (d == std::string_view::npos)
+        return {};
+    constexpr std::string_view tag = " header.from=";
+    const size_t end = auth.find(';', d + 2);
+    const size_t at = auth.substr(0, end).find(tag, d);
+    if (at == std::string_view::npos)
+        return {};
+    std::string_view v = auth.substr(at + tag.size());
+    return v.substr(0, v.find_first_of("; "));
+}
+
 std::string domain_of(std::string_view addr)
 {
     const size_t at = addr.rfind('@');
@@ -501,6 +531,10 @@ void delivery::dispatch(const entry_ptr& e)
     std::vector<uint32_t>& counts = m_target_count[e->id];
     counts.assign(e->rcpts.size(), 1);
     std::vector<target> local;
+    // A stranger's message whose From is of this runtime's domains, which DMARC did not pass here, goes to no address
+    // elsewhere: an alias keeps a sender of ours (and SRS would make one), so from here it would pass SPF and align,
+    // and the next hop's DMARC would pass the forgery.
+    const bool forged_own = !arrived_as_own(*e) && m_run.is_local_domain(lower(checked_from_domain(e->auth)));
     for (size_t i = 0; i < e->rcpts.size(); ++i)
     {
         if (e->rcpts[i].state != rcpt_state::waiting)
@@ -614,6 +648,16 @@ void delivery::dispatch(const entry_ptr& e)
             {
                 const std::string why = "550 5.1.1 " + t + " bounced before and is not sent to again; `socketley mail " +
                                         std::string(m_run.owner().get_name()) + " forgive " + t + "` lets it";
+                if (targets.size() > 1)
+                    m_run.queue().target_over(*e, i, t, false, why);
+                else
+                    m_run.queue().mark(*e, i, rcpt_state::failed, why);
+                continue;
+            }
+            if (forged_own && t.find('@') != std::string::npos)
+            {
+                const std::string why = "550 5.7.1 a message whose From is of this domain, which did not pass DMARC "
+                                        "here, is not sent on to " + t;
                 if (targets.size() > 1)
                     m_run.queue().target_over(*e, i, t, false, why);
                 else
@@ -868,20 +912,6 @@ bool answerable(const spool_entry& e)
 {
     return !e.bounce && !e.from.empty() && e.folder != "Junk" && e.auth.find("x-spam=yes") == std::string::npos &&
            sender_signed(e);
-}
-
-// Whether `e` came as mail of this runtime's own domains may: from a signed-in user, this machine or this runtime,
-// or with DMARC passed for the domain its From names. A stranger's message whose From is one of ours that DMARC did
-// not pass (none, or fail under p=none or quarantine) is still delivered, but not sent on from here.
-bool arrived_as_own(const spool_entry& e)
-{
-    if (!e.user.empty() || e.bounce || e.peer == "127.0.0.1" || e.peer == "::1" || e.peer == "local")
-        return true;
-    // "; dmarc=<result>" is written once, by this host; a sender's names hold no ';'.
-    constexpr std::string_view passed = "; dmarc=pass";
-    const size_t p = e.auth.find(passed);
-    return p != std::string::npos &&
-           (p + passed.size() == e.auth.size() || e.auth[p + passed.size()] == ' ' || e.auth[p + passed.size()] == ';');
 }
 
 // A folder fileinto may name: printable, no step out of the user's mailboxes.
