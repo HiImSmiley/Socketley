@@ -1582,6 +1582,7 @@ The limits are:
 
 - A stream's window starts at 1 MiB and a connection's at 4 MiB; they grow to 16 MiB and 64 MiB.
 - 128 streams are open at once.
+- A request's head is answered 431 when it is larger than 64 KiB as RFC 9114 counts it (each field's name and value and 32 more), the size the server announces, or larger than 32 KiB written as an HTTP/1.1 head.
 - A handshake not done in 10 seconds is dropped.
 - A connection is closed after 30 seconds without a packet.
 

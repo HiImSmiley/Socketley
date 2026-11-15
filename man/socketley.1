@@ -13695,6 +13695,10 @@ and 64 MiB.
 .IP \(bu 2
 128 streams are open at once.
 .IP \(bu 2
+A request's head is answered 431 when it is larger than 64 KiB as RFC 9114
+counts it (each field's name and value and 32 more), the size the server
+announces, or larger than 32 KiB written as an HTTP/1.1 head.
+.IP \(bu 2
 A handshake not done in 10 seconds is dropped.
 .IP \(bu 2
 A connection is closed after 30 seconds without a packet.
@@ -15490,8 +15494,8 @@ turns HTTP/2 off. Over UDP on the same port, the entrance speaks HTTP/3
 .BR "Alt\-Svc: h3" .
 An HTTP/3 stream is routed by its own
 .B :authority
-exactly as an HTTP/2 stream is. A browser that cannot reach the UDP port goes on
-over TCP.
+exactly as an HTTP/2 stream is, and a client may have eight of them open at once
+on a connection. A browser that cannot reach the UDP port goes on over TCP.
 .B SOCKETLEY_PROXY_HTTP3=0
 opens no UDP socket.
 .IP
