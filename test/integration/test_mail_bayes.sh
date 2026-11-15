@@ -117,10 +117,12 @@ python3 "$T/mail.py" "$P" "$PS" ham 1 98
 wait_count INBOX 26 && [ "$(keys Junk | wc -l)" -eq 26 ] && ok "and one like the rest into INBOX" \
     || bad "new ham into INBOX" "INBOX $(keys INBOX | wc -l), Junk $(keys Junk | wc -l)"
 
-# Folded into its file, the journal gone, and that file what a restart reads.
-for _ in $(seq 1 100); do [ -n "$(find "$T" -name m.bayes 2>/dev/null)" ] && [ -z "$(find "$T" -name m.bayes.journal 2>/dev/null)" ] && break; sleep 0.1; done
-[ -n "$(find "$T" -name m.bayes 2>/dev/null)" ] && [ -z "$(find "$T" -name 'm.bayes.journal' -o -name 'm.bayes.folding' 2>/dev/null)" ] \
-    && ok "what it learned is folded into its file" || bad "folded" "$(find "$T" -name 'm.bayes*')"
+# Folded into its file, the journal gone, and that file what a restart reads. A fold moves the journal aside as
+# m.bayes.folding first and removes that once the file is written, so the wait is for what the check reads -- the
+# file there and neither of the two -- and not for the journal alone, which is gone the moment a fold begins.
+folded() { [ -n "$(find "$T" -name m.bayes 2>/dev/null)" ] && [ -z "$(find "$T" -name 'm.bayes.journal' -o -name 'm.bayes.folding' 2>/dev/null)" ]; }
+for _ in $(seq 1 200); do folded && break; sleep 0.1; done
+folded && ok "what it learned is folded into its file" || bad "folded" "$(find "$T" -name 'm.bayes*')"
 "$BIN" restart m >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$IM" >/dev/null 2>&1
 python3 "$T/mail.py" "$P" "$PS" spam 1 97
