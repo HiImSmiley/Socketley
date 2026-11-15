@@ -486,7 +486,9 @@ void idp_run::tick()
         return;
     const int64_t now = wall::now_sec();
     m_http.sweep(now, idle_secs);
-    std::erase_if(m_codes, [now](const auto& kv) { return kv.second.expires <= now; });
+    // A code exchanged is kept as a marker of that until the access token it gave has expired too, so a second exchange
+    // within it revokes what the first gave, and no longer.
+    std::erase_if(m_codes, [now](const auto& kv) { return kv.second.expires + (kv.second.used ? token_secs : 0) <= now; });
     for (auto it = m_devices.begin(); it != m_devices.end();)
     {
         if (it->second.expires > now)
@@ -1846,19 +1848,22 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
         return;
     }
     const int64_t now = wall::now_sec();
-    const std::string family = socketley::random_hex(8);
+    // A code's family is its grant, which a second exchange of the code revokes.
+    const std::string family = e.grant.empty() ? socketley::random_hex(8) : e.grant;
     if (family.empty())
     {
         json_error(c, 503, "temporarily_unavailable", "no randomness for a refresh token");
         return;
     }
-    // The family is kept with the account before its first token is given, so every shard knows it.
+    // The family is kept with the account before its first token is given, so every shard knows it; and only while
+    // its grant was not revoked meanwhile by the code coming again, which shard 0 orders against this.
     field_list fields = stale_families(who, now);
+    fields.emplace_back("?" + std::string(signed_out_prefix) + family, "");
     fields.emplace_back(std::string(family_prefix) + family, "1 " + std::to_string(now + refresh_secs));
     std::weak_ptr<conn> weak = c;
     c->waiting = true;
     update_account(who.id, std::move(fields),
-                   [this, weak, client_id = cl.id, e, id = who.id, family](bool ok, const std::string&)
+                   [this, weak, client_id = cl.id, e, id = who.id, family](bool ok, const std::string& why)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -1866,7 +1871,9 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
         cc->waiting = false;
         const client* again = find_client(client_id);
         const account* a = m_accounts.by_id(id);
-        if (!ok || !again || !a)
+        if (!ok && why == changed_meanwhile)
+            json_error(cc, 400, "invalid_grant", "the code was used again meanwhile; what it gave is revoked");
+        else if (!ok || !again || !a)
             json_error(cc, 503, "temporarily_unavailable", "the sign-in could not be kept; try again");
         else
             send_tokens(cc, *again, e, *a, family, 1);
@@ -1900,6 +1907,9 @@ void idp_run::send_tokens(const std::shared_ptr<conn>& c, const client& cl, cons
     const std::string id_token = sign_token(m_key, m_kid, "JWT", claims);
     claims.assign(common).append(",\"aud\":").append(aud).append(",\"client_id\":").append(client_id);
     claims.append(",\"scope\":").append(scope).append(",\"jti\":\"").append(jti).append("\",\"exp\":").append(exp);
+    // The grant it is of, by which it is revoked with the rest: its refresh family, or the code's own when it has none.
+    if (const std::string_view sid = family.empty() ? std::string_view(e.grant) : family; !sid.empty())
+        claims.append(",\"sid\":\"").append(sid).append("\"");
     claims.append(profile);
     // The admin bit a session cookie carries, so a runtime taking the token can tell an admin as it does from a cookie.
     claims.append(",\"admin\":").append(who.in_group("admins") ? "true" : "false");
@@ -1991,20 +2001,20 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq, bool fetc
         if (code_shard(code, m_shards, keeper) && keeper != m_shard)
         {
             std::weak_ptr<conn> weak = c;
-            const bool asked = cross(keeper, shard_call{shard_call::redeem, code, {}, 0},
+            const bool asked = cross(keeper, shard_call{shard_call::redeem, code, {{"client", cl->id}}, 0},
                                      [this, weak, p, client_id = cl->id](bool answered, std::string_view reply)
             {
                 auto cc = weak.lock();
                 if (!cc || cc->dead)
                     return;
                 cc->waiting = false;
-                bool found = false;
+                code_use use = code_use::none;
                 code_entry e;
-                if (!answered || !decode_code(reply, found, e))
-                    found = false;
+                if (!answered || !decode_code(reply, use, e))
+                    use = code_use::none;
                 // The clients file may have been read again meanwhile, so the client is found again by its id.
                 if (const client* again = find_client(client_id))
-                    redeemed(cc, *again, p, found, e);
+                    redeemed(cc, *again, p, use, e);
                 else
                     json_error(cc, 401, "invalid_client", "the client is not known or its secret is not right");
                 // Its tokens may wait on the refresh family being kept, which resumes the connection itself.
@@ -2017,16 +2027,9 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq, bool fetc
                 json_error(c, 400, "invalid_grant", "the code is not known, was used, or has expired");
             return;
         }
-        const auto it = m_codes.find(code);
-        if (it == m_codes.end())
-        {
-            redeemed(c, *cl, p, false, {});
-            return;
-        }
-        // Good once, whatever this exchange comes to.
-        const code_entry e = std::move(it->second);
-        m_codes.erase(it);
-        redeemed(c, *cl, p, true, e);
+        code_entry e;
+        const code_use use = take_code(code, cl->id, e);
+        redeemed(c, *cl, p, use, e);
         return;
     }
     if (grant == "refresh_token")
@@ -2079,7 +2082,8 @@ void idp_run::refresh_grant(const std::shared_ptr<conn>& c, const client& cl, co
     int64_t expires = 0;
     const int64_t now = wall::now_sec();
     // A token of a family the account no longer keeps, or of none, as one given before families were, is spent.
-    if (family.size() != 16 || !generation || !read_family(was, newest, expires) || expires <= now)
+    if (family.size() != 16 || !generation || !read_family(was, newest, expires) || expires <= now ||
+        !who.field(std::string(signed_out_prefix) + family).empty())
     {
         json_error(c, 400, "invalid_grant", "the refresh token's sign-in has ended");
         return;
@@ -2213,7 +2217,8 @@ void idp_run::ssh_user_cert(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     const account* who = m_accounts.by_id(claim(a, "sub"));
-    if (!who || who->disabled() || who->field("reset") == "1" || !still_signed_in(*who, issued_ms(a)))
+    if (!who || who->disabled() || who->field("reset") == "1" || !still_signed_in(*who, issued_ms(a)) ||
+        grant_revoked(*who, a))
     {
         respond(c, 403, "text/plain", "the account is no longer one that may sign in\n");
         return;
@@ -2784,12 +2789,93 @@ void idp_run::device_answered(const std::shared_ptr<conn>& c, const client& cl, 
     issue_tokens(c, cl, granted, *who);
 }
 
-void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, bool found,
+code_use idp_run::take_code(const std::string& code, std::string_view client_id, code_entry& out)
+{
+    const auto it = m_codes.find(code);
+    if (it == m_codes.end() || it->second.expires + (it->second.used ? token_secs : 0) <= wall::now_sec())
+        return code_use::none;
+    code_entry& e = it->second;
+    if (!e.used)
+    {
+        // Named here, at the one shard that keeps the code, so a second exchange at any shard revokes the same grant.
+        e.grant = socketley::random_hex(8);
+        e.used = true;
+        out = e;
+        // What the marker needs is the account, the client and the grant; the rest is let go now.
+        e.redirect = {};
+        e.nonce = {};
+        e.scope = {};
+        e.challenge = {};
+        e.resource = {};
+        return code_use::first;
+    }
+    out = e;
+    // Another client bringing it is not the one the code went to, and revokes nothing; what it gave is revoked once.
+    if (e.revoked || e.client_id != client_id)
+        return code_use::again;
+    e.revoked = true;
+    return code_use::again_revoke;
+}
+
+void idp_run::revoke_grant(const code_entry& e, std::function<void()> then)
+{
+    const account* who = m_accounts.by_id(e.sub);
+    if (!who || e.grant.size() != 16)
+    {
+        then();
+        return;
+    }
+    const int64_t now = wall::now_sec();
+    LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": an authorization code of \"" + std::string(who->username()) +
+              "\" for " + e.client_id + " came again after it was exchanged; the tokens it gave are revoked").c_str());
+    // Its access tokens, the first and every one refreshed since, carry the grant as their sid, signed out until the
+    // newest of them has expired (one given just now by the first exchange, still in flight, included); its refresh
+    // family, kept or still being made, is ended by the same field.
+    field_list fields = sign_out_fields(*who, e.grant, now + token_secs + code_secs, now);
+    const std::string family = std::string(family_prefix) + e.grant;
+    if (!who->field(family).empty())
+        fields.emplace_back(family, "");
+    update_account(e.sub, std::move(fields), [then = std::move(then)](bool, const std::string&) { then(); });
+}
+
+bool idp_run::grant_revoked(const account& who, const claims& a)
+{
+    const std::string sid = claim(a, "sid");
+    return !sid.empty() && !who.field(std::string(signed_out_prefix) + sid).empty();
+}
+
+void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, code_use use,
                        const code_entry& e)
 {
-    if (!found)
+    if (use == code_use::again_revoke)
+    {
+        // RFC 6749 4.1.2: a code used twice revokes what it gave, as either exchange may be an attacker's; answered once
+        // that is written and every shard and runtime can know it.
+        std::weak_ptr<conn> weak = c;
+        // Answered here when nothing was to be written or the write failed at once, resumed when it was waited for.
+        auto inside = std::make_shared<bool>(true);
+        c->waiting = true;
+        revoke_grant(e, [this, weak, inside]
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            cc->waiting = false;
+            json_error(cc, 400, "invalid_grant", "the code was used already; the tokens it gave are revoked");
+            if (!*inside)
+                m_http.resume(cc);
+        });
+        *inside = false;
+        return;
+    }
+    if (use != code_use::first)
     {
         json_error(c, 400, "invalid_grant", "the code is not known, was used, or has expired");
+        return;
+    }
+    if (e.grant.empty())
+    {
+        json_error(c, 503, "temporarily_unavailable", "no randomness for the grant");
         return;
     }
     if (e.expires <= wall::now_sec() || e.client_id != cl.id || e.redirect != param(p, "redirect_uri"))
@@ -2844,7 +2930,7 @@ void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
     }
     // Answered from the account as it is now, which is what userinfo is for beside the token's copy.
     const account* who = m_accounts.by_id(claim(a, "sub"));
-    if (!who || who->disabled() || !still_signed_in(*who, issued_ms(a)))
+    if (!who || who->disabled() || !still_signed_in(*who, issued_ms(a)) || grant_revoked(*who, a))
     {
         json_error(c, 401, "invalid_token", "the account is no longer one that may sign in",
                    "WWW-Authenticate: Bearer error=\"invalid_token\"\r\n");
@@ -4396,16 +4482,14 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
         }
         case shard_call::redeem:
         {
-            // Good once, whatever the exchange at the asking shard comes to.
-            const auto it = m_codes.find(call.key);
-            if (it == m_codes.end())
-            {
-                mgr->requests().complete_deferred(ticket, request_status::ok, encode_code(nullptr));
-                return;
-            }
-            const std::string reply = encode_code(&it->second);
-            m_codes.erase(it);
-            mgr->requests().complete_deferred(ticket, request_status::ok, reply);
+            // Good once, whatever the exchange at the asking shard comes to; a second asks that shard to revoke the first's.
+            std::string_view client_id;
+            for (const auto& [k, v] : call.fields)
+                if (k == "client")
+                    client_id = v;
+            code_entry e;
+            const code_use use = take_code(call.key, client_id, e);
+            mgr->requests().complete_deferred(ticket, request_status::ok, encode_code(use, &e));
             return;
         }
         case shard_call::update:

@@ -3,7 +3,8 @@
 # An idp runtime of several shards: shard 0 writes the accounts, every shard reads them and signs in on the one port.
 #
 # What each part would catch:
-#   * a code given by one shard not redeemed at another, or redeemed twice by two
+#   * a code given by one shard not redeemed at another, or redeemed twice by two, or redeemed again at another
+#     shard leaving the tokens the first exchange gave standing
 #   * the shards signing with different keys, so a token one gives does not verify against the published key
 #   * a change made with idp-user, or on the account page at a reading shard, not seen at once by every shard
 #   * a reading shard losing the accounts when shard 0 folds its journal into a snapshot
@@ -133,7 +134,11 @@ if phase == "main":
     check("a signed-in browser is given a code at every shard", all(codes), True)
     got = [exchange(c) for c in codes]
     check("every code is redeemed, whichever shard gave it", [st for st, _ in got], [200] * len(codes))
-    check("and good once, at every shard", [exchange(c)[0] for c in codes[:12]], [400] * 12)
+    # The last twelve exchanged again, each at whichever shard: refused, and what each gave revoked at every shard.
+    check("and good once, at every shard", [exchange(c)[0] for c in codes[-12:]], [400] * 12)
+    check("a code exchanged again revokes the refresh token it gave, at every shard",
+          [req("POST", "/token", dict(grant_type="refresh_token", refresh_token=t["refresh_token"]), BASIC)[0] for _, t in got[-12:]], [400] * 12)
+    check("and its access token", [userinfo(t["access_token"]) for _, t in got[-12:]], [401] * 12)
     ks = keys()
     tokens = [t for _, t in got]
     bad_sig = 0

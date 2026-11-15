@@ -753,11 +753,13 @@ TEST_CASE("the shards' questions and answers come back as they were sent")
     CHECK_FALSE(decode_call("not a call", d));
     CHECK_FALSE(decode_call(encode_call(c).substr(0, cross_marker.size() + 3), d));
 
-    code_entry e{"wiki", "http://x/cb", "sub", "n", "openid", "chal", 10, 10500, 20, "https://mcp.example.com/mcp"};
-    bool found = false;
+    code_entry e{"wiki", "http://x/cb", "sub", "n", "openid", "chal", 10, 10500, 20, "https://mcp.example.com/mcp", {}, false, false};
+    e.grant = "00112233445566ff";
+    code_use use = code_use::none;
     code_entry f;
-    REQUIRE(decode_code(encode_code(&e), found, f));
-    CHECK(found);
+    REQUIRE(decode_code(encode_code(code_use::again_revoke, &e), use, f));
+    CHECK(use == code_use::again_revoke);
+    CHECK(f.grant == "00112233445566ff");
     CHECK(f.redirect == "http://x/cb");
     CHECK(f.challenge == "chal");
     CHECK(f.issued_ms == 10500);
@@ -774,8 +776,9 @@ TEST_CASE("the shards' questions and answers come back as they were sent")
     CHECK(what == device_poll::approved);
     CHECK(df.auth_time == 7);
     CHECK(df.issued_ms == 7250);
-    REQUIRE(decode_code(encode_code(nullptr), found, f));
-    CHECK_FALSE(found);
+    REQUIRE(decode_code(encode_code(code_use::first, nullptr), use, f));
+    CHECK(use == code_use::none);
+    CHECK_FALSE(decode_code(std::string(1, '\x04'), use, f));
 
     bool ok = true;
     std::string why;

@@ -10,7 +10,8 @@
 #     or wrong codes, passing the bars on them
 #   * an address's bar holding up a browser an account signed in on, or set by /token requests that guess no secret
 #   * a code redeemed twice, by another client, for another redirect, or without its PKCE verifier, or with a
-#     verifier when it was asked without a challenge (PKCE downgrade)
+#     verifier when it was asked without a challenge (PKCE downgrade); or redeemed again by its client leaving the
+#     refresh and access tokens of the first exchange standing, or brought by another client revoking them
 #   * a token that does not verify against the published key, or names the account by anything but its id
 #   * a refresh for an account disabled, signed out everywhere or made to reset its password since
 #   * a refresh token good more than once, or one used again leaving its sign-in standing
@@ -241,10 +242,10 @@ if phase == "main":
               (alice_id, "alice", "Alice A", "alice@example.com", ["admins"], "n-123"))
     except Exception as e:
         check("the id token verifies against the published key", repr(e), "")
-    check("a code is good once", exchange(p.get("code"))[0], 400)
-
     st, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + t.get("access_token", "")})
     check("userinfo answers for the access token", (st, json.loads(body).get("sub") if st == 200 else None), (200, alice_id))
+    # Exchanged again below, which revokes t: its tokens are not used past here.
+    check("a code is good once", exchange(p.get("code"))[0], 400)
 
     st, body, h = req("GET", "/authorize" + q(**dict(auth, state="again")), cookie=cookie)
     check("a signed-in browser is sent straight back with a code", (st, bool(code_of(h)[0].get("code"))), (302, True))
@@ -257,6 +258,32 @@ if phase == "main":
     st, body, h = req("GET", "/authorize" + q(**dict(auth, state="downgrade")), cookie=cookie)
     st, body, _ = exchange(code_of(h)[0].get("code"), extra=dict(code_verifier="d" * 64))
     check("a verifier for a code asked without a challenge gets nothing", (st, json.loads(body).get("error")), (400, "invalid_grant"))
+
+    # A code exchanged twice: the second is refused and revokes what the first gave (RFC 6749 4.1.2, RFC 9700 4.2.4),
+    # its refresh token and its access token, while another sign-in's tokens stand.
+    st, body, h = req("GET", "/authorize" + q(**dict(auth, state="beside")), cookie=cookie)
+    beside = json.loads(exchange(code_of(h)[0].get("code"))[1] or "{}")
+    st, body, h = req("GET", "/authorize" + q(**dict(auth, state="twice")), cookie=cookie)
+    twice = code_of(h)[0].get("code")
+    st, body, _ = exchange(twice)
+    tw = json.loads(body) if st == 200 else {}
+    check("a code exchanged gives tokens", (st, "refresh_token" in tw), (200, True))
+    st, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + tw.get("access_token", "")})
+    check("whose access token is taken", st, 200)
+    st, body, _ = req("POST", "/token", dict(grant_type="authorization_code", code=twice, redirect_uri=CB, client_id="spa"))
+    check("the code brought by another client is refused, revoking nothing", (st, json.loads(body).get("error")), (400, "invalid_grant"))
+    st, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + tw.get("access_token", "")})
+    check("so its access token is still taken", st, 200)
+    st, body, _ = exchange(twice)
+    check("the same code exchanged again is refused", (st, json.loads(body).get("error")), (400, "invalid_grant"))
+    st, body, _ = req("POST", "/token", dict(grant_type="refresh_token", refresh_token=tw.get("refresh_token", "")), basic("wiki", "wikisecret"))
+    check("and the refresh token the first gave refreshes no more", (st, json.loads(body).get("error")), (400, "invalid_grant"))
+    st, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + tw.get("access_token", "")})
+    check("nor is its access token taken", st, 401)
+    st, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + beside.get("access_token", "")})
+    check("while another code's access token still is", st, 200)
+    st, body, _ = req("POST", "/token", dict(grant_type="refresh_token", refresh_token=beside.get("refresh_token", "")), basic("wiki", "wikisecret"))
+    check("and its refresh token refreshes", st, 200)
 
     # A public client: PKCE or nothing.
     pub = dict(client_id="spa", redirect_uri="http://localhost:5173/cb", response_type="code", scope="openid offline_access")

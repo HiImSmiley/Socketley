@@ -180,8 +180,15 @@ private:
                      std::string_view family, uint64_t generation);
     // A refresh token exchanged: the next of its family given, and the family ended when one before the newest comes.
     void refresh_grant(const std::shared_ptr<conn>& c, const client& cl, const claims& r, const account& who);
-    // An authorization code exchanged, once the shard that gave it has handed over its entry.
-    void redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, bool found, const code_entry& e);
+    // An authorization code exchanged, once the shard that gave it has said what it was and handed over its entry.
+    void redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, code_use use, const code_entry& e);
+    // The code `code` taken for an exchange by `client_id` at the shard that gave it: its first exchange marks it used
+    // and names its grant, a later one by the client it was given to is told to revoke that grant, once.
+    code_use take_code(const std::string& code, std::string_view client_id, code_entry& out);
+    // The tokens a code reused gave revoked: its access tokens' sid signed out and its refresh family ended.
+    void revoke_grant(const code_entry& e, std::function<void()> then);
+    // Whether the tokens of the grant an access token's `sid` names were revoked since.
+    static bool grant_revoked(const account& who, const claims& a);
 
     // Whether `password` is the account's, on the hash pool, with `then` called on the loop.
     void check_password(const account* who, std::string_view password, std::function<void(bool)> then);

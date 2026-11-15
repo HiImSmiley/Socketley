@@ -30,6 +30,22 @@ struct code_entry
     int64_t expires{0};
     // The resource server its access token is for, empty for the client itself.
     std::string resource;
+    // Once exchanged: the 16 hex digits its tokens carry, as the refresh family and as the access token's `sid`, by
+    // which a second exchange of the code revokes them (RFC 6749 4.1.2, RFC 9700 4.2.4).
+    std::string grant;
+    // Exchanged once already, the entry kept as a marker of that until its tokens have expired, and what it gave revoked.
+    bool used{false};
+    bool revoked{false};
+};
+
+// What a code brought to the token endpoint is: not known, its first exchange, or one exchanged before, whose tokens
+// are revoked by this exchange (`again_revoke`, once, and only for the client it was given to) or were already.
+enum class code_use : uint8_t
+{
+    none         = 0,
+    first        = 1,
+    again        = 2,
+    again_revoke = 3,
 };
 
 // A device grant (RFC 8628) waiting for its person, kept by the shard its user code names.
@@ -107,9 +123,9 @@ std::string encode_call(const shard_call& c);
 // False when it is not one.
 bool decode_call(std::string_view in, shard_call& out);
 
-// A redeem's answer: the code's entry, or none when it is not known, was used or has gone.
-std::string encode_code(const code_entry* e);
-bool decode_code(std::string_view in, bool& found, code_entry& out);
+// A redeem's answer: what the code was, with its entry unless it is not known or has gone.
+std::string encode_code(code_use use, const code_entry* e);
+bool decode_code(std::string_view in, code_use& use, code_entry& out);
 
 // A device poll's answer: what it came to, and for an approved grant the account, its scope and when it signed in;
 // a peek's, pending with the client and scope of a grant still waiting.
