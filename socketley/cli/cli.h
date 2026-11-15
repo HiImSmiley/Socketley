@@ -6,6 +6,12 @@
 #include "../shared/util/version.h"
 
 int cli_dispatch(int argc, char** argv);
+// A reply on stdout in one write(2), anything printed before it first.  Through stdio, text past its 4 KiB buffer
+// reached the pipe in pieces, and a reader that had what it wanted and left -- grep -q, head -1 -- killed this
+// process with SIGPIPE between two of them: under `set -o pipefail` a reply holding the line read as one without it.
+void cli_print(std::string_view text);
+// The same, with a newline after a reply that does not end in one.
+void cli_print_line(std::string_view text);
 // Whether a daemon of this user's serves the socket, started where none does unless `start` is false, and said on
 // stderr where it is refused: nothing is sent to whatever else holds the path.
 bool ensure_daemon(bool start = true);

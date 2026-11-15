@@ -56,9 +56,8 @@ int ask(const std::string& command)
     const int rc = ipc_send(command, data);
     if (rc < 0)
         return ipc_report_failure(rc);
-    std::cout << data;
-    if (!data.empty() && data.back() != '\n')
-        std::cout << "\n";
+    if (!data.empty())
+        cli_print_line(data);
     return rc != 0 || data.starts_with("error") ? 1 : 0;
 }
 
@@ -436,7 +435,7 @@ int cli_mail_send(int argc, char** argv)
         const int rc = deliver(argv[2], c, reply);
         if (rc < 0)
             return ipc_report_failure(rc);
-        std::cout << reply << (reply.ends_with('\n') ? "" : "\n");
+        cli_print_line(reply);
         return rc != 0 || reply.starts_with("error") ? 1 : 0;
     }
 
@@ -459,7 +458,7 @@ int cli_mail_send(int argc, char** argv)
         }
         if (rc != 0 || out.starts_with("error") || out.starts_with("usage") || out.starts_with("no "))
         {
-            std::cout << out << (out.ends_with('\n') ? "" : "\n");
+            cli_print_line(out);
             return false;
         }
         return true;
@@ -661,7 +660,7 @@ int cli_mail_send(int argc, char** argv)
         const int rc = deliver(argv[2], m, reply);
         if (rc < 0)
             return ipc_report_failure(rc);
-        std::cout << reply << (reply.ends_with('\n') ? "" : "\n");
+        cli_print_line(reply);
         return rc != 0 || !reply.starts_with("queued") ? 1 : 0;
     }
 
@@ -960,7 +959,7 @@ int cli_mail(int argc, char** argv)
             return ipc_report_failure(rc);
         else if (rc != 0 || !out.starts_with("job "))
         {
-            std::cout << out << (out.ends_with('\n') ? "" : "\n");
+            cli_print_line(out);
             return 1;
         }
         std::string poll = "mail ";
@@ -976,7 +975,7 @@ int cli_mail(int argc, char** argv)
                 return ipc_report_failure(rc);
             if (rc == 0 && st.starts_with("running"))
                 continue;
-            std::cout << st << (st.ends_with('\n') ? "" : "\n");
+            cli_print_line(st);
             return rc != 0 || st.starts_with("error") ? 1 : 0;
         }
     }
@@ -993,7 +992,7 @@ int cli_mail(int argc, char** argv)
         }
         if (ipc_send("idp-user " + std::string(socketley::json::string_of(cfg, "idp")) + " list", list) != 0)
         {
-            std::cout << list;
+            cli_print(list);
             return 1;
         }
         std::string users;

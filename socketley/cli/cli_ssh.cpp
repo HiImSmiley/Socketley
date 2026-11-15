@@ -195,7 +195,7 @@ int cli_idp_ssh(int argc, char** argv)
             return ipc_report_failure(rc);
         if (rc != 0 || data.starts_with("error: "))
         {
-            std::cout << data << (data.ends_with('\n') ? "" : "\n");
+            cli_print_line(data);
             return rc ? rc : 1;
         }
         const std::string out = cert_path_of(pub);

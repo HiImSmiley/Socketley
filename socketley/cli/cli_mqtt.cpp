@@ -105,7 +105,7 @@ int cli_mqtt_pub(int argc, char** argv)
     const int rc = ipc_send(cmd, data);
     if (rc < 0)
         return ipc_report_failure(rc);
-    std::cout << data;
+    cli_print(data);
     return rc;
 }
 
@@ -138,7 +138,7 @@ int cli_mqtt_sub(int argc, char** argv)
         return ipc_report_failure(rc);
     if (rc != 0)
     {
-        std::cout << data;
+        cli_print(data);
         return rc;
     }
     const std::string ids = data.substr(0, data.find('\n'));
@@ -161,7 +161,7 @@ int cli_mqtt_sub(int argc, char** argv)
         }
         if (rc != 0)
         {
-            std::cout << data;
+            cli_print(data);
             result = rc;
             break;
         }

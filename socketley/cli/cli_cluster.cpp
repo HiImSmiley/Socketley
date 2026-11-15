@@ -425,7 +425,7 @@ int cluster_raft_verb(int argc, char** argv)
     if (rc < 0)
         return ipc_report_failure(rc);
     if (!data.empty())
-        std::cout << data;
+        cli_print(data);
     if (rc != 0 || applied.empty())
         return rc;
     return wait_applied(applied);

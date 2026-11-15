@@ -11,6 +11,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <csignal>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
@@ -183,6 +185,31 @@ bool ensure_daemon(bool start)
 
     std::cerr << "failed to start daemon\n";
     return false;
+}
+
+void cli_print(std::string_view text)
+{
+    std::cout.flush();
+    std::fflush(stdout);
+    while (!text.empty())
+    {
+        const ssize_t n = ::write(STDOUT_FILENO, text.data(), text.size());
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return;
+        text.remove_prefix(static_cast<size_t>(n));
+    }
+}
+
+void cli_print_line(std::string_view text)
+{
+    if (text.ends_with('\n'))
+        return cli_print(text);
+    std::string line;
+    line.reserve(text.size() + 1);
+    line.append(text).push_back('\n');
+    cli_print(line);
 }
 
 static int settle_startup(int rc, std::string& data);
@@ -427,7 +454,7 @@ int cli_dispatch(int argc, char** argv)
                               << daemon_handler::socket_path << "\n";
                     return 2;
                 }
-                std::cout << data;
+                cli_print(data);
                 return rc;
             }
 
@@ -679,7 +706,7 @@ int cli_dispatch(int argc, char** argv)
                 return ipc_report_failure(rc);
             rc = settle_startup(rc, data);
             if (!data.empty())
-                std::cout << data;
+                cli_print(data);
             return rc;
         }
 
@@ -929,7 +956,7 @@ int cli_forward(int argc, char** argv)
         exit_code = settle_startup(exit_code, data);
 
     if (!data.empty())
-        std::cout << data;
+        cli_print(data);
 
     return exit_code;
 }
@@ -1003,7 +1030,7 @@ int cli_db_backup(int argc, char** argv)
         return ipc_report_failure(rc);
     if (rc != 0 || !data.starts_with("job "))
     {
-        std::cout << data;
+        cli_print(data);
         return rc ? rc : 2;
     }
     const std::string job = data.substr(4, data.find('\n') - 4);
@@ -1019,7 +1046,7 @@ int cli_db_backup(int argc, char** argv)
             return ipc_report_failure(rc);
         if (rc != 0)
         {
-            std::cout << data;
+            cli_print(data);
             return rc;
         }
         if (data.starts_with("done "))
@@ -1244,7 +1271,7 @@ int cli_import(int argc, char** argv)
         return ipc_report_failure(exit_code);
 
     if (!data.empty())
-        std::cout << data;
+        cli_print(data);
 
     return exit_code;
 }
@@ -1603,7 +1630,7 @@ int cli_runtime_action(int argc, char** argv)
         return ipc_report_failure(exit_code);
 
     if (!data.empty())
-        std::cout << data;
+        cli_print(data);
 
     return exit_code;
 }

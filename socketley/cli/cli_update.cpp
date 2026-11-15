@@ -347,7 +347,7 @@ int install_and_restart(const std::string& path, const std::string& from, const 
             {
                 std::string data;
                 if (socketley::daemon_request(daemon_handler::socket_path, "ls", data) == 0)
-                    std::cout << data;
+                    cli_print(data);
                 return 0;
             }
             ::usleep(100000);
