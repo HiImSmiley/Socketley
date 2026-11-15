@@ -137,11 +137,12 @@ if out != "no node":
 img_js = script.decode("utf-8", "replace")
 img_js = img_js[img_js.find("function imageUrl"):img_js.find("function cleanHtml(")] if "function imageUrl" in img_js else ""
 harness = img_js + r"""
-const base = 'https://mail.example.test/', cids = { part1: '/jmap/download/a/b/x.png' };
+const here = 'https://mail.example.test', cids = { part1: '/jmap/download/a/b/x.png' };
 const cases = [['\x01https://tracker.test/1.gif', false], ['\\\\tracker.test/2.gif', false], ['/\\tracker.test/3.gif', false],
   ['/\n/tracker.test/4.gif', false], [' \x1f//tracker.test/5.gif\x02', false], ['https://ok.test/6.png', true],
-  ['http://ok.test/7.png', true], ['cid:<Part1>', false], ['/jmap/download/a/b/y.png', false], ['data:image/png;base64,AA', false]];
-console.log(JSON.stringify(cases.map(([v, images]) => imageUrl(v, images, cids, base))));
+  ['http://ok.test/7.png', true], ['cid:<Part1>', false], ['/jmap/download/a/b/y.png', true], ['data:image/png;base64,AA', false],
+  ['https://mail.example.test/jmap/download/a/b/z.png', true], ['data:image/svg+xml,<svg/>', true], ['cid:__proto__', true]];
+console.log(JSON.stringify(cases.map(([v, images]) => imageUrl(v, images, cids, here))));
 """
 try:
     out = json.loads(subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20).stdout) if img_js else None
@@ -152,15 +153,120 @@ except (ValueError, subprocess.SubprocessError):
 if out != "no node":
     check("with images blocked a remote image hidden by a control character, a backslash or a newline is dropped and counted",
           out and all(o["url"] is None and o["remote"] for o in out[:5]), out)
-    check("a shown one goes by https, and a cid, one of here and data: are kept", out and
+    check("a shown one goes by https, and a cid and a data: image are kept", out and
           out[5]["url"] == "https://ok.test/6.png" and out[6]["url"] == "https://ok.test/7.png" and
-          out[7]["url"] == "/jmap/download/a/b/x.png" and out[8]["url"] == "https://mail.example.test/jmap/download/a/b/y.png" and
-          out[9]["url"] == "data:image/png;base64,AA" and not any(o["remote"] for o in out[7:]), out)
+          out[7]["url"] == "/jmap/download/a/b/x.png" and out[9]["url"] == "data:image/png;base64,AA" and
+          not any(o["remote"] for o in out[7:]), out)
+    check("but no address of the page's own origin, whose GET would carry the reader's cookie, nor an SVG by data:, nor a cid "
+          "that names no part", out and all(o["url"] is None for o in out[8:9] + out[10:]), out)
 clean_js = script.decode("utf-8", "replace")
-clean_js = clean_js[clean_js.find("function cleanHtml("):clean_js.find("// The quotes of what a reply answers")]
-check("an SVG animation, which could set an href, is taken out, and the frame refuses remote images while they are blocked",
-      ",animate,set,animateMotion,animateTransform," in clean_js and
+clean_js = clean_js[clean_js.find("const FRAME_CSS"):clean_js.find("// The quotes of what a reply answers")]
+check("the frame refuses remote images while they are blocked, whatever the cleaning missed",
       "Content-Security-Policy\" content=\"img-src \\'self\\' data: blob:\"" in clean_js, clean_js[:200])
+# The cleaner itself, as the page runs it, in a headless Chromium where there is one (SOCKETLEY_TEST_CHROME names it):
+# a selection of known-bad markup from the OWASP cheat sheets, html5sec.org and the mutation XSS reports, each cleaned
+# and shown as the page shows it, in a frame with the page's sandbox and srcdoc. The full corpus is kept outside the
+# repository; these are the families it covers.
+import glob, os, shutil, tempfile, threading, http.server, socketserver, html as _html
+chrome = os.environ.get("SOCKETLEY_TEST_CHROME") or next((shutil.which(n) for n in ("chrome-headless-shell", "chromium",
+         "chromium-browser", "google-chrome") if shutil.which(n)), None) or next(iter(sorted(glob.glob(
+         # The user's own home, as the test runs under a HOME of its own.
+         __import__("pwd").getpwuid(os.getuid()).pw_dir + "/.cache/ms-playwright/chromium_headless_shell-*/*/chrome-headless-shell"))), None)
+sandbox = (re.search(r"el\('iframe', \{ sandbox: '([^']*)'", script.decode("utf-8", "replace")) or [None, None])[1]
+BAD = ['<script>parent.HIT()</script>', '<img src=x onerror="parent.HIT()">', '<svg onload="parent.HIT()"><a href="javascript:parent.HIT()"><text>x</text></a></svg>',
+       '<a href="&#x6A&#x61&#x76&#x61&#x73&#x63&#x72&#x69&#x70&#x74&#x3A;parent.HIT()">x</a>', '<a href="jav&#x09;ascript:parent.HIT()">x</a>',
+       '<a href="data:text/html;base64,PHNjcmlwdD5wYXJlbnQuSElUKCk8L3NjcmlwdD4=">x</a>', '<a href="livescript:x">x</a>', '<a href="/~mail/session">x</a>',
+       '<form action="javascript:parent.HIT()"><button formaction="javascript:parent.HIT()">x</button></form>',
+       '<iframe srcdoc="&lt;script&gt;parent.parent.HIT()&lt;/script&gt;"></iframe>', '<meta http-equiv="refresh" content="0;url=javascript:parent.HIT()">',
+       '<base href="javascript:parent.HIT()//"><a href="x">x</a>', '<math href="javascript:parent.HIT()">x</math>',
+       '<details open ontoggle="parent.HIT()">x</details>', '<object data="javascript:parent.HIT()"></object>', '<isindex action="javascript:parent.HIT()">',
+       '<map name=m><area href="javascript:parent.HIT()" target=_top></map>', '<img src=x name=head><img src=x name=body>',
+       '<noscript><p title="</noscript><img src=x onerror=parent.HIT()>">', '<svg></p><style><a id="</style><img src=1 onerror=parent.HIT()>">',
+       '<form><math><mtext></form><form><mglyph><style></math><img src onerror=parent.HIT()>',
+       '<math><mtext><table><mglyph><style><!--</style><img title="--&gt;&lt;img src=1 onerror=parent.HIT()&gt;">',
+       '<plaintext><img src=x onerror=parent.HIT()>', '<template><img src=x onerror=parent.HIT()></template>',
+       '<img src="https://tracker.test/a.gif"><div style="background:u\\72l(https://tracker.test/b.gif)">x</div>',
+       '<style>@import "https://tracker.test/c.css";li{list-style:url(https://tracker.test/d.gif)}</style><li>x</li>',
+       '<table background="https://tracker.test/e.gif"><tr><td background="https://tracker.test/f.gif">x</td></tr></table>',
+       '<img src="/jmap/download/x">']
+GOOD = ['<table width="600" bgcolor="#ffcc00" cellpadding="4"><tr><td style="color:#333" align="center"><a href="https://shop.test/x?a=1&amp;b=2">Buy</a></td></tr></table>',
+        '<p><img src="cid:part1" alt="logo"> <a href="mailto:bob@example.test">mail</a> <a href="#top">top</a></p>',
+        '<blockquote type="cite"><div class="gmail_quote">quoted</div></blockquote><style>.x{color:red}</style><span class="x">red</span>']
+if chrome and sandbox:
+    page_js = r"""
+window.HITS = []; window.HIT = () => HITS.push(window.CUR);
+%s
+const BAD = %s, GOOD = %s, SANDBOX = %s, cids = { part1: '/jmap/download/a/b/x.png' };
+// A CSS function that would fetch the tracker; the cleaner leaves none( where one was.
+const FETCH = /(url|image-set|image|src|cross-fade|element|@import)\s*\(?\s*['"]?[^;)]*tracker/i;
+function scan(d) {
+  const bad = [];
+  for (const e of d.body.querySelectorAll('*')) {
+    if (/^(script|iframe|frame|object|embed|form|meta|base|link|area|isindex|svg|math|template|noscript|plaintext|button|input)$/.test(e.localName)) bad.push(e.localName);
+    for (const a of e.attributes) {
+      const v = a.value.replace(/[\u0000- ]/g, '');
+      if (a.name.startsWith('on') || a.name === 'name' && e.localName !== 'a' || a.name === 'formaction' || a.name === 'srcdoc') bad.push(a.name);
+      if (a.name === 'href' && !/^(https?:|mailto:|tel:|#)/i.test(v)) bad.push('href ' + v.slice(0, 30));
+      if (/^(src|background|href)$/.test(a.name) && v.startsWith(location.origin)) bad.push('own origin ' + a.name);
+      if (/^(src|background)$/.test(a.name) && /tracker/.test(v)) bad.push('remote ' + a.name);
+      if (a.name === 'style' && FETCH.test(v)) bad.push('remote style');
+      if (a.name === 'target' && v !== '_blank') bad.push('target ' + v);
+    }
+  }
+  if (FETCH.test([...d.querySelectorAll('style')].map(s => s.textContent).join(''))) bad.push('remote css');
+  const b1 = d.body.innerHTML, d2 = new DOMParser().parseFromString('<!doctype html><body>' + b1, 'text/html');
+  if (d2.body.innerHTML !== b1) bad.push('changes when parsed again');
+  return bad;
+}
+async function show(src) {
+  const c = cleanHtml(src, false, cids), f = document.createElement('iframe');
+  f.setAttribute('sandbox', SANDBOX);
+  await new Promise(res => { f.onload = res; f.srcdoc = c.doc; document.body.append(f); setTimeout(res, 1500); });
+  const d = f.contentDocument, out = { bad: scan(d), body: d.body.innerHTML, css: [...d.querySelectorAll('style')].map(s => s.textContent).join(''), blocked: c.blocked };
+  f.remove();
+  return out;
+}
+(async () => {
+  const bad = [], good = [];
+  for (let i = 0; i < BAD.length; ++i) { window.CUR = i; bad.push((await show(BAD[i])).bad); }
+  for (const g of GOOD) good.push(await show(g));
+  document.getElementById('out').textContent = 'RESULTS' + JSON.stringify({ bad, good, hits: HITS }) + 'END';
+})();
+""" % (clean_js, json.dumps(BAD).replace("<", "\\u003c"), json.dumps(GOOD).replace("<", "\\u003c"), json.dumps(sandbox))
+    doc = ('<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out"></pre><script>' + page_js +
+           '</script></body></html>').encode()
+    class Page(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(doc))); self.end_headers(); self.wfile.write(doc)
+        def log_message(self, *a):
+            pass
+    srv = socketserver.TCPServer(("127.0.0.1", 0), Page)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    ud = tempfile.mkdtemp(prefix="webmail-chrome-")
+    args = [chrome, "--no-sandbox", "--disable-gpu", "--user-data-dir=" + ud, "--virtual-time-budget=120000", "--dump-dom",
+            "http://127.0.0.1:%d/" % srv.server_address[1]]
+    if not chrome.endswith("chrome-headless-shell"):
+        args.insert(1, "--headless=new")
+    try:
+        dom = subprocess.run(args, capture_output=True, text=True, timeout=180).stdout
+    except subprocess.SubprocessError as e:
+        dom = str(e)
+    srv.shutdown(); shutil.rmtree(ud, ignore_errors=True)
+    m = re.search(r"RESULTS(\{.*?\})END", _html.unescape(dom), re.S)
+    res = json.loads(m.group(1)) if m else None
+    check("in a browser, the cleaner leaves nothing of %d known-bad pieces that runs, submits, embeds, clobbers, reaches "
+          "the page's origin or a remote address, or parses again into something else" % len(BAD),
+          res and not res["hits"] and all(not b for b in res["bad"]),
+          res and [(BAD[i][:60], b) for i, b in enumerate(res["bad"]) if b] or dom[-300:])
+    g = res and res["good"]
+    check("and keeps what mail is made of: tables and their colours, a web link opening apart, a cid image, mailto, a "
+          "place in the message, quotes as the folding finds them and a style element's CSS", g and
+          'bgcolor="#ffcc00"' in g[0]["body"] and 'href="https://shop.test/x?a=1&amp;b=2"' in g[0]["body"] and
+          'target="_blank"' in g[0]["body"] and 'style="color:#333"' in g[0]["body"].replace(" ", "") and
+          'src="/jmap/download/a/b/x.png"' in g[1]["body"] and 'href="mailto:bob@example.test"' in g[1]["body"] and
+          'href="#top"' in g[1]["body"] and 'blockquote type="cite"' in g[2]["body"] and 'class="gmail_quote"' in g[2]["body"]
+          and ".x{color:red}" in g[2]["css"].replace(" ", "") and not any(x["bad"] for x in g), g)
 st2, _, body2 = web("GET", "/", headers={"If-None-Match": h.get("etag", "x")})
 check("a browser's copy is answered 304", st2 == 304 and not body2, st2)
 

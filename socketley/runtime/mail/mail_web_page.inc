@@ -539,44 +539,99 @@ function cssClean(t, images) {
   if (!images) t = t.replace(CSS_FETCH, () => { blocked++; return 'none('; });
   return { css: t.replace(/</g, '\\3c '), blocked };
 }
-// What an image's URL in a message is shown as: a cid its part, one of here, data: or blob: as it is, another only while
-// images are shown; read as the browser reads it, so no control character or backslash hides where it goes.
-function imageUrl(v, images, cids, base) {
+// What an image's URL in a message is shown as: a cid its part, a data: image as it is, a web address only while
+// images are shown; read as the browser reads it, so no control character or backslash hides where it goes. Nothing of
+// this page's own origin: a message has no business there, and a GET of it would carry the reader's cookie.
+function imageUrl(v, images, cids, here) {
   v = v.replace(/^[\u0000- ]+|[\u0000- ]+$/g, '');
-  if (/^cid:/i.test(v)) return { url: cids[v.slice(4).replace(/^<|>$/g, '').toLowerCase()] || null, remote: false };
+  if (/^cid:/i.test(v)) { const k = v.slice(4).replace(/^<|>$/g, '').toLowerCase(); return { url: Object.prototype.hasOwnProperty.call(cids, k) ? cids[k] : null, remote: false }; }
+  // A part's address put in by a pass before, read again.
+  for (const k in cids) if (Object.prototype.hasOwnProperty.call(cids, k) && cids[k] === v) return { url: v, remote: false };
   let u = null;
-  try { u = new URL(v, base); } catch (e) { return { url: null, remote: false }; }
-  if (u.protocol === 'data:' || u.protocol === 'blob:' || u.origin === new URL(base).origin) return { url: u.href, remote: false };
-  const web = /^https?:$/.test(u.protocol);
+  try { u = new URL(v, here + '/'); } catch (e) { return { url: null, remote: false }; }
+  if (u.protocol === 'data:') return { url: /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(u.href) ? u.href : null, remote: false };
+  const web = /^https?:$/.test(u.protocol) && u.origin !== here;
   return { url: images && web ? u.href.replace(/^http:/, 'https:') : null, remote: web };
 }
-function cleanHtml(html, images, cids) {
-  const d = new DOMParser().parseFromString(html, 'text/html');
-  d.querySelectorAll('script,iframe,frame,frameset,object,embed,applet,form,input,button,select,textarea,meta,link,base,noscript,template,portal,dialog,animate,set,animateMotion,animateTransform,discard').forEach(e => e.remove());
-  let blocked = 0;
-  const urlish = /^(href|src|action|formaction|background|poster|srcset|xlink:href|data|lowsrc|dynsrc|cite|longdesc|ping)$/;
-  for (const e of d.querySelectorAll('*')) {
-    for (const a of [...e.attributes]) {
-      const n = a.name.toLowerCase(), v = a.value.replace(/[\u0000- ]/g, '');
-      if (n.startsWith('on') || n === 'srcdoc' || n === 'formaction' || n === 'ping') { e.removeAttribute(a.name); continue; }
-      if (urlish.test(n) && /^(javascript|vbscript|data:(?!image\/(png|gif|jpe?g|webp);))/i.test(v)) e.removeAttribute(a.name);
-    }
-    if (e.localName === 'a' && e.hasAttribute('href')) { e.setAttribute('target', '_blank'); e.setAttribute('rel', 'noopener noreferrer'); }
-    for (const at of /^(image|use|feimage)$/.test(e.localName.toLowerCase()) ? ['src', 'background', 'poster', 'href', 'xlink:href'] : ['src', 'background', 'poster']) {
-      if (!e.hasAttribute(at)) continue;
-      const c = imageUrl(e.getAttribute(at), images, cids, location.href);
-      if (c.url) e.setAttribute(at, c.url); else { e.removeAttribute(at); if (c.remote) blocked++; }
-    }
-    if (e.hasAttribute('srcset') && !images) { e.removeAttribute('srcset'); blocked++; }
-    const st = e.getAttribute('style');
-    if (st) { const c = cssClean(st, images); blocked += c.blocked; if (c.css !== st) e.setAttribute('style', c.css); }
-  }
+// A link's address: the web, mail and telephone, or a place in the message; any other scheme, and an address relative
+// to this page, is no link.
+function linkUrl(v, here) {
+  v = v.replace(/^[\u0000- ]+|[\u0000- ]+$/g, '');
+  if (/^#[^\u0000-\u001f]*$/.test(v)) return v;
+  let u = null;
+  try { u = new URL(v, here + '/'); } catch (e) { return null; }
+  return /^(https?|mailto|tel):$/.test(u.protocol) && u.origin !== here ? u.href : null;
+}
+// The HTML a message may show, by allowlist (OWASP's HTML sanitization): these elements and attributes, nothing else.
+// An element not named is taken out and what it holds kept, but these go with all they hold: what runs, embeds or
+// submits, what the parser reads by other rules (SVG and MathML, raw text, templates), so the cleaned document parses
+// again into what was checked.
+const MAIL_KEEP = new Set(('a abbr acronym address article aside b bdi bdo big blockquote br caption center cite code col colgroup dd del details dfn ' +
+  'div dl dt em figcaption figure font footer h1 h2 h3 h4 h5 h6 header hgroup hr i img ins kbd li main mark nav ol p pre q rp rt ruby s samp ' +
+  'section small span strike strong sub summary sup table tbody td tfoot th thead time tr tt u ul var wbr').split(' '));
+const MAIL_DROP = 'script,style,template,noscript,noembed,noframes,xmp,plaintext,textarea,title,iframe,frame,frameset,object,embed,applet,' +
+  'svg,math,select,option,optgroup,datalist,input,button,meter,progress,output,video,audio,source,track,canvas,map,area,portal,dialog,' +
+  'head,meta,link,base,param,slot,image,isindex,keygen,menuitem';
+const MAIL_ATTRS = new Set('align bgcolor border class color dir height id lang style title valign width'.split(' '));
+const MAIL_ATTRS_OF = {
+  a: ['href', 'name'], img: ['alt', 'src', 'hspace', 'vspace'], font: ['face', 'size'], ol: ['start', 'reversed', 'type'], ul: ['type'],
+  li: ['type', 'value'], blockquote: ['type'], table: ['background', 'cellpadding', 'cellspacing', 'frame', 'rules', 'summary'],
+  td: ['abbr', 'axis', 'background', 'colspan', 'headers', 'nowrap', 'rowspan', 'scope'], col: ['span'], colgroup: ['span'],
+  details: ['open'], del: ['datetime'], ins: ['datetime'], time: ['datetime'], hr: ['noshade', 'size']
+};
+MAIL_ATTRS_OF.th = MAIL_ATTRS_OF.td;
+// One pass of the allowlist over the parsed document; the CSS of its style elements is taken out first, and returned.
+function cleanOnce(d, images, cids, counts) {
+  for (const e of [...d.querySelectorAll('svg,math')]) e.remove();
   let css = '';
   for (const s of d.querySelectorAll('style')) {
     const c = cssClean(s.textContent, images);
-    blocked += c.blocked;
-    css += c.css + '\n'; s.remove();
+    counts.blocked += c.blocked;
+    css += c.css + '\n';
   }
+  for (const e of [...d.querySelectorAll(MAIL_DROP)]) e.remove();
+  for (const e of [...(d.body ? d.body.querySelectorAll('*') : [])]) {
+    if (e.namespaceURI !== 'http://www.w3.org/1999/xhtml') { e.remove(); continue; }
+    const tag = e.localName;
+    if (!MAIL_KEEP.has(tag)) { e.replaceWith(...e.childNodes); continue; }
+    const own = MAIL_ATTRS_OF[tag] || [];
+    for (const a of [...e.attributes]) {
+      const n = a.name.toLowerCase();
+      if (a.namespaceURI || !(MAIL_ATTRS.has(n) || own.includes(n))) e.removeAttribute(a.name);
+    }
+    if (tag === 'a') {
+      if (e.hasAttribute('href')) {
+        const to = linkUrl(e.getAttribute('href'), location.origin);
+        if (to === null) e.removeAttribute('href');
+        else { e.setAttribute('href', to); if (!to.startsWith('#')) { e.setAttribute('target', '_blank'); e.setAttribute('rel', 'noopener noreferrer'); } }
+      }
+    }
+    for (const at of ['src', 'background']) {
+      if (!e.hasAttribute(at)) continue;
+      const c = imageUrl(e.getAttribute(at), images, cids, location.origin);
+      if (c.url) e.setAttribute(at, c.url); else { e.removeAttribute(at); if (c.remote) counts.blocked++; }
+    }
+    const st = e.getAttribute('style');
+    if (st) { const c = cssClean(st, images); counts.blocked += c.blocked; if (c.css !== st) e.setAttribute('style', c.css); }
+  }
+  return css;
+}
+function cleanHtml(html, images, cids) {
+  const counts = { blocked: 0 };
+  let d = new DOMParser().parseFromString(html, 'text/html');
+  let css = cleanOnce(d, images, cids, counts);
+  // Cleaned again until parsing what came out gives what went in, so no markup that reads one way here and another in
+  // the frame (mutation on re-parse) survives.
+  for (let i = 0; i < 4; ++i) {
+    const out = d.body ? d.body.innerHTML : '';
+    const again = new DOMParser().parseFromString('<!doctype html><html><head></head><body>' + out + '</body></html>', 'text/html');
+    const before = { blocked: counts.blocked };
+    css += cleanOnce(again, images, cids, before);
+    d = again;
+    if ((d.body ? d.body.innerHTML : '') === out) break;
+    if (i === 3) d.body.textContent = '';
+  }
+  let blocked = counts.blocked;
   // A message that paints no page of its own, only dark text on white as most replies are, is shown in the page's
   // colours; one with its own backgrounds or a stylesheet that colours keeps the white it was made for.
   const white = c => c === null || (c && lumOf(c) > .92);
