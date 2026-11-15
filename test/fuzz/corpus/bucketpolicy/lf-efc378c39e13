@@ -1,0 +1,1 @@
+{"Statement":{"Effect":"Allow","Principal":{"AWS":"/"},"Action":"s8:t","Resource":"ar.:ws:s3@*"}}

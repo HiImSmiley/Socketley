@@ -1,0 +1,1 @@
+{"Statement":{"Effect":"Allow","Principal":"*","Action":["s3:PutObject","s3:GetObjec*"],"Resource":"arn:aws:s3:::pub/*","Condition":{"StringEquals":{"S3:X-Amz-Sevrre-Side-Encryption":["6","aws:kms"]},"Null":{"s3:x-amz-sӖide-ryptiosport":"true"}}}}

@@ -1,0 +1,7 @@
+$ORIGIN fuzâ”¿
+$TTL 6 
+@ SOA ns h 5 1 1 1 1
+@ NS n.4
+www CNAME @
+*.a TXT 0@A2.3.3
+www TXT 1  ns

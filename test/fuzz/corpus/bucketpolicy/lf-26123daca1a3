@@ -1,0 +1,1 @@
+{"Statement":{"Effect":"Allow","Principal":"*","Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::p*/bu","Condition":{"StringEquals":{"S3r-Sixaws:SecureTransport":"true"}}}}

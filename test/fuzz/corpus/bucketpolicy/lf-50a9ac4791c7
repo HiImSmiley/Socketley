@@ -1,0 +1,1 @@
+{ "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:?utObject*", "Resource": "s:3:ub"}]}

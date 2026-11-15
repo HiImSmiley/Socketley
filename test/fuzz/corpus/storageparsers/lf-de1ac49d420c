@@ -1,0 +1,1 @@
+ú<LifecycleConfiguration><Rule><ID>r</ID><Filter><And><Tag><Key>kz0</Key></Tag><Tag><Key>k4</Key><Value>v</Value></Tag></And></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>

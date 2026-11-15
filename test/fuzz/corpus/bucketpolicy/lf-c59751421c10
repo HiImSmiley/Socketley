@@ -1,0 +1,1 @@
+{"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::12345LIC"}, "Action": ["s3eObject"], "Resource": "arn:awsub/*"}]}

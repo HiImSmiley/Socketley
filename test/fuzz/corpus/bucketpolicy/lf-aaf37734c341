@@ -1,0 +1,1 @@
+{"Statement":{"Effect":"Allow","Principal":"*","Action":[],"Resource":"a*","Condition":{"Striool":{"aort":"true"}}}}

@@ -1,0 +1,1 @@
+{"Statement": [{"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::pub*/", "Condition":-17}]}

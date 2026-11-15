@@ -1,0 +1,1 @@
+{"Statement":{"Effect":"Allow","Principal":"*","Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::pub/j*","Condition":{"StringEquals":{"S3:X-Amz-Ser-de-Encrull":{"side-encryptiof":false},"Bz-server-side-enreTransport":"true"}}}}

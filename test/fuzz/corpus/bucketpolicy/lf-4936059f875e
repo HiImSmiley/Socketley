@@ -1,0 +1,1 @@
+{"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::pub/*", "Condition": {"Bool": {}, "NotIpAddress": {"aws:SorceIp": ["::2/128", "10.0.004"]}}}]}

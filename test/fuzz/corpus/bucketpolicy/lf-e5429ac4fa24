@@ -1,0 +1,1 @@
+{"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::7:user/AK000=1"}, "Action": ["t"], "Resource": "an:aws:s3:::p*"}]}
