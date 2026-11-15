@@ -962,14 +962,17 @@ void sync_run::body_from(const target& t, http_request& rq, const std::shared_pt
 void sync_run::carry(target& t, lane& l, const job& j)
 {
     // Opened by the path it resolves to, and only below --dir, so a link changed since it was looked at cannot
-    // point the upload anywhere else.
+    // point the upload anywhere else -- and that path is walked again by the kernel beneath the folder's own
+    // descriptor, because a second walk by name let a folder on the way be swapped for a link to anywhere between
+    // the check and the open: whoever may write in --dir had the daemon upload a file of its choosing from outside.
     std::string real;
-    if (!inside(std::string(m_rt.get_dir()) + "/" + j.path, &real))
+    if (!inside(std::string(m_rt.get_dir()) + "/" + j.path, &real) || real.size() <= m_root_real.size())
     {
         l.busy = false;
         return;
     }
-    const int raw = ::open(real.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+    const std::string below = real.substr(m_root_real == "/" ? 1 : m_root_real.size() + 1);
+    const int raw = open_beneath(m_root_fd, below, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
     struct stat st{};
     if (raw < 0 || ::fstat(raw, &st) != 0 || !S_ISREG(st.st_mode))
     {
