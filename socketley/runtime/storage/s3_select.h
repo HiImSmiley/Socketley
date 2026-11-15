@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "s3_auth.h"
+#include "../../shared/util/build_cost.h"
 
 namespace socketley::storage
 {
@@ -19,8 +20,8 @@ inline constexpr size_t select_max_record = size_t{1} << 20;
 // The longest SQL expression a request may carry, past which it fails with ExpressionTooLong.
 inline constexpr size_t select_max_expression = size_t{256} << 10;
 // What a query may spend evaluating, and a JSON record of it: this, and select_time_per_byte for each byte fed.
-inline constexpr std::chrono::milliseconds select_time_base{100};
-inline constexpr std::chrono::nanoseconds  select_time_per_byte{250};
+inline constexpr std::chrono::milliseconds select_time_base{100 * build_cpu_factor};
+inline constexpr std::chrono::nanoseconds  select_time_per_byte{250 * build_cpu_factor};
 
 enum class select_format : uint8_t { csv, json };
 enum class select_header : uint8_t { none, use, ignore };

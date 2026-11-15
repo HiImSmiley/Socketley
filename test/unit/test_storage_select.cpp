@@ -533,14 +533,14 @@ TEST_CASE("LIKE costs time linear in the value, and a pattern built to cost more
     };
     // A long literal after a % is searched for, not tried at every byte: 10,000 bytes against 512 KiB took 3 s.
     CHECK(cpu_of([&] { CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + run10k + "b'", csv_none, value) == ""); }) <
-          1.0);
+          1.0 * build_cpu_factor);
     CHECK(cpu_of([&] { CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + run10k + "'", csv_none, value) == value); }) <
-          1.0);
+          1.0 * build_cpu_factor);
     CHECK(cpu_of([&] { CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + run10k + "%'", csv_none, value) == value); }) <
-          1.0);
+          1.0 * build_cpu_factor);
     // Runs of _ have nothing to search for, so their tries are counted and a pattern that spends the count fails.
     CHECK(cpu_of([&] { CHECK(run_failure("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + blanks + "b'", csv_none, value) ==
-                             "LikeInvalidInputs"); }) < 1.0);
+                             "LikeInvalidInputs"); }) < 1.0 * build_cpu_factor);
     // A run shorter than 63 never spends it, however many there are.
     std::string many;
     for (int i = 0; i < 2000; ++i)
@@ -557,7 +557,7 @@ TEST_CASE("TRIM costs time linear in the value and the set, whichever of them is
     const auto t0 = thread_cpu_now();
     CHECK(run("SELECT TRIM(LEADING '" + set + "' FROM _1) FROM S3Object", csv_none, value) == "x\n");
     CHECK(run("SELECT TRIM(BOTH _2 FROM _1) FROM S3Object", csv_none, "\xC3\xA9xa\xC3\xA9," + set + "\xC3\xA9\n") == "x\n");
-    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0 * build_cpu_factor);
     // A set ending in a cut character holds both it and the whole one, and the value loses the one it starts with.
     CHECK(run("SELECT TRIM(LEADING '\xC3\xA9' || '\xC3' FROM _1) FROM S3Object", csv_none, "\xC3\xA9z\n") == "z\n");
     CHECK(run("SELECT TRIM(LEADING '\xC3\xA9' || '\xC3' FROM _1) FROM S3Object", csv_none, "\xC3z\n") == "z\n");
@@ -578,7 +578,7 @@ TEST_CASE("IN over text literals is a lookup, and a query that costs more than i
     // 40,000 text literals against 128 Ki records took 32 s walked one by one.
     const auto t0 = thread_cpu_now();
     const std::string hits = run(text + ",'hit')", csv_none, rows);
-    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0 * build_cpu_factor);
     CHECK(std::count(hits.begin(), hits.end(), '\n') == 132);
     CHECK(run("SELECT _1 FROM S3Object WHERE _1 NOT IN ('a', 'hit')", csv_none, rows) == "");
     CHECK(run("SELECT _1 FROM S3Object WHERE _1 IN ('x', 2)", csv_none, "2\nx\ny\n") == "2\nx\n");
