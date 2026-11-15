@@ -10128,6 +10128,16 @@ std::chrono::milliseconds proxy_instance::answer_moving_for(const proxy_client_c
     return idle < bound ? bound - idle : std::chrono::milliseconds{};
 }
 
+// Whether `conn` is still owed any of what it was sent: queued, in flight, or unacknowledged in the socket.
+bool proxy_instance::client_still_owed(const proxy_client_connection* conn, int fd)
+{
+    if (conn->write_pending || !conn->write_queue.empty() || conn->splice_in_pending || conn->splice_out_pending ||
+        tls_owes_output(conn))
+        return true;
+    const socketley::send_look l = socketley::look_at_send(fd);
+    return l.tcp && l.owed > 0;
+}
+
 void proxy_instance::arm_header_deadline(proxy_client_connection* conn)
 {
     // Already running, because the deadline dates from the first incomplete
@@ -10192,13 +10202,21 @@ void proxy_instance::response_deadline_sweep()
         remaining--;
 
         // A drain past its time ends with the read side, which completes the
-        // armed read and lets the teardown run.
+        // armed read and lets the teardown run -- by shutdown(SHUT_RD) only
+        // once the client has everything: with any of its answer still queued,
+        // in flight or unacknowledged, the next byte it sends would be answered
+        // with a reset that throws the rest away.  Then the read is withdrawn
+        // instead and the end is orderly_close's, which waits for the client to
+        // have it all, as an end without the drain always was.
         if (conn->closing && conn->ex.drain_on_close)
         {
             if (now >= conn->ex.header_deadline)
             {
                 conn->ex.drain_on_close = false;
-                shutdown(cfd, SHUT_RD);
+                if (conn->read_pending && !conn->recv_withdrawing && client_still_owed(conn, cfd))
+                    end_client_read(conn);
+                else
+                    shutdown(cfd, SHUT_RD);
             }
             else
                 still_waiting = true;

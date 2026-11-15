@@ -18,6 +18,11 @@
 #     without its deadline
 #   * fifty clients that ask to close and close get every byte first -- a
 #     close taken for the client's FIN while bytes of the answer were unsent
+#   * a client that asked to close, reads its 2 MB answer slowly and keeps
+#     sending meanwhile gets all of it and then the end -- the drain's bound
+#     counted from the answer being queued, which at a second shut the read
+#     side under megabytes still owed, so the client's next byte drew a reset
+#     that threw them away
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
@@ -118,6 +123,42 @@ OK=0
 for _ in $(seq 1 50); do [ "$(timeout 10 python3 "$WORK/close.py" "$P" go 2>&1)" = ok ] && OK=$((OK+1)); done
 if [ "$OK" = 50 ]; then pass
 else fail "50 closing clients get their whole answer" "$OK of 50"; fi
+
+# ── one that reads slowly and keeps sending ─────────────────────────────────
+# Nothing read for 2 s, so the whole answer is queued, then 32 KiB every 100 ms behind a small receive buffer: the
+# rest outlasts the drain's second by far, and the 8 bytes it sends every 50 ms find the socket shut if it was.
+cat > "$WORK/slow.py" <<'PY'
+import socket, sys, threading, time
+port, n = int(sys.argv[1]), int(sys.argv[2])
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+s.settimeout(30); s.connect(("127.0.0.1", port))
+s.sendall(b"GET /os/a/%d HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" % n)
+stop = threading.Event()
+def keep_sending():
+    while not stop.is_set():
+        try: s.send(b"xxxxxxxx")
+        except OSError: break
+        time.sleep(0.05)
+threading.Thread(target=keep_sending, daemon=True).start()
+time.sleep(2.0)
+buf, how = b"", "eof"
+try:
+    while True:
+        d = s.recv(32768)
+        if not d: break
+        buf += d
+        time.sleep(0.1)
+except ConnectionResetError: how = "reset"
+except socket.timeout: how = "timeout"
+stop.set()
+body = buf.partition(b"\r\n\r\n")[2]
+want = bytes((i * 7 + i // 251) & 0xff for i in range(n))
+print(len(body), how, "same" if body == want[:len(body)] else "corrupt")
+PY
+N=$((2 * 1024 * 1024))
+GOT=$(timeout 60 python3 "$WORK/slow.py" "$P" "$N" 2>&1 | tail -1) || true
+if [ "$GOT" = "$N eof same" ]; then pass
+else fail "a closing client that reads slowly and keeps sending gets its whole answer" "got '$GOT', want '$N eof same'"; fi
 daemon_stop
 
 
