@@ -15506,7 +15506,11 @@ and
 .B \-\-backend\-timeout
 as over TCP, and a stream whose body stops past
 .B \-\-backend\-timeout
-is reset as a cancelled request. A browser that cannot reach the UDP port goes on over TCP.
+is reset as a cancelled request. An upload over HTTP/2 or HTTP/3 that is faster
+than its backend reads is held at the stream's flow\-control window while the
+backend's queue is full, as an HTTP/1.1 upload is held by TCP, rather than reset at
+.BR \-\-write\-buffer .
+A browser that cannot reach the UDP port goes on over TCP.
 .B SOCKETLEY_PROXY_HTTP3=0
 opens no UDP socket.
 .IP
