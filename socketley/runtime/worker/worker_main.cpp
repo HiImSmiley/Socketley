@@ -43,6 +43,7 @@
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/loop/frame_writer.h"
 #include "../../shared/ipc/peer_link.h"
+#include "../../shared/ipc/send_link_server.h"
 #include "../../shared/ipc/shard_mesh.h"
 #include "../../shared/ipc/shard_target.h"
 #include "../../shared/ipc/worker_protocol.h"
@@ -1098,6 +1099,11 @@ private:
                             ::close(fd);
                         return;
                     }
+                    if (peer == socketley::send_link::marker)
+                    {
+                        adopt_send_link(fd);
+                        return;
+                    }
                     adopt_peer_link(std::move(peer), fd);
                 });
             if (!m_link_recv->attach(m_loop))
@@ -1622,6 +1628,37 @@ private:
         for (auto& e : m_peer_links)
             if (e.link)
                 f(*e.link);
+    }
+
+    // A shell's link for `socketley send`, served until the shell closes it; the ended ones are freed here, once the
+    // ring has nothing of theirs left.
+    void adopt_send_link(int fd)
+    {
+        if (!m_loop.owner_table_full())
+            std::erase_if(m_send_links, [this](const auto& l) { return l->ended() && m_loop.owner_drained(l.get()); });
+        if (m_send_links.size() >= socketley::send_link::max_links)
+        {
+            ::close(fd);
+            return;
+        }
+        // Granted without close-on-exec, and a program a script starts must not hold the shell's link open.
+        if (::fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {}
+        auto link = std::make_unique<socketley::send_link::server>(
+            fd, [this](std::string_view message) { return link_deliver(message); });
+        // Kept even when the ring refused it: it has ended then, and the next adoption frees it.
+        if (!link->attach(m_loop)) {}
+        m_send_links.push_back(std::move(link));
+    }
+
+    // What cmd_send() answers for a line, decided here because the link has no daemon in it: a sharded runtime's
+    // line is for every shard, which only the daemon reaches, so it is not taken and the shell asks the daemon.
+    uint8_t link_deliver(std::string_view message)
+    {
+        if (!m_rt || m_rt->get_state() != runtime_running || m_rt->get_shards() > 1
+            || (m_rt->get_type() != runtime_server && m_rt->get_type() != runtime_client))
+            return socketley::send_link::not_taken;
+        deliver_local(message);
+        return socketley::send_link::delivered;
     }
 
     // One link to another runtime's process, as the daemon handed it over.
@@ -2622,6 +2659,7 @@ private:
 
     int m_link_chan_fd{-1};
     std::unique_ptr<socketley::peer_link::receiver> m_link_recv;
+    std::vector<std::unique_ptr<socketley::send_link::server>> m_send_links;
 
     // One entry per routed connection this worker has sent a frame for, gone
     // when the route closes; bounded by the routes that are open, which is

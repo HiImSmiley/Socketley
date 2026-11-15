@@ -2,10 +2,13 @@
 // `socketley send <name> <message>` a request to the daemon from the shell's own process, with no program started for
 // it, and runs the socketley program for every other command as before.
 #include "shared/ipc/daemon_request.h"
+#include "shared/ipc/send_link.h"
 #include "shared/persist/paths.h"
 
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -187,6 +190,39 @@ struct kept_conn
     }
 };
 
+// A runtime's link (send_link.h), kept by name; `plain` once a link ended before it took a line, which is then asked of
+// the daemon alone, so a worker that cannot keep links does not cost every line a second exchange.
+struct kept_link
+{
+    std::string name;
+    kept_conn conn;
+    bool took = false;
+    bool plain = false;
+};
+
+// What became of a line sent on a link.
+enum class link_result { delivered, unsent, lost, silent };
+
+link_result send_on_link(int fd, std::string_view message)
+{
+    ssize_t n;
+    do
+        n = ::send(fd, message.data(), message.size(), MSG_NOSIGNAL);
+    while (n < 0 && errno == EINTR);
+    // A message on a SEQPACKET socket goes whole or not at all.
+    if (n != static_cast<ssize_t>(message.size()))
+        return link_result::unsent;
+    uint8_t st = 0;
+    do
+        n = ::recv(fd, &st, 1, 0);
+    while (n < 0 && errno == EINTR);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return link_result::silent;
+    if (n != 1)
+        return link_result::lost;
+    return st == socketley::send_link::delivered ? link_result::delivered : link_result::unsent;
+}
+
 int send_from_shell(const std::vector<std::string>& args);
 
 } // namespace
@@ -246,15 +282,66 @@ int send_from_shell(const std::vector<std::string>& args)
         return 1;
     }
 
+    // The message as cmd_send() takes it from the command: the words after the name, without the blanks around them.
+    const std::string& name = args[1];
+    std::string_view message(command);
+    message.remove_prefix(5 + name.size() + 1);
+    while (!message.empty() && (message.front() == ' ' || message.front() == '\t'))
+        message.remove_prefix(1);
+    while (!message.empty() && (message.back() == ' ' || message.back() == '\t'))
+        message.remove_suffix(1);
+
+    // A line for a runtime this shell holds a link to goes to its worker; the daemon is asked when it has none, a
+    // name the daemon would read differently, or a line too long for one message.
+    static std::vector<kept_link> links;
+    kept_link* link = nullptr;
+    if (!message.empty() && message.size() <= socketley::send_link::max_message
+        && name.find_first_of(" \t\r\n") == std::string::npos)
+    {
+        for (auto& l : links)
+            if (l.name == name)
+                link = &l;
+        if (!link)
+            link = &links.emplace_back(kept_link{name, {}, false, false});
+    }
+    // A link made through another daemon's socket is that daemon's runtime, not the one this name means now.
+    if (link && link->conn.still_ours() && link->conn.path != path)
+        link->conn.drop();
+    if (link && link->conn.fd >= 0)
+    {
+        const link_result r = send_on_link(link->conn.fd, message);
+        if (r == link_result::delivered)
+        {
+            link->took = true;
+            return 0;
+        }
+        link->conn.drop();
+        if (r == link_result::lost || r == link_result::silent)
+        {
+            std::fprintf(stderr, r == link_result::lost
+                                     ? "socketley: the worker holding %s ended before it answered for the line\n"
+                                     : "socketley: the worker holding %s took the line and has not answered in 5s\n",
+                         name.c_str());
+            return 2;
+        }
+        // Nothing of the line was taken, so it goes to the daemon, which says why when it cannot be sent.
+        if (!link->took)
+            link->plain = true;
+    }
+
     // One connection for the shell's commands, as the daemon reads a connection's commands in turn, made again when the
     // path changes or the daemon closed it: then nothing of the command went out, and it is sent once more.
     static kept_conn conn;
+    // Whether the daemon behind `conn` predates `send-link`, which it refuses as an unknown command, or a long one as
+    // one with too many words, having done nothing.
+    static bool conn_no_link = false;
     if (conn.still_ours() && conn.path != path)
         conn.drop();
     // Checked once above, and a failed exchange below drops it, so a descriptor not -1 here is this process's own.
     std::string data;
     int rc = 0;
-    for (int attempt = 0; attempt < 2; ++attempt)
+    int passed = -1;
+    for (int attempt = 0; attempt < 3; ++attempt)
     {
         const bool fresh = conn.fd < 0;
         if (fresh)
@@ -268,14 +355,41 @@ int send_from_shell(const std::vector<std::string>& args)
                 return run_program(args);
             }
             conn.take(c, path);
+            conn_no_link = false;
         }
+        const bool ask_link = link && !link->plain && !conn_no_link;
         bool sent = false;
-        rc = socketley::daemon_exchange(conn.fd, command, data, sent);
+        rc = ask_link ? socketley::daemon_exchange(conn.fd, "send-link" + command.substr(4), data, sent, &passed)
+                      : socketley::daemon_exchange(conn.fd, command, data, sent);
+        if (ask_link && rc == 1
+            && (data == "unknown command: send-link\n" || data.starts_with("too many arguments for send-link ")))
+        {
+            conn_no_link = true;
+            continue;
+        }
         if (rc >= 0)
             break;
+        if (passed >= 0)
+            ::close(passed);
+        passed = -1;
         conn.drop();
         if (sent || fresh)
             return socketley::daemon_request_failure(path, rc);
+    }
+    if (passed >= 0)
+    {
+        if (rc == 0 && link)
+        {
+            // Five seconds each way, as the daemon's connection has: a worker that stopped reading is not waited on.
+            const struct timeval tv{5, 0};
+            if (::setsockopt(passed, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) < 0
+                || ::setsockopt(passed, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0)
+                ::close(passed);
+            else
+                link->conn.take(passed, path);
+        }
+        else
+            ::close(passed);
     }
     if (rc < 0)
         return socketley::daemon_request_failure(path, rc);

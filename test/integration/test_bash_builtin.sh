@@ -18,7 +18,8 @@ daemon_isolate bashbuiltin
 
 SO="$(cd "$(dirname "$BIN")" && pwd)/socketley-bash.so"
 P=$((SL_PORT_BASE+1966))
-NAMES="bb_cli"
+P2=$((SL_PORT_BASE+1967))
+NAMES="bb_cli bb_lk"
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -31,11 +32,11 @@ if [ ! -f "$SO" ]; then
     exit 0
 fi
 
-LPID=""
+LPID=""; LPID2=""
 cleanup() {
-    if [ -n "$LPID" ]; then
-        { kill -9 "$LPID" && wait "$LPID"; } 2>/dev/null || true
-    fi
+    for p in $LPID $LPID2; do
+        { kill -9 "$p" && wait "$p"; } 2>/dev/null || true
+    done
     for n in $NAMES; do "$BIN" stop "$n"   >/dev/null 2>&1 || true; done
     sleep 0.3
     for n in $NAMES; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
@@ -122,6 +123,41 @@ check "signals during sends do not fail them" "" \
     "$(run 'trap : USR1; ( while kill -USR1 $$ 2>/dev/null; do :; done ) & K=$!
             for ((i = 1; i <= 300; i++)); do socketley send bb_cli "i$i" || { echo "send $i failed: $?"; break; }; done
             kill $K' 2>&1 | grep -v '^$' || true)"
+
+# After its first line a shell sends on a link to the runtime's worker, so a daemon that cannot answer does not hold it.
+: > "$GOT"
+OUT=$(run "socketley send bb_cli d0 || exit 8; kill -STOP $SOCKETLEY_DPID
+           for i in \$(seq 1 50); do socketley send bb_cli \"d\$i\" || { echo \"send \$i: \$?\"; break; }; done
+           kill -CONT $SOCKETLEY_DPID")
+kill -CONT "$SOCKETLEY_DPID" 2>/dev/null || true
+check "sends after the first do not wait on the daemon" "" "$OUT"
+for _ in $(seq 1 50); do [ "$(grep -c . "$GOT")" -ge 51 ] && break; sleep 0.1; done
+check "and every one of them reached the peer, in order" "$(for i in $(seq 0 50); do echo "d$i"; done)" "$(cat "$GOT")"
+
+# A link ends with the runtime's worker, and the line after that is the daemon's to answer, as without a link.
+# A peer of its own, since the first one reads one connection to its end before it takes the next.
+GOT2="$SOCKETLEY_TMPD/got2"
+: > "$GOT2"
+python3 "$SOCKETLEY_TMPD/peer.py" "$P2" "$GOT2" > /dev/null 2>&1 &
+LPID2=$!
+for _ in $(seq 1 200); do
+    ss -ltn 2>/dev/null | grep -q ":$P2 " && break
+    sleep 0.05
+done
+create_ok "a client to the second peer" "$BIN" create client bb_lk -t "127.0.0.1:$P2" -s
+for _ in $(seq 1 50); do
+    "$BIN" ls 2>/dev/null | grep -q "bb_lk.*Up" && break
+    sleep 0.1
+done
+check "a stopped runtime's line is refused, and a started one's sent" "runtime is not running: bb_lk|1|0|0" \
+    "$(run 'socketley send bb_lk k1; socketley stop bb_lk >/dev/null; socketley send bb_lk k2; echo "|$?"
+            socketley start bb_lk >/dev/null; for _ in $(seq 1 50); do socketley ls | grep -q "bb_lk.*Up" && break; sleep 0.1; done
+            socketley send bb_lk k3; echo "|$?"; socketley send bb_lk k4; echo "|$?"' | tr -d '\n')"
+check "a removed runtime's line is refused" "runtime not found: bb_lk|1" \
+    "$(run 'socketley send bb_lk k5; socketley remove bb_lk >/dev/null 2>&1 || { socketley stop bb_lk; socketley remove bb_lk; } >/dev/null 2>&1
+            socketley send bb_lk k6; echo "|$?"' | tr -d '\n')"
+for _ in $(seq 1 50); do [ "$(grep -c . "$GOT2")" -ge 4 ] && break; sleep 0.1; done
+check "only the lines that were answered 0 reached the peer" "k1|k3|k4|k5" "$(sort "$GOT2" | paste -sd'|')"
 
 # The kept connection outlives the daemon it was made to, and the next send makes a new one.
 : > "$GOT"

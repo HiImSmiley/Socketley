@@ -10,7 +10,9 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <sys/socket.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 #include "../shared/loop/event_loop_definitions.h"
 #include "../shared/runtime/runtime_instance.h"
@@ -64,6 +66,22 @@ struct ipc_connection
     uint64_t serial = 0;
     // The least exit code a parked reply may answer with, for what the command said before it parked.
     int parked_floor = 0;
+
+    // The shell's end of a send link (send_link.h), travelling with the next reply and closed once that write has
+    // reported; the message and its control buffer are what the ring reads until then.
+    int pass_fd = -1;
+    struct iovec pass_iov{};
+    struct msghdr pass_msg{};
+    alignas(struct cmsghdr) char pass_ctl[CMSG_SPACE(sizeof(int))]{};
+
+    ipc_connection() = default;
+    ipc_connection(const ipc_connection&) = delete;
+    ipc_connection& operator=(const ipc_connection&) = delete;
+    ~ipc_connection()
+    {
+        if (pass_fd >= 0)
+            ::close(pass_fd);
+    }
 };
 
 // What a command handler returns when its reply waits for a worker that is not forked yet.
@@ -178,6 +196,7 @@ private:
     int cmd_ls(ipc_connection* conn, const parsed_args& pa);
     int cmd_ps(ipc_connection* conn, const parsed_args& pa);
     int cmd_send(const parsed_args& pa);
+    int cmd_send_link(ipc_connection* conn, const parsed_args& pa);
 
     // Where a message addressed to a runtime name goes, shared by `send` at
     // the CLI and by a worker's socketley.send, with `exclude` naming the one

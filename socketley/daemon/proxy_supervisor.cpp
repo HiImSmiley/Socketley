@@ -4,6 +4,7 @@
 #include "../shared/ipc/worker_env.h"
 
 #include "../shared/ipc/peer_link.h"
+#include "../shared/ipc/send_link.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -354,6 +355,12 @@ bool proxy_supervisor::grant_interactive(int fd)
         return false;
     }
     return true;
+}
+
+bool proxy_supervisor::grant_send_link(int fd)
+{
+    return m_link_chan_fd >= 0 && fd >= 0
+           && socketley::peer_link::grant(m_link_chan_fd, socketley::send_link::marker, fd);
 }
 
 bool proxy_supervisor::grant_suppressed(std::string_view peer)

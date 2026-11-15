@@ -178,6 +178,9 @@ public:
     // definition for why it is a marker and not a second one.
     bool grant_interactive(int fd);
 
+    // One end of a shell's link for `socketley send` (send_link.h), over the same channel.
+    bool grant_send_link(int fd);
+
     // Whether this child has been introduced to `peer` recently enough that a
     // second grant would be waste rather than repair.
     bool grant_suppressed(std::string_view peer);

@@ -17,7 +17,8 @@ int daemon_request(const std::string& socket_path, std::string_view command, std
 // The two halves of it, for a caller that keeps the connection for its next command: a trusted connection's descriptor
 // or a code above, and the exchange, which `sent` tells whether any of the command reached the socket.
 int daemon_connect(const std::string& socket_path);
-int daemon_exchange(int fd, std::string_view command, std::string& data, bool& sent);
+// `passed`, when given, takes a descriptor the daemon sent with its answer (-1 when it sent none).
+int daemon_exchange(int fd, std::string_view command, std::string& data, bool& sent, int* passed = nullptr);
 
 // The sentence a daemon_request failure deserves, on stderr, and 2.
 int daemon_request_failure(const std::string& socket_path, int rc);

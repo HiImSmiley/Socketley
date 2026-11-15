@@ -43,11 +43,36 @@ int daemon_connect(const std::string& socket_path)
     return fd;
 }
 
+// A read that also takes a descriptor sent with what it reads, close-on-exec, since a shell runs programs.
+static ssize_t read_passing(int fd, char* buf, size_t len, int& passed)
+{
+    struct iovec iov{buf, len};
+    alignas(struct cmsghdr) char ctl[CMSG_SPACE(sizeof(int))]{};
+    struct msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctl;
+    msg.msg_controllen = sizeof ctl;
+    const ssize_t n = ::recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
+    for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); n >= 0 && c; c = CMSG_NXTHDR(&msg, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
+        {
+            int got = -1;
+            std::memcpy(&got, CMSG_DATA(c), sizeof got);
+            if (passed >= 0)
+                ::close(passed);
+            passed = got;
+        }
+    return n;
+}
+
 // Leaves the connection open, for the next command or for the caller to close; `sent` says whether any of the
 // command reached the socket, so a caller may send it again on a new connection only when none did.
-int daemon_exchange(int fd, std::string_view command, std::string& data, bool& sent)
+int daemon_exchange(int fd, std::string_view command, std::string& data, bool& sent, int* passed)
 {
     sent = false;
+    if (passed)
+        *passed = -1;
     // A line unless it cannot be one, so every ordinary command stays
     // byte-identical and a new CLI can talk to a daemon that has not been
     // restarted.
@@ -82,7 +107,7 @@ int daemon_exchange(int fd, std::string_view command, std::string& data, bool& s
     ssize_t n;
     // A socket with a receive deadline is never restarted after a signal, and a shell's SIGCHLD arrives at any time.
     do
-        n = read(fd, buf, sizeof(buf));
+        n = passed ? read_passing(fd, buf, sizeof(buf), *passed) : read(fd, buf, sizeof(buf));
     while (n < 0 && errno == EINTR);
 
     if (n < 1)

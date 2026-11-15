@@ -1135,6 +1135,12 @@ void daemon_handler::handle_write(struct io_uring_cqe* cqe, const io_request* re
 
     auto* conn = it->second.get();
     conn->write_pending = false;
+    // The kernel holds its own reference to a descriptor once the send that carried it has reported.
+    if (conn->pass_fd >= 0)
+    {
+        ::close(conn->pass_fd);
+        conn->pass_fd = -1;
+    }
 
     // A failed send says the reply is not going to be delivered, so this
     // connection goes rather than sitting in m_clients with nothing armed on
@@ -1518,6 +1524,7 @@ int daemon_handler::process_parsed(ipc_connection* conn, const parsed_args& pa)
         switch (pa.hashes[0])
         {
             case fnv1a("send"):
+            case fnv1a("send-link"):
             case fnv1a("action"):
             case fnv1a("import"):
                 break;   // the tail is the payload, and it is all there
@@ -1579,6 +1586,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("ls"):        return cmd_ls(conn, pa);
         case fnv1a("ps"):        return cmd_ps(conn, pa);
         case fnv1a("send"):      return cmd_send(pa);
+        case fnv1a("send-link"): return cmd_send_link(conn, pa);
         case fnv1a("edit"):      return cmd_edit(conn, pa);
         case fnv1a("show"):
         case fnv1a("dump"):      return cmd_dump(conn, pa);
@@ -3140,6 +3148,30 @@ int daemon_handler::cmd_send(const parsed_args& pa)
         return 1;
     }
     return 0;
+}
+
+// `send`, and with its answer one end of a link straight to the worker holding the runtime, for a shell's builtin to
+// send its next lines on (send_link.h); offered only where that worker alone holds the runtime's connections.
+int daemon_handler::cmd_send_link(ipc_connection* conn, const parsed_args& pa)
+{
+    const int rc = cmd_send(pa);
+    if (rc != 0 || !conn || conn->pass_fd >= 0)
+        return rc;
+    const auto* instance = m_manager.get(pa.args[1]);
+    const auto it = m_proxy_workers.find(std::string(pa.args[1]));
+    if (!instance || !instance->is_out_of_process() || instance->get_shards() > 1 || it == m_proxy_workers.end()
+        || it->second.size() != 1 || !it->second[0])
+        return rc;
+    int ends[2];
+    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, ends) != 0)
+        return rc;
+    const bool granted = it->second[0]->grant_send_link(ends[1]);
+    ::close(ends[1]);
+    if (granted)
+        conn->pass_fd = ends[0];
+    else
+        ::close(ends[0]);
+    return rc;
 }
 
 // The same verb arriving from a worker's script, answered by nothing, with
@@ -9771,6 +9803,33 @@ bool daemon_handler::send_response(ipc_connection* conn)
 
     conn->write_req.buffer = base;
     conn->write_req.length = len;
+
+    // A link's end goes with the first byte of the reply, so the shell takes it in the read that starts the answer.
+    if (conn->pass_fd >= 0 && conn->write_off == 0)
+    {
+        conn->pass_iov = {base, len};
+        conn->pass_msg = {};
+        conn->pass_msg.msg_iov = &conn->pass_iov;
+        conn->pass_msg.msg_iovlen = 1;
+        conn->pass_msg.msg_control = conn->pass_ctl;
+        conn->pass_msg.msg_controllen = sizeof conn->pass_ctl;
+        struct cmsghdr* c = CMSG_FIRSTHDR(&conn->pass_msg);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int));
+        std::memcpy(CMSG_DATA(c), &conn->pass_fd, sizeof(int));
+        if (m_loop.submit_sendmsg(conn->fd, &conn->pass_msg, &conn->write_req))
+        {
+            conn->write_pending = true;
+            return true;
+        }
+    }
+    // Not sent with this reply, so the shell goes on through the daemon and the worker's end sees the link close.
+    if (conn->pass_fd >= 0)
+    {
+        ::close(conn->pass_fd);
+        conn->pass_fd = -1;
+    }
 
     if (!m_loop.submit_write(conn->fd, base, len, &conn->write_req))
     {
