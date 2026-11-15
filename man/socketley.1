@@ -14399,7 +14399,16 @@ These are either a user's name and the password of its login profile (see IAM ab
 or an access key and its secret.
 The answer sets the cookie
 .B skl_ui
-(HttpOnly, SameSite=Strict, Secure over TLS).
+(HttpOnly, SameSite=Strict).
+Over HTTPS, its own TLS or an entrance's (X\-Forwarded\-Proto: https), the cookie is
+.B __Host\-skl_ui
+instead, Secure and for this host alone, and only that name is read there.
+A page on another name under the same domain, such as a bucket's website, can set a
+.B skl_ui
+of its own that a browser sends first, but no
+.B __Host\-
+cookie of this host.
+Two sessions of different users sent together let neither in.
 The cookie holds the access key (or
 .BI ~ user
 for a password), the time it was made, an expiry, and an HMAC-SHA256 of these under
@@ -16157,6 +16166,19 @@ application named by address, the proxy removes the provider's cookies and keeps
 every other one, with
 .B \-\-auth idp:
 or without it.
+.IP
+A page on any name under the domain, such as a bucket's website, can also set a
+.B skl_idp
+cookie of its own, holding a session of an account its maker has, at a longer
+path that the browser then sends first. It cannot replace the provider's cookie.
+With an
+.B https://
+issuer the provider therefore also sets
+.BR __Host\-skl_idp ,
+the same session for its own host alone, and reads its own sign-in only from that
+cookie. A runtime that reads
+.B skl_idp
+takes no sign-in when the cookies sent name two different accounts.
 .TP
 .BI "\-\-shards " N
 The number of worker processes that serve the provider, 1 to 64. Shard 0 writes

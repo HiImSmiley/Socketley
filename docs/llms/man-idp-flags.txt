@@ -59,6 +59,8 @@ With any resource set, an application may also sign in with the https address of
 
 The domain whose names share the sign-in cookie. A user signed in here is then signed in for a proxy, a storage or the dashboard on any name below it. Default: the cookie is for the provider's host alone. A browser sends that cookie to every name below the domain, and whoever holds it is the user. So a proxy hands it only to a backend that is a runtime of this daemon, which checks it itself. From what it sends to any other backend, an application named by address, the proxy removes the provider's cookies and keeps every other one, with **--auth idp:** or without it.
 
+A page on any name under the domain, such as a bucket's website, can also set a **skl_idp** cookie of its own, holding a session of an account its maker has, at a longer path that the browser then sends first. It cannot replace the provider's cookie. With an **https://** issuer the provider therefore also sets **__Host-skl_idp**, the same session for its own host alone, and reads its own sign-in only from that cookie. A runtime that reads **skl_idp** takes no sign-in when the cookies sent name two different accounts.
+
 ### `--shards N`
 
 The number of worker processes that serve the provider, 1 to 64. Shard 0 writes the accounts, and every shard signs in (see **On several cores** above). The number can change only while the runtime is stopped.
