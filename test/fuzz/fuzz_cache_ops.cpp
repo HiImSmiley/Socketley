@@ -2502,6 +2502,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         return 0;
 
     world w;
+    // The string table without the 1024 slots cache_store() reserves for a first load.  check_structure() walks it
+    // twice a step, and a walk costs every slot, so the reserve was four fifths of this target's time; twelve keys
+    // never fill it either way, and a table that has to grow puts the rebuild (and SCAN across one) in reach.
+    w.store.m_data = string_map();
     {
         // /dev/shm keeps save()/load() off the disk; the pid keeps two
         // concurrent fuzzer workers from writing the same file.

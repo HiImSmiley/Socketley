@@ -2878,8 +2878,11 @@ void check_instance(world& w, bool deep)
 
     // The whole of both tables, once.  A slot with no index entry is a
     // connection no completion can ever be routed to; an index entry with no
-    // slot is a pointer into storage nobody owns.
-    for (int fd = 0; fd < proxy_instance::MAX_FDS; fd++)
+    // slot is a pointer into storage nobody owns.  As far as a descriptor can
+    // be numbered in this process (init_once() caps that at 4096): the tables
+    // are indexed by descriptor, so no entry past it is ever written.
+    const int fd_end = std::min<int>(proxy_instance::MAX_FDS, static_cast<int>(fuzzrt::fd_scan_limit()));
+    for (int fd = 0; fd < fd_end; fd++)
     {
         const auto& e = rt->m_conn_idx[fd];
         if (rt->m_client_slots[fd])
@@ -3333,6 +3336,18 @@ void init_once()
     // on a socket the program deliberately reset, and report it as a finding in
     // the runtime.
     signal(SIGPIPE, SIG_IGN);
+
+    // No descriptor past 4096, so the walks over every number one could be (sweep_descriptors() and the deep half
+    // of check_instance()) cover all there are in 4096 steps rather than 65536: they were a third of this target's
+    // time.  A program here holds a few hundred at most; one that runs out is leaking them, which is a finding.
+    {
+        struct rlimit rl{};
+        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur > 4096))
+        {
+            rl.rlim_cur = 4096;
+            ::setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
 
     // Before anything is built, because make_instance() reads it.
     parse_pinned_config();

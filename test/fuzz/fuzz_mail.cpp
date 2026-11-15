@@ -538,7 +538,10 @@ struct sieve_dir_guard
 
 void managesieve_case(std::string_view in)
 {
-    static const sieve_dir_guard guard{"/tmp/fuzz-mail-sieve-" + std::to_string(::getpid())};
+    // In memory where the machine has it: the store fsyncs every script it writes, and on a disk that is tens of
+    // milliseconds an input, which was most of this target's time.
+    static const sieve_dir_guard guard{(std::filesystem::is_directory("/dev/shm") ? "/dev/shm" : "/tmp") +
+                                       std::string("/fuzz-mail-sieve-") + std::to_string(::getpid())};
     static sieve_store store(guard.path);
     sieve_hooks h;
     managesieve_config cfg;
