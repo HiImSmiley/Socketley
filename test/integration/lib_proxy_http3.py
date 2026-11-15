@@ -136,6 +136,11 @@ async def main():
         return 1
 
     async with connection("one.example.com") as c:
+        # Each stream is a client connection of the entrance's own, with a descriptor and a backend connection, so it
+        # allows as few at once as its HTTP/2 does; the endpoint once offered every host's 128 whatever it asked for,
+        # and one address's connections held a descriptor table's worth.
+        check("the entrance allows eight streams at once on a connection, as over HTTP/2",
+              c._quic._remote_max_streams_bidi, 8)
         check("a request over HTTP/3 is routed to the runtime its name has",
               await c.request("one.example.com", "/who.txt"), ("200", b"from-one\n"))
 

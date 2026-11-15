@@ -61,12 +61,12 @@ constexpr uint64_t stream_window   = 1u << 20;
 constexpr uint64_t conn_window     = 4u << 20;
 constexpr uint64_t stream_window_max = 16u << 20;
 constexpr uint64_t conn_window_max = 64u << 20;
-constexpr uint64_t max_streams     = 128;
-constexpr size_t   max_head        = 32 * 1024;
-constexpr size_t   max_conns       = 4096;
-// The most of them one client address holds, so that one address cannot take the table whole: sixteen at least
-// always find room.
-constexpr size_t   max_per_address = max_conns / 16;
+// The request streams a connection may have open at once and the connections the endpoint holds are the host's
+// options.max_streams and options.max_conns: a host for which a stream costs more than a struct -- the entrance's is a
+// client connection of its own with a descriptor and a backend connection -- bounds them lower than a web server does.
+// The most connections one client address holds is a sixteenth of them, so that one address cannot take the table
+// whole: sixteen at least always find room.
+size_t per_address_cap(size_t conns) { return std::max<size_t>(conns / 16, 1); }
 constexpr size_t   pull_slice      = 64 * 1024;
 constexpr size_t   rx_buf          = 64 * 1024;
 // Packets written at once and sent in one sendmsg by UDP GSO: as many of ngtcp2's largest (its default
@@ -612,10 +612,10 @@ void endpoint::packet(const sockaddr_storage& local, socklen_t local_len, const 
     if (!hc)
     {
         ngtcp2_pkt_hd hd{};
-        if (ngtcp2_accept(&hd, data, len) != 0 || conns.size() >= max_conns)
+        if (ngtcp2_accept(&hd, data, len) != 0 || conns.size() >= o.max_conns)
             return;
         const uint32_t from = reinterpret_cast<const sockaddr_in*>(&remote)->sin_addr.s_addr;
-        if (const auto it = per_address.find(from); it != per_address.end() && it->second >= max_per_address)
+        if (const auto it = per_address.find(from); it != per_address.end() && it->second >= per_address_cap(o.max_conns))
             return;
         // A client that has not proven its address is sent a Retry while many handshakes are under way; one that
         // comes back with the token is let in as the client the first Initial named.
@@ -863,7 +863,7 @@ std::shared_ptr<conn> endpoint::new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_c
     params.initial_max_stream_data_bidi_remote = stream_window;
     params.initial_max_stream_data_uni = stream_window;
     params.initial_max_data = conn_window;
-    params.initial_max_streams_bidi = max_streams;
+    params.initial_max_streams_bidi = o.max_streams;
     params.initial_max_streams_uni = 3;
     params.max_idle_timeout = idle_timeout_ns;
     params.active_connection_id_limit = 7;
@@ -1741,6 +1741,8 @@ endpoint_ptr open(const options& o, host& h, event_loop& loop, std::string& err)
     e->loop = &loop;
     e->owner = o.owner;
     e->o = o;
+    e->o.max_streams = std::max<uint64_t>(o.max_streams, 1);
+    e->o.max_conns = std::max<size_t>(o.max_conns, 1);
     e->retry_after = o.retry_after;
     if (o.cc == "reno")
         e->cc = NGTCP2_CC_ALGO_RENO;
