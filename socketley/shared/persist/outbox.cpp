@@ -35,7 +35,7 @@ bool outbox::open(const std::string& dir, std::string_view sub, uint32_t shard, 
                   const keeper& keep, std::string& err)
 {
     const std::string nd = dir + "/" + std::string(sub);
-    if (::mkdir(nd.c_str(), 0755) < 0 && errno != EEXIST)
+    if (::mkdir(nd.c_str(), 0700) < 0 && errno != EEXIST)
     {
         err = "cannot create " + nd + ": " + std::strerror(errno);
         return false;
@@ -147,7 +147,7 @@ bool outbox::open(const std::string& dir, std::string_view sub, uint32_t shard, 
 
     // Written again with only what is still owed, so the file never outgrows its undelivered entries.
     const std::string tmp = m_name + ".new";
-    const int fd = ::openat(m_dir_fd, tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    const int fd = ::openat(m_dir_fd, tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0)
     {
         err = "cannot write " + nd + "/" + tmp + ": " + std::strerror(errno);
@@ -354,7 +354,7 @@ void outbox::maybe_rotate()
         return;
     // Opened and renamed here rather than on the ring, so a stop never finds a rename that may still run after it.
     const std::string tmp = m_name + ".new";
-    const int fd = ::openat(m_dir_fd, tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    const int fd = ::openat(m_dir_fd, tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0 || ::renameat(m_dir_fd, tmp.c_str(), m_dir_fd, m_name.c_str()) < 0)
     {
         LOG_WARN((m_what + " could not be started again empty: " + std::strerror(errno)).c_str());

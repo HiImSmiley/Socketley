@@ -464,7 +464,7 @@ bool multipart_store::open(std::string& err)
 bool multipart_store::recover_bucket(const std::string& bucket, std::string& err)
 {
     const std::string mpu = base_of(bucket) + "/mpu";
-    if (::mkdir(mpu.c_str(), 0755) < 0)
+    if (::mkdir(mpu.c_str(), 0700) < 0)
     {
         if (errno != EEXIST)
         {
@@ -661,7 +661,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
     // bucket when this is what made it.
     ch->then([io, s](file_io::done d)
     {
-        return io->mkdirat(AT_FDCWD, s->mpu, 0755, [s, d](int64_t r) { s->mpu_made = r == 0; d(r); });
+        return io->mkdirat(AT_FDCWD, s->mpu, 0700, [s, d](int64_t r) { s->mpu_made = r == 0; d(r); });
     }, -EEXIST);
     ch->then([io, s](file_io::done d)
     {
@@ -684,7 +684,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
     });
     ch->then([io, s](file_io::done d)
     {
-        return io->mkdirat(AT_FDCWD, s->dir, 0755, [s, d](int64_t r) { s->dir_made = r == 0; d(r); });
+        return io->mkdirat(AT_FDCWD, s->dir, 0700, [s, d](int64_t r) { s->dir_made = r == 0; d(r); });
     });
     ch->then([io, s](file_io::done d)
     {

@@ -592,7 +592,7 @@ void object_store::pool_open_dir(bucket& b)
         if (bucket* bp = same())
             bp->pool_making = 0;
     };
-    const bool q = m_io->mkdirat(b.dir_fd, "pool", 0755, [this, alive, same, give_up](int64_t r)
+    const bool q = m_io->mkdirat(b.dir_fd, "pool", 0700, [this, alive, same, give_up](int64_t r)
     {
         if (!*alive)
             return;
@@ -1059,7 +1059,7 @@ void object_store::maybe_compact(bucket& b)
     auto alive = m_alive;
     const std::string file = "index." + std::to_string(m_opts.shard) + ".new";
     const bool queued = m_io->openat(
-        b.dir_fd, file, O_WRONLY | O_CREAT | O_TRUNC, 0644,
+        b.dir_fd, file, O_WRONLY | O_CREAT | O_TRUNC, 0600,
         [this, alive, name](int64_t fd)
         {
             if (!*alive)
@@ -1334,7 +1334,7 @@ void object_store::ensure_dirs(const std::string& bucket_name, const std::string
                 cb(-1, errno_status(fd));
                 return;
             }
-            const bool q2 = m_io->mkdirat(bp->data_fd, leaf, 0755,
+            const bool q2 = m_io->mkdirat(bp->data_fd, leaf, 0700,
                 [this, alive, bucket_name, rel, cb](int64_t r)
                 {
                     if (!*alive)
@@ -3145,20 +3145,20 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
         switch (stage)
         {
             case 0:
-                queued = m_io->mkdirat(m_root_fd, base, 0755, next);
+                queued = m_io->mkdirat(m_root_fd, base, 0700, next);
                 break;
             case 1:
                 if (res < 0 && res != -EEXIST) { fail(errno_status(res)); return; }
-                queued = m_io->mkdirat(m_root_fd, base + "/data", 0755, next);
+                queued = m_io->mkdirat(m_root_fd, base + "/data", 0700, next);
                 break;
             case 2:
                 if (res < 0 && res != -EEXIST) { fail(errno_status(res)); return; }
-                queued = m_io->mkdirat(m_root_fd, base + "/tmp", 0755, next);
+                queued = m_io->mkdirat(m_root_fd, base + "/tmp", 0700, next);
                 break;
             case 3:
                 if (res < 0 && res != -EEXIST) { fail(errno_status(res)); return; }
                 queued = m_io->openat(m_root_fd, base + "/created",
-                                      O_WRONLY | O_CREAT | O_TRUNC, 0644, next);
+                                      O_WRONLY | O_CREAT | O_TRUNC, 0600, next);
                 break;
             case 4:
                 if (res < 0) { fail(errno_status(res)); return; }
@@ -3176,7 +3176,7 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                     m_loop->close_fd(cs->fd);
                 cs->fd = -1;
                 queued = m_io->openat(m_root_fd, base + "/index." + std::to_string(m_opts.shard),
-                                      O_RDWR | O_CREAT | O_TRUNC, 0644, next);
+                                      O_RDWR | O_CREAT | O_TRUNC, 0600, next);
                 break;
             case 7:
                 if (res < 0) { fail(errno_status(res)); return; }
@@ -3210,7 +3210,7 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                     // One object directory per turn of this step, then on to the next.
                     --cs->stage;
                     queued = m_io->mkdirat(m_root_fd, base + "/data/" + hex_byte(static_cast<uint8_t>(cs->fan++)),
-                                           0755, next);
+                                           0700, next);
                     break;
                 }
                 queued = m_io->openat(m_root_fd, base + "/data", O_RDONLY | O_DIRECTORY, 0, next);
@@ -3922,12 +3922,12 @@ void object_store::stage_doc(bucket_doc kind, std::string name, std::string xml,
     // The directories of noncurrent versions are there, and durable, before any version may need one.
     if (kind == bucket_doc::versioning && !text->empty())
     {
-        ch->then([this, dir_fd](file_io::done d) { return m_io->mkdirat(dir_fd, "versions", 0755, std::move(d)); },
+        ch->then([this, dir_fd](file_io::done d) { return m_io->mkdirat(dir_fd, "versions", 0700, std::move(d)); },
                  -EEXIST);
         for (int i = 0; i < 256; ++i)
             ch->then([this, dir_fd, i](file_io::done d)
                      {
-                         return m_io->mkdirat(dir_fd, "versions/" + hex_byte(static_cast<uint8_t>(i)), 0755, std::move(d));
+                         return m_io->mkdirat(dir_fd, "versions/" + hex_byte(static_cast<uint8_t>(i)), 0700, std::move(d));
                      },
                      -EEXIST);
         ch->then([this, dir_fd, fd](file_io::done d)
@@ -3950,7 +3950,7 @@ void object_store::stage_doc(bucket_doc kind, std::string name, std::string xml,
     }
     ch->then([this, dir_fd, fd, file](file_io::done d)
     {
-        return m_io->openat(dir_fd, file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644,
+        return m_io->openat(dir_fd, file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600,
                             [fd, d](int64_t r)
                             {
                                 if (r >= 0)

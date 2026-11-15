@@ -531,7 +531,7 @@ bool object_store::lock_shard(std::string& err)
 
     // The process this one replaces on its shard may still be finishing its stop, and must not write a journal or a marker beside it.
     const std::string lock = m_opts.dir + "/.lock." + std::to_string(m_opts.shard);
-    m_lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    m_lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (m_lock_fd < 0)
     {
         err = "cannot open " + lock + ": " + errstr(errno);
@@ -617,12 +617,16 @@ bool object_store::open(std::string& err, recovery_report* report)
     if (const auto v = settings::number<long>("SOCKETLEY_STORAGE_START_SLEEP_MS"))
         std::this_thread::sleep_for(std::chrono::milliseconds(*v));
 
+    // A --dir this runtime makes is its own alone, as the buckets in it are; one the operator made keeps its mode.
+    const bool made_root = !fs::exists(m_opts.dir, ec);
     fs::create_directories(m_opts.dir, ec);
     if (ec)
     {
         err = "cannot create " + m_opts.dir + ": " + ec.message();
         return false;
     }
+    if (made_root)
+        fs::permissions(m_opts.dir, fs::perms::owner_all, fs::perm_options::replace, ec);
     m_root_fd = ::open(m_opts.dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (m_root_fd < 0)
     {
@@ -740,7 +744,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     b->name = name;
 
     for (const char* sub : {"data", "tmp"})
-        if (::mkdir((base + "/" + sub).c_str(), 0755) < 0 && errno != EEXIST)
+        if (::mkdir((base + "/" + sub).c_str(), 0700) < 0 && errno != EEXIST)
         {
             err = "cannot create " + base + "/" + sub + ": " + errstr(errno);
             return false;
@@ -754,7 +758,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         for (int i = 0; i < 256; ++i)
         {
             const char n[3] = {digits[i >> 4], digits[i & 15], 0};
-            if (::mkdir((base + "/data/" + n).c_str(), 0755) == 0)
+            if (::mkdir((base + "/data/" + n).c_str(), 0700) == 0)
                 made = true;
             else if (errno != EEXIST)
             {
@@ -784,7 +788,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
             // Shard 0 writes it, since two shards truncating one file at once could
             // leave each reading the other's half.
             const int fd = m_opts.shard != 0 ? -1
-                : ::open((base + "/created").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+                : ::open((base + "/created").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
             if (fd >= 0)
             {
                 const std::string t = std::to_string(ms);
@@ -838,12 +842,12 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     const bool has_versions = ::stat((base + "/versions").c_str(), &vsb) == 0 && S_ISDIR(vsb.st_mode);
     if (b->vstate != versioning::off || has_versions)
     {
-        bool made = ::mkdir((base + "/versions").c_str(), 0755) == 0;
+        bool made = ::mkdir((base + "/versions").c_str(), 0700) == 0;
         static constexpr char digits[] = "0123456789abcdef";
         for (int i = 0; i < 256; ++i)
         {
             const char n[3] = {digits[i >> 4], digits[i & 15], 0};
-            if (::mkdir((base + "/versions/" + n).c_str(), 0755) == 0)
+            if (::mkdir((base + "/versions/" + n).c_str(), 0700) == 0)
                 made = true;
             else if (errno != EEXIST)
             {
@@ -859,6 +863,12 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     }
 
     b->dir_fd  = ::open(base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    // A bucket's folder is the runtime's alone: its index names every key with its metadata, tags and owner, and its
+    // configuration files hold the policies, and both were made 0644 in 0755 folders, so any account on the machine
+    // read them while the objects themselves were 0600.  New files are 0600 now; a bucket made before is narrowed here,
+    // which closes everything below it whatever the files' own modes.
+    if (struct stat bst{}; b->dir_fd >= 0 && ::fstat(b->dir_fd, &bst) == 0 && (bst.st_mode & 077) != 0)
+        if (::fchmod(b->dir_fd, 0700) != 0) {}
     b->data_fd = ::open((base + "/data").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     b->tmp_fd  = ::open((base + "/tmp").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (b->dir_fd < 0 || b->data_fd < 0 || b->tmp_fd < 0)
@@ -1106,7 +1116,7 @@ bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, boo
 {
     format = journal_format;
     const std::string path = m_opts.dir + "/" + b.name + "/index." + std::to_string(m_opts.shard);
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0)
     {
         bad_why = "cannot open " + path + ": " + errstr(errno);
@@ -1490,7 +1500,7 @@ bool object_store::rewrite_journal_sync(bucket& b, std::string& err)
     const std::string live = base + "index." + std::to_string(m_opts.shard);
     const std::string tmp  = live + ".new";
 
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0)
     {
         err = "cannot write " + tmp + ": " + errstr(errno);
@@ -1604,7 +1614,7 @@ void object_store::close(bool clean)
     if (clean && synced && !working() && !m_journal_lost && !m_sync_lost && settle_journals() && m_root_fd >= 0)
     {
         const std::string marker = m_opts.dir + "/.clean." + std::to_string(m_opts.shard);
-        const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (fd >= 0)
         {
             if (::fsync(fd) < 0) {}
