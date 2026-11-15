@@ -754,7 +754,10 @@ bool seglog::write_file(const std::string& path, const std::vector<std::string>&
                         std::string& why)
 {
     const std::string tmp = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    // A backup goes where the operator names, which others may write in: what lies at the name beforehand, a link
+    // among them, is taken away and never written through, and a file made there meanwhile fails the copy.
+    if (::unlink(tmp.c_str()) != 0 && errno != ENOENT) {}
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0)
     {
         why = tmp + " cannot be written";
