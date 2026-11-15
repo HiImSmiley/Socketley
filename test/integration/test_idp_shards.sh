@@ -10,6 +10,7 @@
 #   * an address barred at one shard trying its five again at each of the others
 #   * guesses sent at once over the shards each checked against those in flight at its own shard alone
 #   * one code of the second step signing in once at each shard
+#   * a second step for a sign-in another shard no longer keeps asked of that shard for ever
 #   * one refresh token refreshing once at each shard
 #   * the accounts or the key lost when the runtime restarts with another number of shards
 #   * a sign-out everywhere at a reading shard, or an account disabled, not reaching a proxy that verifies sessions alone
@@ -292,6 +293,16 @@ c0=$(stats_of auth | sum_of crossed)
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: 198.51.100.230" --data "rd=/&username=bob&password=wrongpassword" "http://127.0.0.1:$PI/login")
 c1=$(stats_of auth | sum_of crossed)
 expect "a refused sign-in at four shards crosses three times to each other shard" "$code $((c1 - c0))" "401 9"
+# A second step naming a sign-in its shard no longer keeps, or never kept, is told to sign in again: the shard it
+# reached asks the keeper once, not again and again for ever, which held the connection and spun both shards.
+c0=$(stats_of auth | sum_of crossed)
+codes=""
+for i in 0 1 2 3 0 1 2 3; do
+    codes="$codes $(curl -s -m 5 -o /dev/null -w '%{http_code}' --data "rd=/&pending=$i.00112233445566778899aabbccddeeff0011223344556677&code=123456" "http://127.0.0.1:$PI/login")"
+done
+c1=$(stats_of auth | sum_of crossed)
+expect "a second step for a sign-in no shard keeps is answered at every shard" "$codes" " 401 401 401 401 401 401 401 401"
+[ $((c1 - c0)) -le 8 ] && ok || bad "and the keeper is asked once for each" "crossed $((c1 - c0))"
 
 "$BIN" idp-user auth disable alice >/dev/null 2>&1 && ok || bad "disable takes" "rc $?"
 tally < <(run after_logout)

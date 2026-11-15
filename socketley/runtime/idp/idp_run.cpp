@@ -1342,15 +1342,17 @@ bool idp_run::take_pending(const std::shared_ptr<conn>& c, const request& rq, pa
         cc->waiting = false;
         bool found = false;
         pending_sign_in e;
-        // Not found, the step finds nothing under the old token either and says the sign-in took too long.
+        // Kept here under a token of this shard's, or, not found, under none: the step then finds nothing and says the
+        // sign-in took too long. The old token would name the other shard again, and the step would ask it again, and
+        // so on for ever.
+        std::string here;
         if (answered && decode_pending(reply, found, e) && found && m_pending.size() < 10000)
-        {
-            const std::string here = pending_token();
+            here = pending_token();
+        if (!here.empty())
             m_pending[here] = std::move(e);
-            for (auto& [k, v] : p)
-                if (k == field)
-                    v = here;
-        }
+        for (auto& [k, v] : p)
+            if (k == field)
+                v = here;
         (this->*step)(cc, rq, std::move(p));
         if (!cc->waiting)
             m_http.resume(cc);
