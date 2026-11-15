@@ -1281,6 +1281,8 @@ private:
     // Start the wait for the rest of a request's header block, idempotent so a
     // client dribbling one byte at a time cannot renew it for ever.
     void arm_header_deadline(proxy_client_connection* conn);
+    // How much longer an answer still going out holds the bytes behind its request; zero when it has gone quiet.
+    static std::chrono::milliseconds answer_moving_for(const proxy_client_connection* conn, int fd);
     // Give up on every deadline that has passed, both on one sweep because an
     // armed timeout hangs off no descriptor and a second chain would be a
     // second thing to get wrong at teardown.

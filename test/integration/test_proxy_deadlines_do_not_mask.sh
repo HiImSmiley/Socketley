@@ -33,7 +33,9 @@
 #   started response          which lands at an offset that is not a message
 #                             boundary
 #   and it is closed          `closing` alone driving no teardown, which would
-#                             leave the client waiting out its own budget
+#                             leave the client waiting out its own budget --
+#                             once the answer has been silent for the header
+#                             bound, since one still moving is not cut
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -209,7 +211,8 @@ else bad "and some of its body arrives before the close" \
          "slow_pieces=${SP:-?}, so the checks below judge an empty answer"; fi
 
 SS=$(echo "$OUT" | sed -n 's/slow_seconds=//p')
-if [ -n "$SS" ] && [ "${SS%.*}" -lt 20 ]; then ok
+# Its last piece leaves at about 11s and the hold is ended by 10s of silence after it, not by the answer's age.
+if [ -n "$SS" ] && [ "${SS%.*}" -lt 30 ]; then ok
 else bad "and the connection it cannot answer is closed rather than left open" \
          "took ${SS:-?}s against a 40s client budget, so the close was the" \
          "client's own timeout and nothing drove the teardown"; fi

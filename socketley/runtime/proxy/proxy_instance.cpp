@@ -10002,6 +10002,26 @@ void proxy_instance::clear_response_deadline(proxy_client_connection* conn)
     conn->ex.awaiting_response = false;
 }
 
+// How much longer an answer going out to `conn` holds what is behind its request: the whole header bound while the
+// client is owed any of it, else what is left of the bound since the kernel last sent it data, and nothing once it has
+// said nothing for that long -- nor on a stream, whose end is its session's business, or with no answer begun.
+std::chrono::milliseconds proxy_instance::answer_moving_for(const proxy_client_connection* conn, int fd)
+{
+    constexpr std::chrono::milliseconds bound = std::chrono::seconds(PROXY_HEADER_TIMEOUT_SEC);
+    if (!conn->ex.response_started || conn->h2_parent != nullptr || conn->h3s != nullptr)
+        return {};
+    if (conn->write_pending || !conn->write_queue.empty() || conn->splice_in_pending || conn->splice_out_pending ||
+        tls_owes_output(conn))
+        return bound;
+    const socketley::send_look l = socketley::look_at_send(fd);
+    if (!l.tcp)
+        return {};
+    if (l.owed > 0)
+        return bound;
+    const std::chrono::milliseconds idle(l.idle_ms);
+    return idle < bound ? bound - idle : std::chrono::milliseconds{};
+}
+
 void proxy_instance::arm_header_deadline(proxy_client_connection* conn)
 {
     // Already running, because the deadline dates from the first incomplete
@@ -10107,6 +10127,14 @@ void proxy_instance::response_deadline_sweep()
         // the backend that did not answer.
         if (conn->ex.awaiting_headers)
         {
+            // The bytes held are behind an answer still going out, which is what they wait for, so the bound is
+            // that answer's silence and not its length: ending it at the bound's age sent a FIN behind what the
+            // socket held, and a client taking a large answer with anything behind its request -- a pipelined
+            // request, or the bytes behind a Connection: close -- read a clean end of a short one.  A client that
+            // stops taking it is the write stall's; a source that stops sending it is still ended here.
+            if (now >= conn->ex.header_deadline && !client_answerable(conn))
+                if (const auto more = answer_moving_for(conn, cfd); more.count() > 0)
+                    conn->ex.header_deadline = now + more;
             if (now >= conn->ex.header_deadline)
             {
                 conn->ex.awaiting_headers = false;
