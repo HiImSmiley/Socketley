@@ -12252,7 +12252,10 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
         conn->write_batch_count = 0;
-        close_pair(fd, conn->ex.backend_fd);
+        // A write the kernel failed is a client that is gone, as a read it failed is in handle_client_read: no
+        // answer reaches it however much is owed, so with force -- no close_notify behind nothing and no drain of a
+        // socket that was reset (a denied request whose client reset before the 403 was out tripped answer-owed).
+        close_pair(fd, conn->ex.backend_fd, cqe->res < 0 ? close_reason::force : close_reason::normal);
         return;
     }
 
