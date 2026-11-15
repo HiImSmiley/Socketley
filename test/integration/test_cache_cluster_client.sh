@@ -337,7 +337,8 @@ fi
 ready_resp "$PD" || { echo "  FATAL: the --no-cluster four-shard cache never answered"; exit 2; }
 DEF_BOUND=0
 for i in 2 3 4; do
-    redis-cli -p $((PD+i)) -t 2 PING 2>/dev/null | grep -q PONG && DEF_BOUND=$((DEF_BOUND+1))
+    # timeout and not redis-cli -t, which redis-cli 7.0 refuses as an unknown option: then nothing was ever counted.
+    timeout 2 redis-cli -p $((PD+i)) PING 2>/dev/null | grep -q PONG && DEF_BOUND=$((DEF_BOUND+1))
 done
 # PD+1 is skipped above: clsq is legitimately listening there, and counting it
 # would fail this on the fixture rather than on the build.

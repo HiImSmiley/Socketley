@@ -65,8 +65,10 @@ ready_resp() {
     done
     return 1
 }
-# Whether anything accepts on a port, without the retries a ready check makes.
-answers() { redis-cli -p "$1" -t 1 PING 2>/dev/null | grep -q PONG && echo yes || echo no; }
+# Whether anything accepts on a port, without the retries a ready check makes.  The second is timeout's, not
+# redis-cli -t's: redis-cli 7.0 refuses -t as an unknown option and exits 1 before it connects, so every port read
+# as closed and each "binds nothing" below passed whatever was bound.
+answers() { timeout 1 redis-cli -p "$1" PING 2>/dev/null | grep -q PONG && echo yes || echo no; }
 enabled() { redis-cli "$@" CLUSTER INFO 2>/dev/null | tr -d '\r' | sed -n 's/^cluster_enabled://p'; }
 # How many of base+1..base+3 CLUSTER SLOTS names, read the way a client reads it.
 named_ports() {
