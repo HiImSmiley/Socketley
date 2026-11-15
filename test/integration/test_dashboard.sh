@@ -9,7 +9,9 @@
 #                and a script that parses
 #   slow peers   peers trickling their requests hold up no scrape or page
 #   signing in   an admin's key and secret make a session; another user's, a
-#                wrong secret and none do not; five failures bar the address
+#                wrong secret and none do not; five failures bar the address;
+#                over HTTPS the cookie is __Host-skl_dash and only it is read;
+#                two admins' sessions sent together let neither in
 #   reading      figures and the schema need a session, a local scraper's
 #                /metrics does not, a proxy's does
 #   commands     need a session and the page's header, take only the
@@ -49,7 +51,8 @@ echo "=== Integration: the daemon's dashboard ==="
 
 ADMIN="AKIADASHTESTADMIN000:dashtestadminsecretdashtestadminsecret00"
 BOB="AKIADASHTESTBOB00000:dashtestbobsecretdashtestbobsecretdashte"
-printf '[admin]\nadmin = true\n%s\n[bob]\n%s\n' "$ADMIN" "$BOB" > "$T/creds"
+OPS="AKIADASHTESTOPS00000:dashtestopssecretdashtestopssecretdashte"
+printf '[admin]\nadmin = true\n%s\n[ops]\nadmin = true\n%s\n[bob]\n%s\n' "$ADMIN" "$OPS" "$BOB" > "$T/creds"
 cat > "$T/daemon.lua" <<EOF
 daemon = { metrics_port = $M, dashboard_credentials = "$T/creds" }
 EOF
@@ -241,6 +244,28 @@ forged='skl_dash=AKIADASHTESTADMIN000.9999999999.00'
 expect "a forged cookie sent after the real one does not shut the session out" \
     "$(code -b "skl_dash=$dash; $forged" "$U/api/runtimes")" 200
 expect "nor one sent before it" "$(code -b "$forged; skl_dash=$dash" "$U/api/runtimes")" 200
+# Two admins' sessions sent together are one planted beside the other (a sibling host can set a skl_dash at a longer
+# path, which the browser sends first): neither is taken, in either order; two of one admin's still are.
+odash=$(curl -s -D - -o /dev/null -X POST -u "$OPS" "$U/api/session" | tr -d '\r' | sed -n 's/^[Ss]et-[Cc]ookie: skl_dash=\([^;]*\);.*/\1/p')
+expect "another admin signs in" "$(code -b "skl_dash=$odash" "$U/api/runtimes")" 200
+expect "two admins' sessions sent together let neither in" \
+    "$(code -b "skl_dash=$odash; skl_dash=$dash" "$U/api/runtimes") $(code -b "skl_dash=$dash; skl_dash=$odash" "$U/api/runtimes")" "401 401"
+dash2=$(curl -s -D - -o /dev/null -X POST -u "$ADMIN" "$U/api/session" | tr -d '\r' | sed -n 's/^[Ss]et-[Cc]ookie: skl_dash=\([^;]*\);.*/\1/p')
+expect "while two sessions of one admin do" "$(code -b "skl_dash=$dash2; skl_dash=$dash" "$U/api/runtimes")" 200
+# Over HTTPS, as an entrance says it, the cookie is __Host-skl_dash: Secure, of this host alone, and the only one read.
+HS='X-Forwarded-Proto: https'
+hc=$(curl -s -D - -o /dev/null -X POST -H "$HS" -u "$ADMIN" "$U/api/session" | tr -d '\r' | grep -i '^set-cookie')
+hdash=$(printf '%s' "$hc" | sed -n 's/^[Ss]et-[Cc]ookie: __Host-skl_dash=\([^;]*\);.*/\1/p')
+expect "over HTTPS the session is __Host-skl_dash, Secure, at / and of no domain" \
+    "$([ -n "$hdash" ] && echo named) $(printf '%s' "$hc" | grep -c '; Path=/;.*; Secure$') $(printf '%s' "$hc" | grep -ci 'domain=')" "named 1 0"
+expect "which reads the figures there" "$(code -H "$HS" -b "__Host-skl_dash=$hdash" "$U/api/runtimes")" 200
+expect "where a skl_dash, which a sibling host can set, is not read" "$(code -H "$HS" -b "skl_dash=$dash" "$U/api/runtimes")" 401
+ohdash=$(curl -s -D - -o /dev/null -X POST -H "$HS" -u "$OPS" "$U/api/session" | tr -d '\r' | sed -n 's/^[Ss]et-[Cc]ookie: __Host-skl_dash=\([^;]*\);.*/\1/p')
+expect "and two admins' __Host- sessions let neither in" \
+    "$(code -H "$HS" -b "__Host-skl_dash=$ohdash; __Host-skl_dash=$hdash" "$U/api/runtimes")" 401
+out=$(curl -s -D - -o /dev/null -X DELETE -H "$HS" -b "__Host-skl_dash=$hdash" "$U/api/session" | tr -d '\r')
+expect "signing out over HTTPS ends that session, clearing both names" \
+    "$(printf '%s' "$out" | grep -c '^Set-Cookie: __Host-skl_dash=; Path=/; Max-Age=0') $(printf '%s' "$out" | grep -c '^Set-Cookie: skl_dash=; Path=/; Max-Age=0') $(code -H "$HS" -b "__Host-skl_dash=$hdash" "$U/api/runtimes")" "1 1 401"
 
 # ─── commands ───────────────────────────────────────────────────────────────
 run() { curl -s -m 30 -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -H 'Content-Type: application/json' -d "$1" "$U/api/run"; }

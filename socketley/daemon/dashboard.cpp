@@ -41,6 +41,7 @@
 #include "../shared/util/base64.h"
 #include "../shared/crypto/mac.h"
 #include "../shared/util/hex.h"
+#include "../shared/util/ascii.h"
 #include "../shared/util/random_id.h"
 #include "../shared/http/http_framing.h"
 #include "../shared/http/cookie.h"
@@ -66,6 +67,17 @@ namespace
 #include "dashboard_page.inc"
 
 constexpr int64_t session_seconds = 12 * 3600;
+constexpr std::string_view cookie_name = "skl_dash";
+// The name over HTTPS, a cookie of this host alone: a page on another name under the same domain can set a skl_dash of
+// its own that a browser sends here first, at a longer path, but no other host can set a __Host- cookie of this one's.
+constexpr std::string_view host_cookie_name = "__Host-skl_dash";
+
+// Whether the browser reached the dashboard over HTTPS, which it does only through an entrance that says so; a browser
+// cannot write that field, so a client that does gets a Secure cookie only it misuses.
+bool browser_https(const request& r)
+{
+    return socketley::ascii::iequals(r.header("x-forwarded-proto"), "https");
+}
 
 std::string lower(std::string_view s)
 {
@@ -239,16 +251,24 @@ std::string server::session_of(const request& r) const
         return w.username;
     if (m_key.size() != 32)
         return {};
-    // Every skl_dash sent, the first whose seal holds taken, so one a sibling domain set does not shut the session out.
+    // Over HTTPS __Host-skl_dash alone, which no other name can set. Every one sent is looked at, so one a sibling
+    // domain set does not shut the session out; two whose seals hold for different users are one planted beside the
+    // other (an admin's own session, set at a longer path the browser sends first), and neither is taken.
     std::string user;
-    socketley::http::for_each_cookie(cookies, "skl_dash", [&](std::string_view v) {
+    bool two = false;
+    socketley::http::for_each_cookie(cookies, browser_https(r) ? host_cookie_name : cookie_name, [&](std::string_view v) {
         std::string who, sid;
         if (!unseal(v, who, sid) || !live(sid))
             return false;
+        if (!user.empty() && who != user)
+        {
+            two = true;
+            return true;
+        }
         user = who;
-        return true;
+        return false;
     });
-    return user;
+    return two ? std::string() : user;
 }
 
 bool server::unseal(std::string_view v, std::string& user, std::string& sid) const
@@ -345,7 +365,7 @@ void server::session(int fd, const request& r)
                 host.find_first_of("\r\n\"\\ /") == std::string_view::npos)
             {
                 const std::string back =
-                    std::string(r.header("x-forwarded-proto") == "https" ? "https://" : "http://") + std::string(host) + "/";
+                    std::string(browser_https(r) ? "https://" : "http://") + std::string(host) + "/";
                 idp = ",\"idp_login\":" + socketley::json::quote(m_idp.login_url(back)) + ",\"idp_logout\":" +
                       socketley::json::quote(m_idp.logout_url(back));
             }
@@ -354,20 +374,26 @@ void server::session(int fd, const request& r)
                  (who.empty() ? std::string("null") : socketley::json::quote(who)) + idp + "}");
         return;
     }
-    const bool https = r.header("x-forwarded-proto") == "https";
+    const bool https = browser_https(r);
+    const std::string_view name = https ? host_cookie_name : cookie_name;
     if (r.method == "DELETE")
     {
-        // The session ends here, not only in this browser, so a copy of its cookie is no session either.
-        socketley::http::for_each_cookie(r.header("cookie"), "skl_dash", [&](std::string_view v) {
-            if (std::string who, sid; unseal(v, who, sid))
-            {
-                std::lock_guard lock(m_sessions_mutex);
-                m_sessions.erase(sid);
-            }
-            return false;
-        });
-        send(fd, 204, {}, {}, std::string("Set-Cookie: skl_dash=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict") +
-                                  (https ? "; Secure" : "") + "\r\n");
+        // The session ends here, not only in this browser, so a copy of its cookie is no session either; one kept under
+        // the other name, from before the dashboard was reached over HTTPS, ends with it.
+        for (const std::string_view n : {cookie_name, host_cookie_name})
+            socketley::http::for_each_cookie(r.header("cookie"), n, [&](std::string_view v) {
+                if (std::string who, sid; unseal(v, who, sid))
+                {
+                    std::lock_guard lock(m_sessions_mutex);
+                    m_sessions.erase(sid);
+                }
+                return false;
+            });
+        std::string clear = "Set-Cookie: " + std::string(name) + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" +
+                            (https ? "; Secure" : "") + "\r\n";
+        if (https)
+            clear += "Set-Cookie: " + std::string(cookie_name) + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict; Secure\r\n";
+        send(fd, 204, {}, {}, clear);
         return;
     }
     if (r.method != "POST")
@@ -437,7 +463,7 @@ void server::session(int fd, const request& r)
     }
     LOG_INFO(("dashboard: " + user + " signed in from " + r.client()).c_str());
     send(fd, 200, "application/json", "{\"user\":" + socketley::json::quote(user) + "}",
-         "Set-Cookie: skl_dash=" + sealed + "; Path=/; Max-Age=" + std::to_string(session_seconds) +
+         "Set-Cookie: " + std::string(name) + "=" + sealed + "; Path=/; Max-Age=" + std::to_string(session_seconds) +
              "; HttpOnly; SameSite=Strict" + (https ? "; Secure" : "") + "\r\n");
 }
 
