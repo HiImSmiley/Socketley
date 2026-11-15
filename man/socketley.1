@@ -17879,7 +17879,8 @@ Email/parse reads a blob, an upload or an attached message, as an Email.
 VacationResponse is kept in the user's METADATA.
 It answers the mail that the user's mailbox accepts, at most once a week per
 sender.
-It never answers a list, a bounce, spam or an automatic reply (RFC 3834).
+It never answers a list, a bounce, spam or an automatic reply (RFC 3834),
+nor a sender that neither SPF nor DKIM vouched for, as vacation does.
 It answers whether or not a Sieve script runs.
 .PP
 A user may have at most 50 PushSubscriptions, each lasting a week until it is
@@ -18063,9 +18064,16 @@ machine, or passed SPF; otherwise reject discards it.
 .IP \(bu 2
 redirect sends the message on from the user's own address, and never again if
 it comes back.
+A message whose From is in this runtime's domains is sent on only if it came
+from a signed\-in user or this machine, or passed DMARC on arrival; otherwise
+it is kept in INBOX, since sent from the user's address it would pass the next
+server's DMARC as a forgery.
 .IP \(bu 2
 vacation answers a sender once in its days or seconds, an hour at least, from
 the null sender, and never answers a bounce or spam.
+It answers only a sender who signed in, is this machine, passed SPF, or signed
+the message with DKIM for its own domain, so a stranger cannot have this
+domain answer an address it only named.
 .IP \(bu 2
 notify mails a mailto URI, marked auto\-notified, from the null sender, at most
 three times per message.

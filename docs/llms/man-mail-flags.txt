@@ -214,7 +214,7 @@ A user's JMAP account holds the same mailboxes IMAP reads. A Mailbox id is the f
 
 A state is a digest of the index, and is the same on every shard. A */changes request since any other state is answered cannotCalculateChanges, after which the client reads again. An upload is kept for one day. An EmailSubmission can send only as the user's own address. Email/parse reads a blob, an upload or an attached message, as an Email.
 
-VacationResponse is kept in the user's METADATA. It answers the mail that the user's mailbox accepts, at most once a week per sender. It never answers a list, a bounce, spam or an automatic reply (RFC 3834). It answers whether or not a Sieve script runs.
+VacationResponse is kept in the user's METADATA. It answers the mail that the user's mailbox accepts, at most once a week per sender. It never answers a list, a bounce, spam or an automatic reply (RFC 3834), nor a sender that neither SPF nor DKIM vouched for, as vacation does. It answers whether or not a Sieve script runs.
 
 A user may have at most 50 PushSubscriptions, each lasting a week until it is renewed. A subscription is verified by a code pushed to its URL. After that, it is sent a StateChange whenever the types it asked for change. Pushes go over HTTPS to a public address, encrypted where the subscription gave keys (RFC 8291).
 
@@ -273,8 +273,8 @@ The active script runs on a thread of its own for each message that reaches the 
 - keep and fileinto file the message, with the imap4flags flags that IMAP shows. fileinto into a folder that does not exist works only with :create; otherwise the message goes into INBOX.
 - discard keeps nothing.
 - reject bounces the message to its sender if that sender signed in, is this machine, or passed SPF; otherwise reject discards it.
-- redirect sends the message on from the user's own address, and never again if it comes back.
-- vacation answers a sender once in its days or seconds, an hour at least, from the null sender, and never answers a bounce or spam.
+- redirect sends the message on from the user's own address, and never again if it comes back. A message whose From is in this runtime's domains is sent on only if it came from a signed-in user or this machine, or passed DMARC on arrival; otherwise it is kept in INBOX, since sent from the user's address it would pass the next server's DMARC as a forgery.
+- vacation answers a sender once in its days or seconds, an hour at least, from the null sender, and never answers a bounce or spam. It answers only a sender who signed in, is this machine, passed SPF, or signed the message with DKIM for its own domain, so a stranger cannot have this domain answer an address it only named.
 - notify mails a mailto URI, marked auto-notified, from the null sender, at most three times per message.
 
 What editheader adds or deletes appears in the message as it is kept and sent on, except for the Received and Auto-Submitted headers. A redirect after the script changed the From is sent only when every author in this runtime's domains is the user's own address, as submission requires; otherwise the message is kept in INBOX. duplicate keeps a message's ID for twelve hours unless :seconds says otherwise, and for a week at most. duplicate and vacation remember at most 10,000 entries per user. include :global reads the scripts uploaded for the user **.global** (**socketley mail** m **sieve .global put** name file ). include :personal reads the user's own. environment provides host, domain, remote-ip, location (MDA), phase (during), name and version. spamtest and virustest are 0 until a scanner says more. If a script fails, the message is kept in INBOX.
