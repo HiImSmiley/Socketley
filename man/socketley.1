@@ -2398,6 +2398,8 @@ A stored value would be shown while the old one went on deciding who gets in.
 These are
 .B \-\-tls
 on a runtime without it,
+.B \-\-acme
+on a runtime without TLS (it turns TLS on),
 .B \-\-ca
 naming another file, and on a proxy
 .BR \-\-client\-ca ,
@@ -2579,6 +2581,14 @@ accepts the same fields as the interactive editor (see below).
 Fields marked
 .B (read-only)
 are ignored.
+A document is judged whole before any of it is applied: a field the runtime's
+type does not have, a field named twice, a value its field does not take (a
+word where a number belongs, \-1 for a count, a port past 65535, a strategy or
+mode that is none), a
+.B type
+other than the runtime's, a script that does not load, an ACME name that is
+none and an upstream without a port are each refused, and the runtime is left as
+it was.
 Fields marked
 .B (requires restart)
 cannot be changed while the runtime is running.
@@ -2667,7 +2677,7 @@ id	T{
 T}
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web (read-only; a document that names another type is refused)
 T}
 was_running	T{
 .ad l

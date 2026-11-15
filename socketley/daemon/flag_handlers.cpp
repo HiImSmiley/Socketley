@@ -128,27 +128,26 @@ static int parse_port_flag(runtime_instance* instance, std::string_view value)
 // second grammar and no site can forget the range check.
 // --acme and --acme-email, one decision for create, edit and import: the names are checked as a CA would take them
 // for HTTP-01, and the certificate's files become the ones --acme keeps; "" when applied, else the refusal.
-std::string apply_acme(runtime_instance* instance, std::string_view v, bool email)
+std::string acme_refusal(runtime_type type, std::string_view v, bool email)
 {
     const char* flag = email ? "--acme-email" : "--acme";
-    if (!tls_role_has_handshake(instance->get_type()) || instance->get_type() == runtime_client)
+    if (!tls_role_has_handshake(type) || type == runtime_client)
         return std::string(flag) + ": a certificate is issued for a runtime that listens: server, proxy, cache or storage";
     if (email)
     {
         if (v.find('@') == std::string_view::npos || v.find_first_of(" ,\t") != std::string_view::npos)
             return "--acme-email: '" + std::string(v) + "' is not an address";
-        instance->set_acme_email(v);
         return {};
     }
-    instance->set_acme_domains(v);
-    const auto& names = instance->get_acme_domains();
-    if (names.empty())
-        return "--acme requires a name, or several separated by commas";
-    for (const std::string& name : names)
+    bool any = false;
+    for (std::string_view list = v; !list.empty();)
     {
+        const std::string_view name = socketley::take_item(list);
+        if (name.empty())
+            continue;
+        any = true;
         // A wildcard of one label, which is proven over DNS-01 by a dns runtime serving its zone.
-        const std::string_view n = std::string_view(name).starts_with("*.") ? std::string_view(name).substr(2)
-                                                                             : std::string_view(name);
+        const std::string_view n = name.starts_with("*.") ? name.substr(2) : name;
         // A name whose last label is all digits is an address, which no challenge proves.
         const std::string_view tld = n.substr(n.rfind('.') + 1);
         const bool ok = n.size() <= 253 && n.find('.') != std::string::npos && n.front() != '.' && n.back() != '.' &&
@@ -158,9 +157,25 @@ std::string apply_acme(runtime_instance* instance, std::string_view v, bool emai
                                    ch == '-' || ch == '.';
                         });
         if (!ok)
-            return "--acme: '" + name + "' is not a name a certificate is issued for "
+            return "--acme: '" + std::string(name) + "' is not a name a certificate is issued for "
                    "(no addresses, at least one dot, a wildcard only as its first label)";
     }
+    if (!any)
+        return "--acme requires a name, or several separated by commas";
+    return {};
+}
+
+std::string apply_acme(runtime_instance* instance, std::string_view v, bool email)
+{
+    if (std::string why = acme_refusal(instance->get_type(), v, email); !why.empty())
+        return why;
+    if (email)
+    {
+        instance->set_acme_email(v);
+        return {};
+    }
+    instance->set_acme_domains(v);
+    const auto& names = instance->get_acme_domains();
     instance->set_tls(true);
     instance->set_cert_path(cert_keeper::acme_cert_path(names.front()));
     instance->set_key_path(cert_keeper::acme_key_path(names.front()));
@@ -3267,6 +3282,12 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             return parse_shared_flags(instance, pa, i);
         case fnv1a("--ca"):
             if (is_running && i + 1 < pa.count && pa.args[i + 1] != instance->get_ca_path())
+                return refuse_running_trust(pa.args[i]);
+            return parse_shared_flags(instance, pa, i);
+        // A certificate for a runtime serving in cleartext turns TLS on, as --tls does: the daemon said TLS and the
+        // worker went on answering in cleartext.
+        case fnv1a("--acme"):
+            if (is_running && !instance->get_tls())
                 return refuse_running_trust(pa.args[i]);
             return parse_shared_flags(instance, pa, i);
         // Not a setting of the runtime: it says the caller wants the change carried across a stop and a start, and

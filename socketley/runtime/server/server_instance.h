@@ -850,6 +850,12 @@ public:
     // False when the address named a port that cannot work, storing nothing in
     // that case.
     [[nodiscard]] bool add_upstream_target(std::string_view addr);
+private:
+    // The one judgment of an address both of the above use; stored in `to` when it is not null.
+    static bool add_upstream_target_to(server_instance* to, std::string_view addr);
+public:
+    // Whether add_upstream_target would take `addr`, asked before anything is changed.
+    static bool upstream_ok(std::string_view addr);
     // What a refused upstream is answered with, one line.
     static std::string upstream_refusal(std::string_view addr)
     {

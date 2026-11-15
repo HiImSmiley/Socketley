@@ -375,6 +375,13 @@ public:
     bool parse_json_string(const std::string& json, runtime_config& cfg,
                            std::optional<runtime_type> assumed = std::nullopt) const;
 
+    // What `import` refuses in `json` for a runtime of `type` before anything is applied, empty when nothing: a key
+    // named twice (every reader here takes the first, an editor or jq the last), a type other than the runtime's (the
+    // fields would be read as that type's and the runtime given its defaults), a key no runtime of the type has (a
+    // typo answered 0 and changed nothing), and a value its field does not take (read as the field's default and
+    // applied: "max_connections": -1 lifted the limit, "tls": "yes" turned TLS off).
+    std::string import_refusal(const std::string& json, runtime_type type) const;
+
     // One field exactly as written, for a value that parsing normalises away --
     // `listen` loses its `unix:` prefix and cannot be judged afterwards.
     std::string raw_field(const std::string& json, std::string_view key) const;

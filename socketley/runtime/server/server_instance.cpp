@@ -601,7 +601,17 @@ bool server_instance::get_http_cache() const
 // An upstream that asked for a port and gave an unusable one is refused
 // without storing anything, because a target that can never be connected to
 // sat in the list looking exactly like one that could.
+bool server_instance::upstream_ok(std::string_view addr)
+{
+    return add_upstream_target_to(nullptr, addr);
+}
+
 bool server_instance::add_upstream_target(std::string_view addr)
+{
+    return add_upstream_target_to(this, addr);
+}
+
+bool server_instance::add_upstream_target_to(server_instance* to, std::string_view addr)
 {
     upstream_target t;
     t.address = std::string(addr);
@@ -624,7 +634,8 @@ bool server_instance::add_upstream_target(std::string_view addr)
         t.resolved_host = std::string(addr);
         t.resolved_port = 0;
     }
-    m_upstream_targets.push_back(std::move(t));
+    if (to)
+        to->m_upstream_targets.push_back(std::move(t));
     return true;
 }
 

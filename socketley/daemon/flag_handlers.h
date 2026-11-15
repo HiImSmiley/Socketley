@@ -120,6 +120,8 @@ bool apply_create_flags(runtime_instance* instance, runtime_manager& manager, st
 // success with the bare path in `out` and the reason otherwise.
 std::string validate_listen_value(std::string_view value, std::string& out);
 // --acme or --acme-email's value checked and applied, for a flag and an imported document alike: "" or the refusal.
+// The check alone, so `import` can refuse a document before it has applied any of it.
+std::string acme_refusal(runtime_type type, std::string_view value, bool email);
 std::string apply_acme(runtime_instance* instance, std::string_view value, bool email);
 
 // Mode parsing helpers

@@ -2,6 +2,7 @@
 #include "cluster_reconciler.h"
 #include "raft_host.h"
 #include "flag_handlers.h"
+#include "import_apply.h"
 #include "type_manifest.h"
 #include "../shared/runtime/command_usage.h"
 #include "../shared/util/random_id.h"
@@ -5026,9 +5027,29 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
     std::optional<metrics_instance::settings> metrics_before;
     if (type == runtime_metrics)
         metrics_before = static_cast<const metrics_instance*>(instance)->get_settings();
+    // And everything else a state file holds, because the list above is a list: a proxy's strategy, health and
+    // circuit settings, --auth, --congestion, --domain, --acme and a server's upstreams were left as the refused edit
+    // set them, reported by `show`, absent from the worker and written by the next save.
+    const std::optional<runtime_config> whole_before =
+        m_persistence ? std::optional<runtime_config>(m_persistence->read_from_instance(instance)) : std::nullopt;
 
     const auto restore_edit = [&]
     {
+        // Every field that is not its default before or after the edit, put back as it was: a field the edit changed
+        // is in one of the two documents.  The fields below are then put back by name, as they always were.
+        if (whole_before)
+        {
+            runtime_config back = *whole_before, scratch;
+            if (m_persistence->parse_json_string(m_persistence->format_json_pretty(*whole_before), scratch))
+                back.present = std::move(scratch.present);
+            if (m_persistence->parse_json_string(
+                    m_persistence->format_json_pretty(m_persistence->read_from_instance(instance)), scratch))
+                back.present.insert(scratch.present.begin(), scratch.present.end());
+            for (const char* fixed : {"name", "id", "type", "was_running"})
+                back.present.erase(fixed);
+            std::string ignored;
+            if (!import_apply(*instance, back, ignored, /*restore=*/true)) {}
+        }
         if (metrics_before)
             static_cast<metrics_instance*>(instance)->set_settings(*metrics_before);
         instance->set_tls(before.tls);
@@ -5636,6 +5657,15 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         }
     }
 
+    // The rest of the document judged whole before any field of it is (the listener and the port above, in their own
+    // words): a key named twice, another type's document, a field this type does not have, a value its field does not
+    // take.  Each was read as a default and applied, or ignored, and the import answered 0.
+    if (std::string why = m_persistence->import_refusal(json_str, instance->get_type()); !why.empty())
+    {
+        conn->write_buf = std::move(why);
+        return 1;
+    }
+
     // The --auth judged as the flag judges it, so a typo is told here and not by every request refused.
     if (cfg.has("auth") && !cfg.proxy_auth.empty())
     {
@@ -6107,63 +6137,51 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         return 1;
     }
 
-    if (has("port"))              instance->set_port(cfg.port);
-    if (has("listen"))            instance->set_listen_path(cfg.listen_path);
-    if (has("bind"))              instance->set_bind_address(cfg.bind_address);
-    if (has("domain") && type != runtime_storage) instance->set_domains(cfg.domains);
-    if (has("log_file"))          instance->set_log_file(cfg.log_file);
-    if (has("write_file"))        instance->set_write_file(cfg.write_file);
-    if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);
-    if (has("bash_prefix"))       instance->set_bash_prefix(cfg.bash_prefix);
-    if (has("bash_timestamp"))    instance->set_bash_timestamp(cfg.bash_timestamp);
-    if (has("max_connections"))   instance->set_max_connections(cfg.max_connections);
-    if (has("rate_limit"))        instance->set_rate_limit(cfg.rate_limit);
-    if (has("global_rate_limit")) instance->set_global_rate_limit(cfg.global_rate_limit);
-    if (has("idle_timeout"))      instance->set_idle_timeout(cfg.idle_timeout);
-    if (has("write_buffer"))      instance->set_write_buffer(cfg.write_buffer);
-    if (has("read_buffer"))       instance->set_read_buffer(cfg.read_buffer);
-    if (has("drain"))             instance->set_drain(cfg.drain);
-    if (has("lua_ffi"))           instance->set_lua_ffi(cfg.lua_ffi);
-    if (has("reconnect"))         instance->set_reconnect(cfg.reconnect);
-    if (has("tls"))               instance->set_tls(cfg.tls);
-    if (has("cert_path"))         instance->set_cert_path(cfg.cert_path);
-    if (has("key_path"))          instance->set_key_path(cfg.key_path);
-    // As the flags take them, which also points TLS at the files the names' certificate is kept in; empty clears them.
+    // ─── Everything that can refuse, before the first field is applied ──────
+    // The ACME names and address, a server's upstreams and the script were
+    // judged in the middle of the apply, so a refusal of any of them left every
+    // field above it applied to the daemon's copy: not stored and not sent to
+    // the worker, but reported by `show` and written by the next save that came
+    // along.  Measured: '{"max_connections":7,"lua_script":"/nonexistent.lua"}'
+    // answered "could not load Lua script" and `show` said 7.
     for (const auto& [key, value, email] : {std::tuple{"acme_domains", &cfg.acme_domains, false},
                                             std::tuple{"acme_email", &cfg.acme_email, true}})
     {
-        if (!has(key))
+        if (!has(key) || value->empty())
             continue;
-        if (value->empty())
-        {
-            if (email)
-                instance->set_acme_email("");
-            else
-                instance->set_acme_domains("");
-            continue;
-        }
-        if (std::string why = apply_acme(instance, *value, email); !why.empty())
+        if (std::string why = acme_refusal(type, *value, email); !why.empty())
         {
             conn->write_buf = why + "\n";
             return 1;
         }
     }
-    if (has("ca_path"))           instance->set_ca_path(cfg.ca_path);
-    if (has("target"))            instance->set_target(cfg.target);
-    if (has("cache_name"))        instance->set_cache_name(cfg.cache_name);
-    if (has("group"))             instance->set_group(cfg.group);
-    // Carried into this form from the block it replaced, because `show` emits
-    // shards and a round trip that dropped it would return a sharded proxy
-    // with one worker.
-    if (has("shards"))            instance->set_shards(cfg.shards);
-
-    // Lua script, reloaded if changed and only when the document says which
-    // script it wants, or a partial document detaches the runtime's handler.
+    // A certificate for a runtime that serves in cleartext is TLS turned on, which a running one has no context for:
+    // the daemon said TLS and the worker went on answering in cleartext.
+    if (is_running && has("acme_domains") && !cfg.acme_domains.empty() && !instance->get_tls())
+    {
+        conn->write_buf = "cannot change TLS while running: acme_domains turns it on; import it with --restart\n";
+        return 1;
+    }
+    if (type == runtime_server && has("upstreams"))
+        for (const auto& u : cfg.upstreams)
+            if (!server_instance::upstream_ok(u))
+            {
+                conn->write_buf = server_instance::upstream_refusal(u);
+                return 1;
+            }
+    // The script last of all, because loading it is itself the change: nothing after it refuses.
     std::string cur_lua(instance->get_lua_script_path());
     if (has("lua_script") && cfg.lua_script != cur_lua)
     {
         if (!cfg.lua_script.empty())
         {
+            // Compiled first on its own, because a load that fails keeps the path it was given (a retry needs it)
+            // and, in this process, drops the context the runtime had: a refused import left both behind.
+            if (std::string err; !lua_context::script_compiles(cfg.lua_script, err))
+            {
+                conn->write_buf = "could not load Lua script: " + cfg.lua_script + "\n" + err + "\n";
+                return 1;
+            }
             if (!instance->load_lua_script(cfg.lua_script))
             {
                 conn->write_buf = "could not load Lua script: " + cfg.lua_script + "\n";
@@ -6177,8 +6195,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         }
     }
 
-    // Its type's own fields by the document's keys, refused whole on an upstream that cannot be.
-    if (std::string why; !apply_typed_config(*instance, cfg, /*by_presence=*/true, &why))
+    // The fields themselves, every one the document names and none it leaves out; the script was loaded above, with
+    // the other things that can refuse, so a partial document never detaches the runtime's handler.
+    if (std::string why; !import_apply(*instance, cfg, why))
     {
         conn->write_buf = std::move(why);
         return 1;

@@ -47,7 +47,8 @@ daemon_isolate editrollback
 
 P_SRV=$((SL_PORT_BASE+1960))
 P_CACHE=$((SL_PORT_BASE+1962))
-NAMES="er_srv er_cache"
+P_PRX=$((SL_PORT_BASE+1964))
+NAMES="er_srv er_cache er_prx"
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -142,6 +143,41 @@ if [ -f "$STATE_DIR/er_srv.json" ]; then
 else
     bad "the state file is there to compare" "$STATE_DIR/er_srv.json is missing"
 fi
+
+# ─── 7. Every field an edit flag reaches, not only the ones on a list ───────
+# The rollback restored a list of fields, and the flags reach more: measured on
+# dev f39f29af8, `edit p --strategy random --health-interval 9 --bogus` and
+# `edit s --congestion reno --domain a.test --bogus` answered "unknown flag",
+# exit 1, and `show` had all four.  Each flag here is followed by one nobody
+# knows, and `show` has to be what it was, whole.
+create_ok "a proxy" "$BIN" create proxy er_prx -p "$P_PRX" --backend 127.0.0.1:9
+unchanged() {
+    local name=$1; shift
+    local before after rc=0
+    before=$("$BIN" show "$name")
+    "$BIN" edit "$name" "$@" --bogus-flag >/dev/null 2>&1 || rc=$?
+    after=$("$BIN" show "$name")
+    check "edit $name $* --bogus-flag is refused" "1" "$rc"
+    if [ "$before" = "$after" ]; then ok; else
+        bad "edit $name $* --bogus-flag left nothing behind" "$(diff <(echo "$before") <(echo "$after") | head -6)"; fi
+}
+unchanged er_prx --strategy random --health-interval 9
+unchanged er_prx --health-check http --health-path /up --health-threshold 4
+unchanged er_prx --circuit-threshold 3 --circuit-timeout 40 --backend-timeout 7
+unchanged er_prx --retry 3 --retry-all --compress
+unchanged er_prx --auth basic:/nonexistent/htpasswd --redirect-https 443
+unchanged er_srv --congestion reno --domain a.test
+unchanged er_srv -u 10.0.0.1:80 --http /tmp --origins https://a.test
+unchanged er_srv --acme a.example.com --acme-email me@example.com
+# And the same flags without the stranger take.
+RC=0; "$BIN" edit er_prx --strategy random --health-interval 9 >/dev/null 2>&1 || RC=$?
+check "the same proxy flags alone are taken" "0" "$RC"
+check "strategy"        "random" "$(f er_prx strategy)"
+check "health_interval" "9"      "$(f er_prx health_interval)"
+RC=0; "$BIN" edit er_srv --congestion reno --domain a.test >/dev/null 2>&1 || RC=$?
+check "the same server flags alone are taken" "0" "$RC"
+check "congestion" "reno"   "$(f er_srv congestion)"
+check "domain"     "a.test" "$(f er_srv domain)"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
