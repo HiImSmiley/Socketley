@@ -65,7 +65,8 @@ constexpr uint64_t conn_window_max = 64u << 20;
 // options.max_streams and options.max_conns: a host for which a stream costs more than a struct -- the entrance's is a
 // client connection of its own with a descriptor and a backend connection -- bounds them lower than a web server does.
 // The most connections one client address holds is a sixteenth of them, so that one address cannot take the table
-// whole: sixteen at least always find room.
+// whole: sixteen at least always find room.  Counted once the address is proven (conn::counted), so a forged source
+// fills no one's share; handshakes never finished are held down by retry_after and the handshake timeout instead.
 size_t per_address_cap(size_t conns) { return std::max<size_t>(conns / 16, 1); }
 // The field section a request's head may be, as RFC 9114 4.2.2 counts it and as SETTINGS_MAX_FIELD_SECTION_SIZE tells
 // the client; one larger is answered 431.
@@ -125,8 +126,12 @@ struct conn : std::enable_shared_from_this<conn>
     // The peer as text, for a host that logs it; its address itself stays in `remote`, which the host reads
     // through peer_of() -- parsing it into a runtime's own type is that runtime's business.
     std::string    peer;
-    // The client address it is counted under, as it opened.
+    // The client address it is counted under, as it opened -- and whether it is counted there yet.  Only from the
+    // moment that address is proven: a Retry token this side gave to it, or a handshake that finished, which needs
+    // this side's answers to have reached it.  An Initial costs nothing to send with someone else's address, and one
+    // counted as it came let a forger fill a victim's share with handshakes he never meant to finish.
     uint32_t       addr{0};
+    bool           counted{false};
 
     ~conn()
     {
@@ -219,6 +224,7 @@ struct endpoint
                                                   const sockaddr_storage& local, socklen_t local_len,
                                                   const sockaddr_storage& remote, socklen_t remote_len);
     bool app_ready(conn& hc);
+    bool proven(conn& hc);
 
     void stream_closed(conn& hc, int64_t sid);
     void mark_dirty(const std::shared_ptr<conn>& hc);
@@ -849,6 +855,12 @@ std::shared_ptr<conn> endpoint::new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_c
             auto* hc = static_cast<conn*>(ud);
             return hc->ep->app_ready(*hc) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
         };
+        // The client's Finished came, so it read this side's handshake: its address is its own.
+        c.handshake_completed = [](ngtcp2_conn*, void* ud) -> int
+        {
+            auto* hc = static_cast<conn*>(ud);
+            return hc->ep->proven(*hc) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+        };
         return c;
     }();
 
@@ -918,9 +930,31 @@ std::shared_ptr<conn> endpoint::new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_c
     }
     conns.push_back(hc);
     hc->addr = reinterpret_cast<const sockaddr_in*>(&remote)->sin_addr.s_addr;
-    ++per_address[hc->addr];
+    // A Retry's token proves the address now; any other connection is counted when its handshake finishes.
+    if (odcid)
+    {
+        ++per_address[hc->addr];
+        hc->counted = true;
+    }
     h->count(event::conn_opened);
     return hc;
+}
+
+// A connection whose address is now proven is counted under it, unless the address already holds its share: the
+// connections counted there are all proven, so they are that client's own, and this one is refused.
+bool endpoint::proven(conn& hc)
+{
+    if (hc.counted)
+        return true;
+    size_t& n = per_address[hc.addr];
+    if (n >= per_address_cap(o.max_conns))
+    {
+        ngtcp2_ccerr_set_transport_error(&hc.err, NGTCP2_CONNECTION_REFUSED, nullptr, 0);
+        return false;
+    }
+    ++n;
+    hc.counted = true;
+    return true;
 }
 
 // The handshake's keys for application data are in: HTTP/3's control and QPACK streams are opened.
@@ -1336,10 +1370,13 @@ void endpoint::drop(const std::shared_ptr<conn>& hc)
     for (const std::string& k : hc->cids)
         if (auto it = by_cid.find(k); it != by_cid.end() && it->second == hc)
             by_cid.erase(it);
-    // Once, however many times the connection is dropped.
-    if (std::find(conns.begin(), conns.end(), hc) != conns.end())
+    // Once, however many times the connection is dropped, and only if it was counted.
+    if (hc->counted && std::find(conns.begin(), conns.end(), hc) != conns.end())
+    {
+        hc->counted = false;
         if (const auto it = per_address.find(hc->addr); it != per_address.end() && --it->second == 0)
             per_address.erase(it);
+    }
     std::erase(conns, hc);
 }
 
