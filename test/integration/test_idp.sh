@@ -32,6 +32,8 @@
 #   * a return address a browser reads as another host's, by a backslash in its host
 #   * a sign-in or an account's change posted from another site's page
 #   * an e-mail a user gave themselves taken as vouched for, another account's, or able to split a line
+#   * a name a user gave themselves long enough to make their every token too large to send (Keycloak's
+#     CVE-2026-109081); a password an admin set to be set again opening a mailbox
 #   * one of them still taking a cookie of an account disabled, removed, signed out everywhere or made to reset since,
 #     or the admin bit of one taken out of admins since; or a code given before a sign-out redeemed after it
 #   * a cookie of an account renamed since still taken, carrying the old name another account may be given
@@ -347,6 +349,10 @@ if phase == "main":
     for bad in ("dora@example.com\t9G", "dora@example.com\nx", "dora", "do ra@example.com"):
         check("nor one that is no plain address: %r" % bad, req("POST", "/account", dict(name="Dora", email=bad), cookie=dc)[0], 400)
     check("but one of their own", req("POST", "/account", dict(name="Dora", email="dora@else.example"), cookie=dc)[0], 200)
+    # A name every token carries is bounded, so no holder makes their tokens too large for the heads that take them.
+    check("a name of 4000 characters is refused, as it would ride in every token",
+          req("POST", "/account", dict(name="D" * 4000, email="dora@else.example"), cookie=dc)[0], 400)
+    check("one of 256 is not", req("POST", "/account", dict(name="D" * 256, email="dora@else.example"), cookie=dc)[0], 200)
     # An app password removed while another is being checked and hashed stays removed.
     import threading
     D = {"X-Forwarded-For": "198.51.100.82"}
@@ -729,6 +735,12 @@ tally < <(run main)
 "$BIN" idp-user auth totp erin on 2>&1 | sed -n 's/^key: //p' > "$T/erin.key"
 "$BIN" idp-user auth passwd erin --password erinTemp12345 --reset >/dev/null 2>&1
 "$BIN" idp-user auth add omar --password omarpassword12 >/dev/null 2>&1 || bad "omar is made" "rc $?"
+# The mail's sign-in holds an account to set its password again as every other sign-in does: the password an admin
+# gave for one sign-in is not a mail app's for good.
+expect "a mail app signs in with an account's password" \
+    "$("$BIN" idp-user auth verify omar omarpassword12 2>&1 | cut -c1-7)" "ok omar"
+expect "but not with one an admin set to be set again" \
+    "$("$BIN" idp-user auth verify gina ginapassword1 2>&1 | cut -c1-3)" "err"
 [ -s "$T/erin.key" ] && ok || bad "a second step is turned on for the reset checks" "no key"
 tally < <(run after_cli)
 

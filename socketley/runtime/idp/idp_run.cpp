@@ -3354,6 +3354,13 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
     {
         const params p = parse_form(rq.body);
         const std::string email(http_trim_ows(param(p, "email")));
+        // Every id and access token carries the name: one its holder may make 16 KB long made their tokens too large
+        // for the 16 KiB heads of /userinfo, a db, a metrics and a JMAP runtime, and their id_token for any cookie.
+        if (param(p, "name").size() > 256)
+        {
+            account_page(c, rq, {}, "a name is at most 256 characters", 400);
+            return;
+        }
         fields.emplace_back("name", std::string(param(p, "name")));
         // An address its holder gives themselves is one nobody vouched for, and one left as it was stays as it was.
         if (email != who->field("email"))
@@ -3731,7 +3738,9 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
     if (action == "verify")
     {
         const account* who = named(user);
-        if (who && who->disabled())
+        // Standing as every other sign-in reads it: a password an admin set to be set again opens no mailbox until
+        // its holder has set their own on the web, as it opens no session, token or certificate.
+        if (who && (who->disabled() || who->field("reset") == "1"))
             who = nullptr;
         const std::string name = who ? std::string(who->username()) : std::string();
         const std::string email = who ? std::string(trusted_email(*who)) : std::string();
