@@ -5159,7 +5159,14 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
                     offers_h2 = true;
             }
         }
-        upgrade_offered = conn_has_upgrade && has_upgrade_field && !offers_h2;
+        // A request with a body offers nothing either: it goes on as the plain request it is.  A backend that takes
+        // upgrades -- a WebSocket server -- commonly reads no body behind an Upgrade head, declines (403, 426) and
+        // goes on reading HTTP/1.1, so the body was read as the next request, past every check this proxy makes
+        // per request head, on a connection then pooled (the class of nghttpx's CVE-2026-58055).  Upgrade and
+        // Connection are this hop's (RFC 9110 7.6.1, 7.8), so leaving the offer out is this proxy's to decide; no
+        // upgrade a client asks for in earnest carries a body.
+        const bool has_body = conn->ex.declared_body_len > 0 || conn->ex.declared_body_chunked;
+        upgrade_offered = conn_has_upgrade && has_upgrade_field && !offers_h2 && !has_body;
     }
 
     bool host_written = false;

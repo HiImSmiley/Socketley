@@ -6280,6 +6280,11 @@ header together with a
 header that lists the
 .B upgrade
 token.
+A request that carries a body (a
+.B Content\-Length
+above 0 or chunks) offers no upgrade: both headers are stripped and the request
+goes on as a plain one, because a backend that takes upgrades commonly reads no
+body behind an upgrade offer and would read that body as a request of its own.
 If the backend answers
 .BR "101 Switching Protocols" ,
 the proxy relays that response verbatim.
