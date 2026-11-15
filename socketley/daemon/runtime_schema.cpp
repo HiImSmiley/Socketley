@@ -169,7 +169,7 @@ constexpr row rows[] = {
     {"--join", "U", "text", "Invitation", "What `socketley tunnel <edge> invite` printed, used once to join.", "Tunnel", {}, "pi.Xw3..."},
     {"--offer", "U", "list", "Offers", "What an agent carries the edge's streams to: service=host:port each.", "Tunnel", {}, "pi=127.0.0.1:8123"},
     {"--forward", "U", "list", "Forward", "Where an edge forwards a signed-in user's stream, as ssh's ProxyCommand needs.", "Tunnel", {}, "127.0.0.1:22"},
-    {"--idp", "U", "text", "Identity provider", "The idp runtime whose signed-in people may use --forward.", "Tunnel", {}, "auth"},
+    {"--idp", "U", "text", "Identity provider", "The idp runtime whose signed-in people may use --forward; a link ends with its sign-in.", "Tunnel", {}, "auth"},
     {"--idp-audience", "U", "list", "Audiences", "The clients whose access tokens --forward takes.", "Tunnel", {}, "socketley"},
     {"--resources", "I", "list", "Resource servers", "Resource servers an access token may be issued for, by their https address. With any set, an application may also sign in by the URL of its metadata document.", "Identity", {}, "https://mcp.example.com/mcp"},
     {"--ssh-ca", "I", "int", "SSH certificates", "Sign SSH certificates for signed-in users, valid for this many hours; off unless given.", "Identity", {}, "8"},
@@ -226,7 +226,7 @@ constexpr row rows[] = {
 
     // ── mqtt ────────────────────────────────────────────────────────────────
     {"--users", "M", "path", "Users", "Password accounts, one user:hash per line, as `socketley mqtt passwd` writes them.", "MQTT", {}, "/etc/socketley/mqtt.users"},
-    {"--idp", "M", "text", "Identity provider", "The idp runtime whose access tokens sign clients in, given as the password.", "MQTT", {}, "auth"},
+    {"--idp", "M", "text", "Identity provider", "The idp runtime whose access tokens sign clients in, given as the password; a connection ends with its sign-in.", "MQTT", {}, "auth"},
     {"--idp-audience", "M", "list", "Token clients", "The idp's clients whose access tokens it takes; a token of any other is refused.", "MQTT", {}, "spa"},
     {"--acl", "M", "path", "Access rules", "Who may publish and subscribe to what: user, topic and pattern lines, read again when it changes.", "MQTT", {}, "/etc/socketley/mqtt.acl"},
     {"--anonymous", "M", "switch", "Anonymous", "Let clients in without credentials, as the access rules allow.", "MQTT"},

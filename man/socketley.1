@@ -17061,6 +17061,9 @@ names.
 A connection a token let in is closed within a few seconds once its account is
 disabled, reset, removed or signed out everywhere, rather than kept for as long
 as the client stays.
+It is also closed when the one sign\-in that its token belongs to ends on its
+own, such as when the code or refresh token that the token came from is used a
+second time.
 .TP
 .BI "\-\-idp\-audience " clients
 The ids of the idp's clients whose access tokens the runtime takes,
@@ -18751,6 +18754,9 @@ This is how ssh reaches a server through port 443.
 The edge checks the person's sign\-in again at every stream and once a second.
 Signing the account out everywhere, or disabling, resetting or removing it,
 closes the person's link.
+So does the end of the one sign\-in that the link's access token belongs to,
+such as its refresh token being used a second time; the person's other
+sign\-ins go on.
 Taking the account out of the admins takes away the agents' TCP services at
 its next stream.
 An ssh configuration that uses the tunnel:

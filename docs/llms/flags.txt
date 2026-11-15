@@ -228,7 +228,7 @@ Every flag of every runtime type, with the types that take it.
 | `--join` | text | Invitation: What `socketley tunnel <edge> invite` printed, used once to join. Types: tunnel. |
 | `--offer` | list | Offers: What an agent carries the edge's streams to: service=host:port each. Types: tunnel. |
 | `--forward` | list | Forward: Where an edge forwards a signed-in user's stream, as ssh's ProxyCommand needs. Types: tunnel. |
-| `--idp` | text | Identity provider: The idp runtime whose signed-in people may use --forward. Types: tunnel. |
+| `--idp` | text | Identity provider: The idp runtime whose signed-in people may use --forward; a link ends with its sign-in. Types: tunnel. |
 | `--idp-audience` | list | Audiences: The clients whose access tokens --forward takes. Types: tunnel. |
 
 **Identity**
@@ -342,7 +342,7 @@ Every flag of every runtime type, with the types that take it.
 | flag | value | what it does |
 |---|---|---|
 | `--users` | path | Users: Password accounts, one user:hash per line, as `socketley mqtt passwd` writes them. Types: mqtt. |
-| `--idp` | text | Identity provider: The idp runtime whose access tokens sign clients in, given as the password. Types: mqtt. |
+| `--idp` | text | Identity provider: The idp runtime whose access tokens sign clients in, given as the password; a connection ends with its sign-in. Types: mqtt. |
 | `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. Types: mqtt. |
 | `--acl` | path | Access rules: Who may publish and subscribe to what: user, topic and pattern lines, read again when it changes. Types: mqtt. |
 | `--anonymous` |  | Anonymous: Let clients in without credentials, as the access rules allow. Types: mqtt. |

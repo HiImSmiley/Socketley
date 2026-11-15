@@ -74,7 +74,7 @@ Every flag a mqtt runtime takes, by group.
 | flag | value | what it does |
 |---|---|---|
 | `--users` | path | Users: Password accounts, one user:hash per line, as `socketley mqtt passwd` writes them. |
-| `--idp` | text | Identity provider: The idp runtime whose access tokens sign clients in, given as the password. |
+| `--idp` | text | Identity provider: The idp runtime whose access tokens sign clients in, given as the password; a connection ends with its sign-in. |
 | `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. |
 | `--acl` | path | Access rules: Who may publish and subscribe to what: user, topic and pattern lines, read again when it changes. |
 | `--anonymous` |  | Anonymous: Let clients in without credentials, as the access rules allow. |

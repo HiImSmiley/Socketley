@@ -63,7 +63,7 @@ Every flag a tunnel runtime takes, by group.
 | `--join` | text | Invitation: What `socketley tunnel <edge> invite` printed, used once to join. |
 | `--offer` | list | Offers: What an agent carries the edge's streams to: service=host:port each. |
 | `--forward` | list | Forward: Where an edge forwards a signed-in user's stream, as ssh's ProxyCommand needs. |
-| `--idp` | text | Identity provider: The idp runtime whose signed-in people may use --forward. |
+| `--idp` | text | Identity provider: The idp runtime whose signed-in people may use --forward; a link ends with its sign-in. |
 | `--idp-audience` | list | Audiences: The clients whose access tokens --forward takes. |
 
 ## Benchmarks

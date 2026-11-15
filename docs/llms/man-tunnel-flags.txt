@@ -38,7 +38,7 @@ Each connection to the edge is a multiplexed link: one TLS connection that carri
 
 **People.** An edge with **--forward** carries a person signed in at its **--idp** to the targets that **--forward** names, and to nothing else. The person asks for a target with **socketley tunnel connect** or **tunnel ssh**. This is how ssh reaches a server through port 443.
 
-The edge checks the person's sign-in again at every stream and once a second. Signing the account out everywhere, or disabling, resetting or removing it, closes the person's link. Taking the account out of the admins takes away the agents' TCP services at its next stream. An ssh configuration that uses the tunnel:
+The edge checks the person's sign-in again at every stream and once a second. Signing the account out everywhere, or disabling, resetting or removing it, closes the person's link. So does the end of the one sign-in that the link's access token belongs to, such as its refresh token being used a second time; the person's other sign-ins go on. Taking the account out of the admins takes away the agents' TCP services at its next stream. An ssh configuration that uses the tunnel:
 
 ```
 Host server
