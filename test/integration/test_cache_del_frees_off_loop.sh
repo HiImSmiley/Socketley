@@ -17,11 +17,13 @@ trap daemon_stop EXIT
 echo "=== Integration: DEL of a large value frees it off the loop ==="
 command -v redis-cli >/dev/null 2>&1 || { echo "  FAIL: redis-cli required"; exit 1; }
 daemon_start "$BIN"
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 P=$((SL_PORT_BASE + 1670))
 "$BIN" create cache ldel -p "$P" -s >/dev/null 2>&1
 for _ in $(seq 1 100); do redis-cli -p "$P" ping 2>/dev/null | grep -q PONG && break; sleep 0.1; done
 
-python3 - "$P" <<'PY'
+python3 - "$P" "$sanitized" <<'PY'
 import socket, sys, time
 port = int(sys.argv[1])
 def conn():
@@ -62,7 +64,10 @@ for big in (b"set", b"hash", b"zset"):
         got += s.recv(100)
     check("DEL of the %s answers 1" % big.decode(), got == b":1\r\n", got)
 print("    a PING behind DEL of a set of 2,000,000 and a hash and a sorted set of 1,000,000: worst %.1f ms" % (worst * 1000))
-check("a PING behind DEL of a value of a million elements waits under 100 ms", worst < 0.1, "%.1f ms" % (worst * 1000))
+if sys.argv[2] == "1":
+    print("  SKIP [stall]: milliseconds measure the sanitizer, not the reaper")
+else:
+    check("a PING behind DEL of a value of a million elements waits under 100 ms", worst < 0.1, "%.1f ms" % (worst * 1000))
 check("the keys are gone", run(s, [cmd(b"DBSIZE")], 1) == b":0\r\n")
 print("  Results: %d/%d passed (%d failed)" % (passed, passed + failed, failed))
 sys.exit(failed)
