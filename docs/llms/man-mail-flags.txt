@@ -64,7 +64,7 @@ On the submission ports, the runtime accepts nothing from a client that has not 
 
 A client is answered 421 and closed in two cases: it sends more than its largest message plus one mebibyte while a command is pending, or it leaves 32 MiB of replies unread. If it still reads nothing five seconds later, the connection is reset.
 
-**--rate-limit** *n* accepts *n* messages a second from one client address or one signed-in user, and answers the next MAIL with 450. **--global-rate-limit** sets the same kind of limit for the whole runtime.
+**--rate-limit** *n* accepts *n* messages a second from one client address or one signed-in user, and answers the next MAIL with 450. A signed-in user is held to it however they send: a JMAP EmailSubmission past it is refused with rateLimit, and a message an imapsieve script would send on past it stays in its folder. **--global-rate-limit** sets the same kind of limit for the whole runtime.
 
 **What it checks.** With **--dnsbl**, the runtime looks up the address of each connection on port 25 in each list while it greets the client. Connections from 127.0.0.1 are not looked up. If the answer has not arrived by the time of MAIL, MAIL waits for it. A client that a list names (with an address in 127/8) cannot send anything and is answered 554, unless it signs in. An error answer from a list (127.255.255.x) names nobody, and a list that does not answer lets the mail through. Each answer is kept for five minutes.
 

@@ -17302,6 +17302,9 @@ accepts
 .I n
 messages a second from one client address or one signed\-in user, and answers
 the next MAIL with 450.
+A signed\-in user is held to it however they send: a JMAP EmailSubmission past
+it is refused with rateLimit, and a message an imapsieve script would send on
+past it stays in its folder.
 .B \-\-global\-rate\-limit
 sets the same kind of limit for the whole runtime.
 .PP
