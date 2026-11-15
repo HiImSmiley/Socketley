@@ -3159,6 +3159,61 @@ def statejson_seeds():
         "long_string": bytes([0]) + b'{"name":"' + b"x" * 20000 + b'"}',
     }
 
+def editmerge_seeds():
+    # A type byte, the document the runtime is restored from, a NUL, and the document imported into it.
+    def seed(t, base, doc):
+        enc = lambda o: o if isinstance(o, bytes) else json.dumps(o).encode()
+        return bytes([t]) + enc(base) + b"\0" + enc(doc)
+    server = {"name": "s", "type": "server", "port": 9000, "max_connections": 10, "rate_limit": 5, "mode": "out",
+              "http_dir": "/srv", "origins": "a.test", "upstreams": ["10.0.0.1:80"], "domain": "s.test"}
+    proxy = {"name": "p", "type": "proxy", "port": 8080, "backends": ["127.0.0.1:1", "@grp"], "strategy": "random",
+             "health_check": 2, "health_interval": 9, "health_path": "/h", "retry_count": 2, "auth": "basic:/etc/htpasswd",
+             "congestion": "reno"}
+    cache = {"name": "c", "type": "cache", "port": 6379, "max_memory": 1048576, "eviction": "allkeys-lru",
+             "persistent_path": "/var/c.db", "persistent_interval": 5}
+    storage = {"name": "st", "type": "storage", "port": 9100, "dir": "/data", "domain": "s3.test", "max_bytes": 1024,
+               "fsync": "interval", "fsync_interval": 2}
+    mail = {"name": "ml", "type": "mail", "port": 25, "mail_domain": "example.test", "imap": 143, "users": "/u",
+            "max_size": 1000, "dkim_selector": "k1"}
+    return {
+        "server_limits": seed(0, server, {"max_connections": 7, "rate_limit": 0, "idle_timeout": 30}),
+        "server_mode": seed(0, server, {"mode": "in", "send_to": "sender,others", "upstreams": []}),
+        "server_tls": seed(0, server, {"tls": True, "cert_path": "/c.pem", "key_path": "/k.pem", "ca_path": "/ca.pem"}),
+        "server_acme": seed(0, server, {"acme_domains": "a.example.com,b.example.com", "acme_email": "x@example.com"}),
+        "server_clear": seed(0, server, {"http_dir": "", "origins": "", "domain": "", "log_file": "", "bind": ""}),
+        "client": seed(1, {"name": "cl", "type": "client", "target": "127.0.0.1:9", "connections": 3, "reconnect": 2},
+                       {"connections": 1, "reconnect": -1, "udp": True, "mode": "out"}),
+        "proxy_health": seed(2, proxy, {"health_check": 0, "health_interval": 1, "circuit_threshold": 3,
+                                        "circuit_timeout": 30, "backend_timeout": 0, "retry_all": True}),
+        "proxy_backends": seed(2, proxy, {"backends": ["unix:/x", "10.0.0.2:81"], "strategy": "lua", "protocol": "tcp"}),
+        "proxy_mesh": seed(2, proxy, {"mesh_client_ca": "/ca", "mesh_client_cert": "/c", "mesh_client_key": "/k",
+                                      "congestion": "", "redirect_https": 443, "compress": False}),
+        "cache": seed(3, cache, {"max_memory": 0, "eviction": "noeviction", "cache_mode": "admin", "public": True}),
+        "storage": seed(4, storage, {"anonymous": True, "domain": "", "max_bytes": 0, "website_domain": "w.test"}),
+        "dns": seed(5, {"name": "d", "type": "dns", "port": 53, "zones": "/z", "rrl": 50}, {"rrl": 0, "dnssec": True}),
+        "sync": seed(6, {"name": "sy", "type": "sync", "dir": "/d", "storage": "st/b", "mode": "inout"},
+                     {"mode": "out", "every": 0, "exclude": "*.tmp"}),
+        "idp": seed(7, {"name": "i", "type": "idp", "port": 9443, "issuer": "https://i.test"}, {"ssh_ca": 8}),
+        "db": seed(8, {"name": "db", "type": "db", "port": 7000, "cache": 1048576}, {"cache": 0, "backup_keep": 0}),
+        "mqtt": seed(9, {"name": "m", "type": "mqtt", "port": 1883, "ws_port": 8083},
+                     {"ws_port": 0, "keepalive_max": 60, "max_packet": 1024}),
+        "mail": seed(10, mail, {"imap": 0, "pop3": 110, "recipient_delimiter": "", "dmarc_policy": "reject"}),
+        "tunnel": seed(11, {"name": "t", "type": "tunnel", "mode": "agent", "to": "edge.test:443"},
+                       {"mode": "edge", "offer": "web=127.0.0.1:80"}),
+        "metrics": seed(12, {"name": "mt", "type": "metrics", "port": 9090, "every": 10},
+                        {"downsample": "", "keep": 3600, "logs": True}),
+        "mcp": seed(13, {"name": "mc", "type": "mcp", "port": 7100, "tools": "read"}, {"tools": "none", "anonymous": True}),
+        "web": seed(14, {"name": "w", "type": "web", "port": 8000, "root": "/srv"},
+                    {"index": "home.html", "lua_pages": True, "backends": ["127.0.0.1:9000"]}),
+        "listen": seed(0, server, {"listen": "unix:/run/s.sock", "port": 0}),
+        "extra": seed(0, server, {"extra": {"k": "v"}}),
+        "refused_typo": seed(0, server, {"max_conections": 5}),
+        "refused_type": seed(2, proxy, {"type": "server", "strategy": "random"}),
+        "refused_value": seed(0, server, {"max_connections": -1}),
+        "refused_twice": seed(0, server, b'{"idle_timeout":5,"idle_timeout":9}'),
+        "empty_base": seed(3, b"", {"max_memory": 5}),
+    }
+
 def wsreassembly_seeds():
     # A read-size byte, a --read-buffer byte (64, 128 or 192 KiB; its top bit the mqtt runtime, whose largest packet
     # is 1 KiB times one more than its low six bits), then per frame a kind and a length: 0xE0-0xE7 a short one in the
@@ -3405,6 +3460,7 @@ def main(argv):
                         ("mailsessions", mailsessions_seeds()),
                         ("h2session", h2session_seeds()),
                         ("statejson", statejson_seeds()),
+                        ("editmerge", editmerge_seeds()),
                         ("wsreassembly", wsreassembly_seeds()),
                         ("respdispatch", respdispatch_seeds()),
                         ("sievebudget", sievebudget_seeds()),

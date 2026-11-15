@@ -15,6 +15,9 @@
 //     back as the same configuration: writing it a second time gives the same bytes. A state file is read at every
 //     start and written at every change, so a field that drifts between the two is a setting that changes by itself.
 //   * raw_field() names nothing that is not in the document.
+//   * What this side writes is a document `import` takes for the runtime it describes: `show | import` is the round
+//     trip the manual gives, so a key written that the type does not read, or a value written that its field refuses,
+//     is a document the daemon prints and then refuses.
 
 #include <optional>
 #include <string>
@@ -40,10 +43,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         FUZZ_CHECK(raw.size() <= json.size(), "a raw field longer than the document it was read from");
     }
 
+    // Judged whatever it holds, as an import judges it before anything else is read.
+    (void)parser.import_refusal(json, assumed.value_or(runtime_server));
+
     runtime_config first;
     if (!parser.parse_json_string(json, first, assumed))
         return 0;
     const std::string written = parser.format_json_pretty(first);
+    {
+        const std::string why = parser.import_refusal(written, first.type);
+        if (!why.empty())
+        {
+            fuzz::dump("written", reinterpret_cast<const uint8_t*>(written.data()), written.size());
+            fuzz::dump("refused", reinterpret_cast<const uint8_t*>(why.data()), why.size());
+        }
+        FUZZ_CHECK(why.empty(), "import refuses a document this side wrote");
+    }
 
     runtime_config again;
     FUZZ_CHECK(parser.parse_json_string(written, again, assumed), "a state file this side wrote does not read back");

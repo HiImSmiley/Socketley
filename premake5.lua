@@ -2192,6 +2192,33 @@ project "fuzz_state_json"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: import's merge of a document into a runtime, against one restored from its state ───
+
+project "fuzz_edit_merge"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs {
+        ".",
+        "socketley",
+        "test/fuzz",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "sdk/include/linux"
+    }
+
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
+
+    files {
+        "test/fuzz/fuzz_edit_merge.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: a server's WebSocket reassembly, driven on a connection with no socket ───
 
 project "fuzz_ws_reassembly"
