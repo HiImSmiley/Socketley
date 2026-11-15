@@ -10815,7 +10815,7 @@ The addresses and address blocks that may copy a whole zone by AXFR over TCP (RF
 
 ### `--notify list`
 
-The secondaries that get a NOTIFY (RFC 1996) when the runtime starts and whenever a zone's serial changes. Give them as *host*[:*port*], comma-separated. The runtime sends the NOTIFY again after 1, 3, 7, 15 and 31 seconds until the secondary answers it. Only the first shard sends them.
+The secondaries that get a NOTIFY (RFC 1996) when the runtime starts and whenever a zone's serial changes. Give them as *host*[:*port*], comma-separated. The runtime sends the NOTIFY again after 1, 3, 7, 15 and 31 seconds until the secondary answers it. Only the first shard sends them. Each NOTIFY carries a random ID (RFC 5452) and goes out from a port of its own. An answer counts only when it comes from that secondary's address and port, carries the ID, and gives back the question: the zone, SOA, IN.
 
 ### `--publish list`
 
