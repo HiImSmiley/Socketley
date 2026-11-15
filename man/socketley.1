@@ -25495,6 +25495,15 @@ minutes.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_MAIL_JMAP_AUTH_MS
+A test aid that sets how many milliseconds a JMAP connection takes the
+Authorization it checked again without checking it.
+After this time the next request on the connection has its password or bearer
+token checked again, so an account disabled or a token expired is refused on a
+connection it signed in on. Default: one minute.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_IDP_CLIENT_CA
 A test aid that names a file of CA certificates for checking the client
 metadata documents an idp fetches.

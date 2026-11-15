@@ -11,6 +11,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/settings.h"
 #include "../../shared/util/wall_clock.h"
 
 namespace socketley::mail
@@ -589,7 +590,10 @@ void jmap_session::handle(request rq)
             serve(std::move(rq));
         });
     }
-    if (!m_user.empty() && auth == m_auth_seen)
+    // A credential checked a moment ago on this connection is taken again, but not for the connection's life: a
+    // bearer token past its expiry, a password changed, an account disabled or signed out everywhere ends here too.
+    static const int64_t recheck_ms = settings::number<int64_t>("SOCKETLEY_MAIL_JMAP_AUTH_MS").value_or(60000);
+    if (!m_user.empty() && auth == m_auth_seen && wall::now_ms_coarse() < m_auth_until)
         return serve(std::move(rq));
     const auto signed_in = [this, auth, serve, after, rq, alive = m_alive](account a, std::string name) mutable {
         if (!*alive)
@@ -606,6 +610,7 @@ void jmap_session::handle(request rq)
         }
         m_user = std::move(name);
         m_auth_seen = auth;
+        m_auth_until = wall::now_ms_coarse() + recheck_ms;
         serve(std::move(rq));
     };
     if (auth.size() > 7 && socketley::ascii::iequals(std::string_view(auth).substr(0, 7), "Bearer "))

@@ -23,6 +23,8 @@
 #     StateChange not sent when mail comes, or its URL and keys told back
 #   * a push user with no verified subscription read every second by the shard that pushes for it, so that shard
 #     never lets the user go; or one let go and verified later not pushed to
+#   * a connection that signed in once taken as signed in for its life: an account disabled since, or a bearer
+#     token expired since, still served on it while the client sends the same header
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -91,6 +93,7 @@ PIDS+=($!)
 export SOCKETLEY_MAIL_PUSH_CONNECT="127.0.0.1:$PUSH" SOCKETLEY_MAIL_PUSH_CA="$T/ca.pem"
 # A shard other than the first lets a user go 1.5 s after nothing there asked for it.
 export SOCKETLEY_MAIL_LET_GO_MS=1500
+export SOCKETLEY_MAIL_JMAP_AUTH_MS=1000
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_LOCAL_EXCHANGERS=1
 mkdir -p "$T/sink"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" >/dev/null 2>&1 &
@@ -515,6 +518,26 @@ p = pushes(2)
 say("verified, she is read again by that shard and the new mail pushed", len(p) >= 2 and p[1].get("@type") == "StateChange", p)
 PY
 tally < <(timeout 120 python3 "$T/sharded_push.py" "$JM2" "$P2" "$BIN" "$T/pushes" 2>&1 | grep -E '^(ok|bad) ')
+
+# A connection's credentials checked once are not taken for its life: alice disabled while her connection is kept
+# open is refused on it once SOCKETLEY_MAIL_JMAP_AUTH_MS (1 s here) has passed, the same header sent again.
+tally < <(timeout 60 python3 - "$JM" "$BIN" 2>&1 <<'PY' | grep -E '^(ok|bad) '
+import base64, http.client, subprocess, sys, time
+jm, b = int(sys.argv[1]), sys.argv[2]
+h = {"Authorization": "Basic " + base64.b64encode(b"alice:alicepassword1").decode()}
+c = http.client.HTTPConnection("127.0.0.1", jm, timeout=20)
+def ask():
+    c.request("GET", "/.well-known/jmap", headers=h); r = c.getresponse(); r.read(); return r.status
+first, again = ask(), ask()
+subprocess.run([b, "idp-user", "auth", "disable", "alice"], capture_output=True)
+time.sleep(1.5)
+late = ask()
+got = (first, again, late)
+print(("ok " if got == (200, 200, 401) else "bad ") +
+      "an account disabled is refused on a kept connection it signed in on, once its check is a second old" +
+      ("" if got == (200, 200, 401) else ": " + str(got)))
+PY
+)
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

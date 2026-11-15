@@ -224,6 +224,8 @@ inline constexpr setting table[] = {
      "milliseconds a mail runtime's spam filter leaves what the shards learned in its journal before it is folded in"},
     {"SOCKETLEY_MAIL_LET_GO_MS", kind::number, audience::test, 100, no_max, "600000",
      "milliseconds a mail runtime's shard other than the first keeps a user's index that nothing there asked for"},
+    {"SOCKETLEY_MAIL_JMAP_AUTH_MS", kind::number, audience::test, 0, no_max, "60000",
+     "milliseconds a JMAP connection takes the credentials it checked again without asking"},
     {"SOCKETLEY_IDP_CLIENT_CA", kind::text, audience::test, 0, 0, "the system's",
      "a CA file the certificates of client metadata documents an idp fetches are checked against"},
     {"SOCKETLEY_IDP_CLIENT_CONNECT", kind::text, audience::test, 0, 0, "the address's host",

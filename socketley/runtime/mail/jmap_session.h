@@ -229,8 +229,10 @@ private:
     bool m_closed{false};
     bool m_keep{true};
     std::string m_user;
-    // The Authorization header the last request was signed in with, which the next one need not check again.
+    // The Authorization header the last request was signed in with, which the next one need not check again until
+    // `m_auth_until` (wall ms): a token that expired or an account disabled since is told within that, not never.
     std::string m_auth_seen;
+    int64_t m_auth_until{0};
     // The request being answered came over HTTPS to the entrance, from the webmail page, signed in by its cookie.
     bool m_https{false};
     bool m_from_page{false};
