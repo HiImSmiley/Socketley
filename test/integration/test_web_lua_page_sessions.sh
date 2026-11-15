@@ -103,19 +103,47 @@ check "and it is gone" "user=- n=0" "$(curl -s -b "sid=$SECOND" "http://127.0.0.
 
 check "a password hash is scrypt's and verifies" "\$scrypt\$ true false" "$(get '/hash.lua?pw=secret')"
 
-# Two hashes at once take tens of milliseconds each on the helper thread; a page asked meanwhile is not held for them.
-curl -s "http://127.0.0.1:$P/hash.lua?pw=a" > /dev/null &
-H1=$!
-curl -s "http://127.0.0.1:$P/hash.lua?pw=b" > /dev/null &
-H2=$!
-sleep 0.005
-T0=$(date +%s%N)
-QUICK=$(curl -s "http://127.0.0.1:$P/quick.lua")
-T1=$(date +%s%N)
-wait "$H1" "$H2" || true
-MS=$(( (T1 - T0) / 1000000 ))
-if [ "$QUICK" = quick ] && [ "$MS" -lt 40 ]; then ok; else
-    bad "a page is answered while hashes are made" "'$QUICK' after ${MS}ms"; fi
+# Hash pages under way, each three scrypts on the runtime's one hash thread, and a page asked after them: it is
+# answered before the last of them, which on the loop it could not be -- the loop would make each page's hashes in
+# turn, holding everything that came after.  Measured as an order, from one process holding every connection open
+# before anything is sent, and not as a time: curl started from this shell took most of the 40 ms this was held to
+# on a box at load 30, the hashing's or not.
+ORDER=$(python3 - "$P" <<'PY'
+import socket, sys, time, selectors
+port = int(sys.argv[1])
+def conn():
+    s = socket.create_connection(("127.0.0.1", port), timeout=10); s.setblocking(False); return s
+hashes = [conn() for _ in range(4)]
+quick = conn()
+sel = selectors.DefaultSelector()
+got = {}
+def ask(s, path, name):
+    s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" % path).encode())
+    sel.register(s, selectors.EVENT_READ, [name, b""])
+for i, s in enumerate(hashes):
+    ask(s, "/hash.lua?pw=p%d" % i, "hash%d" % i)
+time.sleep(0.02)
+ask(quick, "/quick.lua", "quick")
+order = []
+end = time.monotonic() + 30
+while len(order) < 5 and time.monotonic() < end:
+    for key, _ in sel.select(timeout=1):
+        d = key.fileobj.recv(65536)
+        if d:
+            key.data[1] += d
+            continue
+        sel.unregister(key.fileobj); key.fileobj.close()
+        body = key.data[1].split(b"\r\n\r\n", 1)[-1]
+        ok = (b"quick" in body) if key.data[0] == "quick" else body.startswith(b"$scrypt$ true false")
+        order.append(key.data[0] if ok else key.data[0] + "?")
+print(" ".join(order))
+PY
+) || true
+echo "  answered in this order: $ORDER"
+set -- $ORDER
+if [ "$#" = 5 ] && [[ " $ORDER " == *" quick "* ]] && [ "${!#}" != quick ]; then ok
+else bad "a page is answered while hashes are made, before the last of four hash pages asked before it" "answered: $ORDER"; fi
+case "$ORDER" in *"?"*|"") bad "and every hash page answers its hash" "answered: $ORDER" ;; *) ok ;; esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]
