@@ -78,8 +78,13 @@ public:
         if (!is_packed())
             return { size(), 0, 0, seg_ref().now(), seg_ref().spare_after_assign(i, len), false };
         const auto& p = packed_ref();
-        if (len > PACK_MAX_LEN) return { p.n, 0, 0, seg_list::built(p.n), 0, false };
         const size_t old = item(offset_of(i)).size();
+        // Unpacked first, then element `i` assigned, which fits it to a block
+        // that may hold more than `len`: 64 bytes set to 100 take 128.  With
+        // that left out, an LSET past the packed bound was admitted for less
+        // than it grew the store by.
+        if (len > PACK_MAX_LEN)
+            return { p.n, 0, 0, seg_list::built(p.n), seg_list::spare_after_fresh_assign(old, len), false };
         return { p.n, p.buf.size() - old + len,
                  p.buf.heap_part(p.buf.capacity_for(len > old ? len - old : 0)), {}, 0, true };
     }

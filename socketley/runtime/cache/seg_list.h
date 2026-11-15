@@ -87,6 +87,13 @@ public:
         return spare() - size_t{units(s)} * 16
              + size_t{units(fitted_capacity(s.capacity(), len), len)} * 16;
     }
+    // The same for an element just made from `old` bytes, as a list unpacked
+    // makes each one: a string as long as it is, or the string's own room.
+    static size_t spare_after_fresh_assign(size_t old, size_t len)
+    {
+        const size_t local = std::string().capacity();
+        return size_t{units(fitted_capacity(old > local ? old : local, len), len)} * 16;
+    }
     void assign(size_t i, std::string_view v)
     {
         std::string& s = (*this)[i];

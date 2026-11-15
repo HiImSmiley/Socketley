@@ -4561,6 +4561,44 @@ TEST_CASE("a COPY of a stream is admitted for what the copy holds, which may be 
     CHECK(over == 0);
 }
 
+TEST_CASE("an LSET that takes a packed list past its bound is admitted for the room the element is fitted to")
+{
+    // The list is unpacked and the element then assigned, which fits it to a
+    // block that may hold more than its length: 64 bytes set to 100 take 128.
+    // The prediction left that out, so the LSET was admitted for 48 bytes less
+    // than it grew the store by (fuzz_cache_ops, "over-limit").  Every limit
+    // from the store's size up: the LSET either fits or is refused.
+    for (const size_t from : { size_t(16), size_t(63), size_t(64) })
+        for (const size_t to : { size_t(65), size_t(100), size_t(127) })
+        {
+            const auto make = [from](cache_store& st) {
+                REQUIRE(st.rpush("l", std::string(from, 'a')));
+                REQUIRE(st.rpush("l", "b"));
+            };
+            cache_store probe;
+            make(probe);
+            const size_t base = probe.get_memory_used();
+            size_t admitted = 0, refused = 0, over = 0;
+            for (size_t limit = base; limit < base + 1024; limit += 4)
+            {
+                cache_store store;
+                make(store);
+                store.set_max_memory(limit);
+                store.set_eviction(evict_none);
+                const int r = store.lset("l", 0, std::string(to, 'c'));
+                REQUIRE((r == 0 || r == -3));
+                (r == 0 ? admitted : refused)++;
+                if (r == 0 && store.get_memory_used() > limit)
+                    over++;
+            }
+            CAPTURE(from);
+            CAPTURE(to);
+            CHECK(admitted > 0);
+            CHECK(refused > 0);
+            CHECK(over == 0);
+        }
+}
+
 TEST_CASE("a stream write refused for room leaves the stream as it was")
 {
     cache_store store;
