@@ -146,6 +146,19 @@ struct conn : std::enable_shared_from_this<conn>
     }
 };
 
+// What a call into nghttp3 from one of ngtcp2's callbacks answered, as that callback's own answer: an error ends
+// the connection with the HTTP/3 code nghttp3 means by it -- H3_CLOSED_CRITICAL_STREAM for a control or QPACK stream
+// the peer reset, or one it asked this side to stop sending on (RFC 9114 6.2.1, RFC 9204 4.2).  Without the code the
+// connection was still closed, but as a transport INTERNAL_ERROR, which tells the peer this side failed.
+static int h3_verdict(conn& hc, int rv)
+{
+    if (rv == 0)
+        return 0;
+    if (hc.err.error_code == 0)
+        ngtcp2_ccerr_set_application_error(&hc.err, nghttp3_err_infer_quic_app_error_code(rv), nullptr, 0);
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
 struct endpoint
 {
     // What used to be the runtime's: who is told about the streams, the ring every operation goes through, the
@@ -785,9 +798,7 @@ std::shared_ptr<conn> endpoint::new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_c
         c.acked_stream_data_offset = [](ngtcp2_conn*, int64_t sid, uint64_t, uint64_t len, void* ud, void*) -> int
         {
             auto* hc = static_cast<conn*>(ud);
-            if (hc->h && nghttp3_conn_add_ack_offset(hc->h, sid, len) != 0)
-                return NGTCP2_ERR_CALLBACK_FAILURE;
-            return 0;
+            return hc->h ? h3_verdict(*hc, nghttp3_conn_add_ack_offset(hc->h, sid, len)) : 0;
         };
         c.stream_close2 = [](ngtcp2_conn*, uint32_t flags, int64_t sid, uint64_t rx, uint64_t tx, void* ud, void*) -> int
         {
@@ -800,17 +811,17 @@ std::shared_ptr<conn> endpoint::new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_c
             if (flags & NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET)
                 f |= NGHTTP3_STREAM_CLOSE_FLAG_TX_APP_ERROR_CODE_SET;
             const int rv = nghttp3_conn_close_stream2(hc->h, f, sid, rx, tx);
-            return rv == 0 || rv == NGHTTP3_ERR_STREAM_NOT_FOUND ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+            return rv == NGHTTP3_ERR_STREAM_NOT_FOUND ? 0 : h3_verdict(*hc, rv);
         };
         c.stream_reset = [](ngtcp2_conn*, int64_t sid, uint64_t, uint64_t, void* ud, void*) -> int
         {
             auto* hc = static_cast<conn*>(ud);
-            return !hc->h || nghttp3_conn_shutdown_stream_read(hc->h, sid) == 0 ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+            return hc->h ? h3_verdict(*hc, nghttp3_conn_shutdown_stream_read(hc->h, sid)) : 0;
         };
         c.stream_stop_sending = [](ngtcp2_conn*, int64_t sid, uint64_t, void* ud, void*) -> int
         {
             auto* hc = static_cast<conn*>(ud);
-            return !hc->h || nghttp3_conn_shutdown_stream_read(hc->h, sid) == 0 ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+            return hc->h ? h3_verdict(*hc, nghttp3_conn_shutdown_stream_read(hc->h, sid)) : 0;
         };
         c.extend_max_remote_streams_bidi = [](ngtcp2_conn*, uint64_t max, void* ud) -> int
         {
@@ -822,7 +833,7 @@ std::shared_ptr<conn> endpoint::new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_c
         c.extend_max_stream_data = [](ngtcp2_conn*, int64_t sid, uint64_t, void* ud, void*) -> int
         {
             auto* hc = static_cast<conn*>(ud);
-            return !hc->h || nghttp3_conn_unblock_stream(hc->h, sid) == 0 ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+            return hc->h ? h3_verdict(*hc, nghttp3_conn_unblock_stream(hc->h, sid)) : 0;
         };
         c.get_new_connection_id2 = [](ngtcp2_conn*, ngtcp2_cid* cid, ngtcp2_stateless_reset_token* token, size_t cidlen,
                                       void* ud) -> int

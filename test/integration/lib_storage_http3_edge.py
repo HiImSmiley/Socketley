@@ -13,6 +13,10 @@ usage:
   lib_storage_http3_edge.py crowd PORT CAFILE N        N connections from 127.0.0.1 held open, then one more from it
                                                        and one from 127.0.0.2; prints how many were kept and whether
                                                        each of the two was "served" or "refused"
+  lib_storage_http3_edge.py critical PORT CAFILE CASE  one of the critical streams (RFC 9114 6.2.1, RFC 9204 4.2) ended,
+                                                       asked to end, or opened twice: reset_ctrl fin_ctrl stop_srv_ctrl
+                                                       fin_enc reset_dec dup_ctrl dup_enc dup_dec; prints the close the
+                                                       server sent, "app 0x104", or "open" when none came in 3 s
 """
 import asyncio
 import hashlib
@@ -278,6 +282,68 @@ async def crowd(port, ca, n):
         c._tr.close()
 
 
+class Bare(QuicConnectionProtocol):
+    """A QUIC client with no HTTP/3 of its own, so its unidirectional streams are the caller's to write."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.closed = None
+
+    def quic_event_received(self, ev):
+        if isinstance(ev, ConnectionTerminated):
+            self.closed = ev
+
+
+async def critical(port, ca, case):
+    from aioquic.buffer import encode_uint_var
+    if case.startswith("dup_"):
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        tr, c = await loop.create_datagram_endpoint(lambda: Bare(QuicConnection(configuration=config(ca))), sock=sock)
+        c.connect(("127.0.0.1", port))
+        c._tr = tr
+        await asyncio.wait_for(c.wait_connected(), 10)
+    else:
+        c = await open_client(port, config(ca))
+    q = c._quic
+    if case.startswith("dup_"):
+        # The client's three unidirectional streams written by hand, one kind twice in place of another; a fourth
+        # would be past the three the server allows.
+        order = {"ctrl": [0x00, 0x02, 0x00], "enc": [0x00, 0x02, 0x02], "dec": [0x00, 0x03, 0x03]}[case[4:]]
+        for i, t in enumerate(order):
+            sid = q.get_next_available_stream_id(is_unidirectional=True)
+            # a control stream begins with SETTINGS, here an empty one
+            q.send_stream_data(sid, encode_uint_var(t) + (b"\x04\x00" if t == 0x00 and i == 0 else b""))
+    else:
+        h = c.h3
+        c.transmit()
+        await asyncio.sleep(0.3)
+        ctrl, enc, dec = h._local_control_stream_id, h._local_encoder_stream_id, h._local_decoder_stream_id
+        if case == "reset_ctrl":
+            q.reset_stream(ctrl, 0x100)
+        elif case == "fin_ctrl":
+            q.send_stream_data(ctrl, b"", end_stream=True)
+        elif case == "fin_enc":
+            q.send_stream_data(enc, b"", end_stream=True)
+        elif case == "reset_dec":
+            q.reset_stream(dec, 0x100)
+        elif case == "stop_srv_ctrl":
+            # the server's control stream is the first stream it opens, 3
+            q.stop_stream(3, 0x100)
+    c.transmit()
+    for _ in range(30):
+        if c.closed is not None:
+            break
+        await asyncio.sleep(0.1)
+    t = c.closed
+    if t is None:
+        print("open")
+    else:
+        # aioquic gives an application close no frame type, and a transport close the type of the frame it was for
+        print("%s 0x%x" % ("app" if t.frame_type is None else "transport", t.error_code))
+    c._tr.close()
+
+
 cmd = sys.argv[1]
 if cmd == "migrate":
     asyncio.run(migrate(int(sys.argv[2]), sys.argv[3], sys.argv[4]))
@@ -287,5 +353,7 @@ elif cmd == "peer":
     asyncio.run(peer(int(sys.argv[2]), sys.argv[3], *sys.argv[4:6]))
 elif cmd == "crowd":
     asyncio.run(crowd(int(sys.argv[2]), sys.argv[3], int(sys.argv[4])))
+elif cmd == "critical":
+    asyncio.run(critical(int(sys.argv[2]), sys.argv[3], sys.argv[4]))
 elif cmd == "stalled":
     asyncio.run(stalled(int(sys.argv[2]), sys.argv[3], sys.argv[4], float(sys.argv[5])))
