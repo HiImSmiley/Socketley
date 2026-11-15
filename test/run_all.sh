@@ -310,6 +310,7 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_sieve_budget)   corpus=sievebudget ;;
         fuzz_tunnel_mux)     corpus=tunnelmux ;;
         fuzz_ssh_cert)       corpus=sshcert ;;
+        fuzz_decoders)       corpus=decoders ;;
         *)
             echo "ERROR: $fname has no corpus mapping in run_all.sh."
             echo "       A target nothing replays is a target that does not run."
