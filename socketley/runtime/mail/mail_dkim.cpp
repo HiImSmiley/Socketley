@@ -338,8 +338,12 @@ std::string sign(std::string_view message, std::string_view domain, std::string_
                     break;
             }
     }
-    // From named once more than it is there, so a second From added on the way breaks the signature.
-    h += ":from";
+    // From named once more than it is there, so a second From added on the way breaks the signature.  Joined only
+    // to a name before it: a message with none of them is h=from, since an empty name in h= is no field name
+    // (RFC 6376 3.5) and a checker matched it to a header of no name, which the signature had not covered.
+    if (!h.empty())
+        h += ':';
+    h += "from";
     const std::string bh = body_hash_given.empty() ? sha256_b64(relaxed_body(body)) : std::string(body_hash_given);
     // A DKIM-Signature says its version first, whatever tags come with it; ARC's signature has none.
     std::string value = " " + std::string(header == "DKIM-Signature" ? "v=1; " : "") + std::string(first_tags) + "a=" +

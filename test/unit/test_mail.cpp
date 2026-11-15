@@ -604,6 +604,17 @@ TEST_CASE("DKIM: what this signs, it verifies, and the canonicalizations are RFC
     REQUIRE(xs.size() == 1);
     CHECK(dkim::verify(expiring, xs[0], dkim::public_record(key.get()), 1400) == dkim::result::pass);
     CHECK(dkim::verify(expiring, xs[0], dkim::public_record(key.get()), 1600) == dkim::result::fail);
+    // A message with none of the headers it signs names From alone: h=from, not h=:from, whose empty first name a
+    // checker matched to a header of no name and failed the signature (fuzz_mail: an ARC set sealed here over such
+    // a message failed its own chain).
+    for (const std::string bare : {":\r\n\r\nFrom:", ": v\r\n\r\nbody\r\n", "X-Other: y\r\n\r\nbody\r\n"})
+    {
+        const std::string signed_bare = dkim::sign(bare, "example.test", "skl", key.get(), 1000) + bare;
+        const auto bs = dkim::signatures(signed_bare);
+        REQUIRE(bs.size() == 1);
+        CHECK(bs[0].h == "from");
+        CHECK(dkim::verify(signed_bare, bs[0], dkim::public_record(key.get()), 1000) == dkim::result::pass);
+    }
     std::filesystem::remove_all(tmpl);
 }
 
@@ -1662,6 +1673,10 @@ TEST_CASE("ARC: a set sealed here verifies, a chain broken on the way fails, and
     CHECK_MESSAGE(c.result == "pass", c.why);
     CHECK(c.count == 1);
     CHECK(c.sealer == "fwd.test");
+    // A message whose one header has no name and that has no From: its set passes too (fuzz_mail, 11 bytes).
+    const std::string bare = ":\r\n\r\nFrom:";
+    c = arc::verify(arc::seal(bare, "mx.fwd.test", "spf=pass", "fwd.test", "arc", key.get(), 1000, "none") + bare, key_of, 1000);
+    CHECK_MESSAGE(c.result == "pass", c.why);
     // A second hop seals over the first, by Ed25519.
     const std::string two = arc::seal(one, "mx.second.test", "arc=pass", "second.test", "arc2", ed.get(), 1001, "pass") + one;
     c = arc::verify(two, key_of, 1001);
