@@ -9,7 +9,8 @@
 #   * guesses sent together, spread over an IPv6 /64, over the /64s of one /48 or over many addresses at one account,
 #     or wrong codes, passing the bars on them
 #   * an address's bar holding up a browser an account signed in on, or set by /token requests that guess no secret
-#   * a code redeemed twice, by another client, for another redirect, or without its PKCE verifier
+#   * a code redeemed twice, by another client, for another redirect, or without its PKCE verifier, or with a
+#     verifier when it was asked without a challenge (PKCE downgrade)
 #   * a token that does not verify against the published key, or names the account by anything but its id
 #   * a refresh for an account disabled, signed out everywhere or made to reset its password since
 #   * a refresh token good more than once, or one used again leaving its sign-in standing
@@ -249,6 +250,11 @@ if phase == "main":
     check("/login sends no code to an address the client did not register", (st, "code=" in (h.get("Location") or "")), (400, False))
     st, body, h = req("POST", "/login", dict(auth, redirect_uri="https://attacker.example/cb", username="alice", password="alicepassword1"))
     check("nor does a sign-in posted to /login", (st, "code=" in (h.get("Location") or "")), (400, False))
+
+    # A verifier sent for a code asked without a challenge: the challenge was taken out on the way (PKCE downgrade).
+    st, body, h = req("GET", "/authorize" + q(**dict(auth, state="downgrade")), cookie=cookie)
+    st, body, _ = exchange(code_of(h)[0].get("code"), extra=dict(code_verifier="d" * 64))
+    check("a verifier for a code asked without a challenge gets nothing", (st, json.loads(body).get("error")), (400, "invalid_grant"))
 
     # A public client: PKCE or nothing.
     pub = dict(client_id="spa", redirect_uri="http://localhost:5173/cb", response_type="code", scope="openid offline_access")

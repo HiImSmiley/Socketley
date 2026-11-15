@@ -2779,6 +2779,13 @@ void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const p
         json_error(c, 400, "invalid_grant", "the code verifier does not match the challenge");
         return;
     }
+    // A verifier for a code asked without a challenge means the challenge was taken out on the way, so the client
+    // that holds the verifier is not the one the code went to (RFC 9700 2.1.1, PKCE downgrade).
+    if (e.challenge.empty() && !param(p, "code_verifier").empty())
+    {
+        json_error(c, 400, "invalid_grant", "a code verifier was sent for a code asked without a code challenge");
+        return;
+    }
     if (const std::string_view asked = param(p, "resource"); !asked.empty() && canonical_resource(asked) != e.resource)
     {
         json_error(c, 400, "invalid_target", "the resource is not the one the code was given for");
