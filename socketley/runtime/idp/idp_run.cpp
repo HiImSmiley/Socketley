@@ -148,7 +148,10 @@ field_list stale_families(const account& who, int64_t now)
 }
 
 // The fields that sign the session naming `sid` out until `exp`, those signed out before that have expired let go; for
-// a session that names no sid it can be known by, or past the most an account keeps, every session ends instead.
+// a session that names no sid it can be known by, every session ends instead.  Past the most an account keeps, every
+// session ends as well, and the others' fields go, their tokens all older than the floor; but `sid`'s own is kept:
+// what is given under it after the floor -- a code's first exchange answered once its family is written, a refresh
+// taken in the same turn -- is newer than the floor, and only the field says it is revoked.
 field_list sign_out_fields(const account& who, std::string_view sid, int64_t exp, int64_t now)
 {
     field_list out;
@@ -173,9 +176,12 @@ field_list sign_out_fields(const account& who, std::string_view sid, int64_t exp
         return out;
     }
     out.clear();
+    const std::string own = named ? std::string(signed_out_prefix) + std::string(sid) : std::string();
     for (const auto& [k, v] : who.fields)
-        if (k.starts_with(signed_out_prefix))
+        if (k.starts_with(signed_out_prefix) && k != own)
             out.emplace_back(k, "");
+    if (named)
+        out.emplace_back(own, std::to_string(exp));
     out.emplace_back("revoked_before", std::to_string(wall::now_ms()));
     return out;
 }
@@ -2832,9 +2838,9 @@ void idp_run::revoke_grant(const code_entry& e, std::function<void()> then)
     // newest of them has expired (one given just now by the first exchange, still in flight, included); its refresh
     // family, kept or still being made, is ended by the same field.
     field_list fields = sign_out_fields(*who, e.grant, now + token_secs + code_secs, now);
-    const std::string family = std::string(family_prefix) + e.grant;
-    if (!who->field(family).empty())
-        fields.emplace_back(family, "");
+    // Ended whether or not this shard has seen it yet: with --shards the first exchange's family can reach shard 0
+    // before this write and after this shard read the account, and would refresh past the field's hour.
+    fields.emplace_back(std::string(family_prefix) + e.grant, "");
     update_account(e.sub, std::move(fields), [then = std::move(then)](bool, const std::string&) { then(); });
 }
 
