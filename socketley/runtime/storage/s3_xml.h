@@ -617,6 +617,10 @@ inline bool xml_unescape(std::string_view in, std::string& out)
     out.clear();
     for (size_t i = 0; i < in.size(); ++i)
     {
+        // XML 1.0 has no NUL, raw or referred to: one taken here was written back as &#x0;, which this refuses, so a
+        // bucket's configuration was stored that no shard and no restart could read.
+        if (in[i] == '\0')
+            return false;
         if (in[i] != '&')
         {
             out.push_back(in[i]);

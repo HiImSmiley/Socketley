@@ -6,6 +6,7 @@
 #include "runtime/storage/object_format.h"
 #include "runtime/storage/multipart.h"
 #include "runtime/storage/object_store.h"
+#include "runtime/storage/s3_replication.h"
 #include "runtime/storage/shard_node.h"
 #include "runtime/storage/shard_owner.h"
 #include "runtime/storage/shard_wire.h"
@@ -2893,5 +2894,35 @@ TEST_CASE("a lifecycle rule names at most as many tags as an object can have, an
     CHECK(parse_lifecycle("<LifecycleConfiguration><Rule><ID>r</ID><Filter><And>" + ten +
                               "</And></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"
                               "</LifecycleConfiguration>",
+                          c, err));
+}
+
+TEST_CASE("a bucket configuration holding a NUL is refused, since what is written back of it reads as no document")
+{
+    // A raw NUL was taken and written back as &#x0;, which the reader refuses: PUT ?lifecycle answered 500 and the
+    // stored document was dropped at every start; a replication configuration so written did not read back.
+    lifecycle_config c;
+    s3_error err;
+    CHECK_FALSE(parse_lifecycle(std::string("<LifecycleConfiguration><Rule><ID>r</ID><Filter><Prefix>a\0b</Prefix>"
+                                            "</Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>"
+                                            "</Rule></LifecycleConfiguration>", 172),
+                                c, err));
+    replication_config rc;
+    CHECK_FALSE(parse_replication_config(
+        std::string("<ReplicationConfiguration><Role>arn:aws:iam::1:role/t</Role><Rule><ID>a</ID><Priority>1</Priority>"
+                    "<Status>Enabled</Status><Filter><And><Prefix>d/</Prefix><Tag><Key>\0k</Key><Value>v</Value></Tag>"
+                    "</And></Filter><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>"
+                    "<Destination><Bucket>arn:aws:s3:::copies</Bucket></Destination></Rule></ReplicationConfiguration>",
+                    382),
+        rc, err));
+    CHECK(parse_replication_config(
+        "<ReplicationConfiguration><Role>arn:aws:iam::1:role/t</Role><Rule><ID>a</ID><Priority>1</Priority>"
+        "<Status>Enabled</Status><Filter><And><Prefix>d/</Prefix><Tag><Key>kk</Key><Value>v</Value></Tag>"
+        "</And></Filter><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>"
+        "<Destination><Bucket>arn:aws:s3:::copies</Bucket></Destination></Rule></ReplicationConfiguration>",
+        rc, err));
+    CHECK(parse_lifecycle("<LifecycleConfiguration><Rule><ID>r</ID><Filter><Prefix>a&#x1;b</Prefix></Filter>"
+                          "<Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"
+                          "</LifecycleConfiguration>",
                           c, err));
 }
