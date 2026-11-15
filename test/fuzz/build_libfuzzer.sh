@@ -161,7 +161,8 @@ want fuzz_mail_sessions && build fuzz_mail_sessions "$ROOT/test/fuzz/fuzz_mail_s
     "$ROOT/socketley/runtime/mail/mail_mime.cpp" "$ROOT/socketley/runtime/mail/mail_text.cpp" \
     "$ROOT/socketley/runtime/mail/smtp_session.cpp" "$ROOT/socketley/runtime/mail/mail_setup.cpp" \
     "$ROOT/socketley/shared/util/base64.cpp" -lssl -lcrypto
-want fuzz_mcp && build fuzz_mcp "$ROOT/test/fuzz/fuzz_mcp.cpp" "$ROOT/socketley/runtime/mcp/mcp_protocol.cpp"
+want fuzz_mcp && build fuzz_mcp "$ROOT/test/fuzz/fuzz_mcp.cpp" "$ROOT/socketley/runtime/mcp/mcp_protocol.cpp" \
+    "$ROOT/socketley/runtime/mcp/mcp_schema.cpp" "$ROOT/socketley/shared/util/regex.cpp"
 want fuzz_metrics_chunk && build fuzz_metrics_chunk "$ROOT/test/fuzz/fuzz_metrics_chunk.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_chunk.cpp" "$ROOT/socketley/runtime/metrics/metrics_block.cpp" \
     "$ROOT/socketley/shared/util/crc.cpp"
