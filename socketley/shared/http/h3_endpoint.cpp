@@ -198,6 +198,12 @@ struct endpoint
     bool        tm_armed{false};
     uint64_t    tm_deadline{0};
     std::vector<std::weak_ptr<conn>> dirty;
+    // Inside ngtcp2_conn_read_pkt: its callbacks, nghttp3's within them, and whatever a host does from those.  A
+    // flush asked for there writes nothing, since ngtcp2 and nghttp3 are not to be written from inside their own read
+    // callbacks; the connection stays dirty and is written by the flush that follows the read.
+    int         reading{0};
+    // Streams let go of while pull() was handing them a body, kept until that pull() is done with them.
+    std::vector<std::unique_ptr<stream>> doomed;
     // Handshakes under way past which a new client is asked to prove its address with a Retry first (RFC 9000
     // 8.1.2), so datagrams with forged sources cannot fill the table: SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER, 0 always.
     size_t      retry_after{64};
@@ -240,6 +246,9 @@ struct endpoint
     bool proven(conn& hc);
 
     void stream_closed(conn& hc, int64_t sid);
+    // The stream goes from its connection's table: freed, or kept in `doomed` while a pull() still holds it.
+    void forget(conn& hc, int64_t sid);
+    void forget(std::unique_ptr<stream> st);
     void mark_dirty(const std::shared_ptr<conn>& hc);
     void dirty_raw(conn& hc);
     void flush_dirty();
@@ -694,7 +703,9 @@ void endpoint::packet(const sockaddr_storage& local, socklen_t local_len, const 
     path.remote.addr = reinterpret_cast<sockaddr*>(const_cast<sockaddr_storage*>(&remote));
     path.remote.addrlen = remote_len;
     ngtcp2_pkt_info pi{};
+    ++reading;
     const int r = ngtcp2_conn_read_pkt(hc->q, &path, &pi, data, len, now_ns());
+    --reading;
     if (r != 0)
     {
         if (r == NGTCP2_ERR_DRAINING || r == NGTCP2_ERR_DROP_CONN)
@@ -1116,7 +1127,28 @@ void endpoint::stream_closed(conn& hc, int64_t sid)
     drop_rx(st);
     st.gone = true;
     h->stream_gone(st);
+    forget(hc, sid);
+}
+
+// A stream is freed here and nowhere else.  pull() hands a body to the host a slice at a time and reads the stream
+// between slices, and a host may let go of the stream inside a take -- the entrance closes the pair when the backend
+// leg cannot take the body (a Lua on_proxy_request that refuses it, a backend that went away); gone() with no head
+// framed and nothing lent then erased it, and pull() went on in freed memory.  A stream pull() is running on is kept
+// here instead, and pull() frees it as it returns.
+void endpoint::forget(conn& hc, int64_t sid)
+{
+    const auto it = hc.streams.find(sid);
+    if (it == hc.streams.end())
+        return;
+    std::unique_ptr<stream> st = std::move(it->second);
     hc.streams.erase(it);
+    forget(std::move(st));
+}
+
+void endpoint::forget(std::unique_ptr<stream> st)
+{
+    if (st && st->pulling)
+        doomed.push_back(std::move(st));
 }
 
 
@@ -1139,6 +1171,9 @@ void endpoint::dirty_raw(conn& hc)
 
 void endpoint::flush_dirty()
 {
+    // Not from inside ngtcp2's read: the read's own flush writes what was asked.
+    if (reading)
+        return;
     std::vector<std::weak_ptr<conn>> due;
     due.swap(dirty);
     // Only a connection written to can have moved its expiry earlier, so only those are looked at: one whose expiry
@@ -1378,6 +1413,10 @@ void endpoint::drop(const std::shared_ptr<conn>& hc)
         st->owner = nullptr;
         h->stream_gone(*st);
     }
+    // A connection dropped from inside a take -- a flush the host asked for there found it dead -- leaves the
+    // stream that take was for to its pull().
+    for (auto& st : all)
+        forget(std::move(st));
     for (const std::string& k : hc->cids)
         if (auto it = by_cid.find(k); it != by_cid.end() && it->second == hc)
             by_cid.erase(it);
@@ -1464,7 +1503,7 @@ void endpoint::deliver_head(stream& st, bool fin)
         if (st.owner && st.owner->h)
             nghttp3_conn_set_stream_user_data(st.owner->h, st.sid, nullptr);
         if (st.owner)
-            st.owner->streams.erase(st.sid);
+            forget(*st.owner, st.sid);
         return;
     }
     st.synth_chunked = mr.synth_chunked;
@@ -1478,7 +1517,11 @@ void pull(stream& st, std::string_view fresh)
     conn* hc = st.owner;
     if (!hc || !hc->ep)
         return;
-    host& h = *hc->ep->h;
+    // What outlives a take that lets go of the stream or of its connection: the endpoint, and the stream itself,
+    // which forget() keeps while `pulling` is set and which is freed below.  `hc` is not read after a take; the
+    // stream's owner is, which drop() clears.
+    endpoint& ep = *hc->ep;
+    host& h = *ep.h;
     // The answer is done and the rest of the body is not read.
     if (st.end_pending || st.gone)
     {
@@ -1523,6 +1566,11 @@ void pull(stream& st, std::string_view fresh)
             at += n;
             give(front.data() + at - n, n);
         }
+        if (st.gone)
+        {
+            give_back_raw(st.owner, front.size() - at);
+            break;
+        }
         if (at < front.size())
         {
             st.rx_head = at;
@@ -1531,6 +1579,12 @@ void pull(stream& st, std::string_view fresh)
     }
     while (!fresh.empty())
     {
+        // Let go of inside a take: the rest is never read, and is the connection's window again.
+        if (st.gone)
+        {
+            give_back_raw(st.owner, fresh.size());
+            break;
+        }
         if (!open_for() || !st.rxq.empty())
         {
             st.rxq.emplace_back(fresh);
@@ -1553,6 +1607,16 @@ void pull(stream& st, std::string_view fresh)
         ngtcp2_conn_extend_max_stream_offset(st.owner->q, st.sid, given);
         ngtcp2_conn_extend_max_offset(st.owner->q, given);
         st.owner->ep->dirty_raw(*st.owner);
+    }
+    else if (given && st.gone)
+        give_back_raw(st.owner, given);
+    // Last, since nothing of the stream is read after it: one let go of during this pull is freed now.
+    if (!ep.doomed.empty())
+    {
+        const auto it = std::find_if(ep.doomed.begin(), ep.doomed.end(),
+                                     [&st](const std::unique_ptr<stream>& d) { return d.get() == &st; });
+        if (it != ep.doomed.end())
+            ep.doomed.erase(it);
     }
 }
 
@@ -1764,8 +1828,8 @@ void gone(stream& st)
         return;
     if (hc.h)
         nghttp3_conn_set_stream_user_data(hc.h, st.sid, nullptr);
-    const int64_t sid = st.sid;
-    hc.streams.erase(sid);
+    if (hc.ep)
+        hc.ep->forget(hc, st.sid);
 }
 
 // ─── The endpoint a runtime holds ───────────────────────────────────────────

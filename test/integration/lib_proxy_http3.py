@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """HTTP/3 against an entrance proxy, spoken with aioquic over QUIC.
-usage: lib_proxy_http3.py PORT CAFILE BIGFILE [PORT2]
+usage: lib_proxy_http3.py PORT CAFILE BIGFILE [PORT2 [PORT3]]
 
 PORT2 is an entrance with --backend-timeout 30 and --write-buffer 256K, in front of slow.example.com, whose backend
-reads nothing of a request for three seconds.
+reads nothing of a request for three seconds.  PORT3 is an entrance whose on_proxy_request refuses every piece of a
+request's body.
 
 What it holds down is what forced the entrance to read the frames at all: each stream is routed by its own
 `:authority`, so two names on ONE connection reach their two different runtimes, and a stream naming a name the
@@ -39,6 +40,7 @@ if int(aioquic.__version__.split(".")[0]) < 1:
 PORT = int(sys.argv[1])
 CA, BIG = sys.argv[2], sys.argv[3]
 PORT2 = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+PORT3 = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 PASS = FAIL = 0
 
 
@@ -323,6 +325,22 @@ async def main():
                   ("reset 0x%x" % st["reset"]) if st["reset"] is not None else
                   (st["headers"] or {}).get(b":status", b"").decode() + " " + b"".join(st["body"]).decode(),
                   "200 len=%d" % size)
+
+    if PORT3:
+        # A body its hook refuses closes the pair inside the take that hands it over, with no answer framed: the stream
+        # was freed there while pull() went on with it (seen only under a sanitizer or a build that poisons freed
+        # streams; in Release the heap was written quietly).  It is reset as a cancelled request, and the entrance
+        # serves the next one.
+        for _ in range(3):
+            async with connection("echo.example.com", PORT3) as c:
+                st = c.begin("echo.example.com", "/refused", "POST", b"r" * (300 << 10))
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(st["done"].wait(), 10)
+        check("a body its on_proxy_request refuses is reset as a cancelled request (0x10c)",
+              hex(st["reset"]) if st["reset"] is not None else st["headers"], hex(0x10c))
+        async with connection("echo.example.com", PORT3) as c:
+            check("and the entrance still answers the next request",
+                  (await c.request("echo.example.com", "/after"))[0], "200")
 
     print("Results: %d passed, %d failed" % (PASS, FAIL))
     return FAIL

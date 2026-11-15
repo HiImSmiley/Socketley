@@ -339,7 +339,19 @@ expect "a 32 MiB HTTP/2 upload to a backend that reads nothing for 3 s arrives w
     "$(curl -sk --http2 --noproxy '*' -m 60 --resolve "slow.example.com:$E2:127.0.0.1" --data-binary @"$T/up32.bin" \
         -w ' %{http_code} %{http_version}' "https://slow.example.com:$E2/up" 2>&1)" "len=$((32 << 20)) 200 2"
 rm -f "$T/up32.bin"
-h3out=$(python3 "$HERE/lib_proxy_http3.py" "$E" "$T/e.pem" "$T/big.txt" "$E2" 2>&1)
+# A third whose on_proxy_request refuses every piece of a body: the pair is closed inside the take that hands the
+# body over, which is the endpoint's pull() still running on the stream.
+E3=$((P+10))
+cat >"$T/refuse.lua" <<'LUA'
+function on_proxy_request(fd, data)
+    if data:sub(1, 4) == "POST" or data:sub(1, 3) == "GET" then return data end
+    return false
+end
+LUA
+"$BIN" create proxy ent3 -p "$E3" --tls --cert "$T/e.pem" --key "$T/e.key" --lua "$T/refuse.lua" -s >/dev/null 2>&1
+for _ in $(seq 1 60); do f=$(find "$T" -name 'routes-ent3' | head -1)
+    [ -n "$f" ] && grep -q echo.example.com "$f" && break; sleep 0.2; done
+h3out=$(python3 "$HERE/lib_proxy_http3.py" "$E" "$T/e.pem" "$T/big.txt" "$E2" "$E3" 2>&1)
 echo "$h3out" | sed -n 's/^  \(PASS\|FAIL\|SKIP\)/  \1/p'
 h3p=$(echo "$h3out" | sed -n 's/^Results: \([0-9]*\) passed.*/\1/p')
 h3f=$(echo "$h3out" | sed -n 's/^Results: [0-9]* passed, \([0-9]*\) failed/\1/p')
