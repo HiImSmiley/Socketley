@@ -10,6 +10,7 @@
 #include "../shared/crypto/cert_keeper.h"
 #include <iostream>
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <sys/un.h>
 #include <arpa/inet.h>
@@ -209,6 +210,37 @@ static int parse_domain_flag(runtime_instance* instance, const parsed_args& pa, 
     instance->set_domains(v);
     return 0;
 }
+
+// Whether `list` is * or comma-separated web origins as a browser writes them (RFC 6454): a scheme, :// and a host
+// with an optional port, nothing after. Never "null", the origin every sandboxed page, file and data: page sends alike,
+// so naming it lets any site in; and no pattern, as an origin is matched whole.
+static bool origins_ok(std::string_view list)
+{
+    if (list.empty() || list.find_first_of(" ;") != std::string_view::npos || list.front() == ',' || list.back() == ',' ||
+        list.find(",,") != std::string_view::npos)
+        return false;
+    for (std::string_view rest = list; !rest.empty();)
+    {
+        const std::string_view one = socketley::take_item(rest, ',');
+        if (one == "*")
+            continue;
+        const size_t sep = one.find("://");
+        if (sep == std::string_view::npos || sep == 0 || sep + 3 == one.size())
+            return false;
+        if (!std::isalpha(static_cast<unsigned char>(one.front())))
+            return false;
+        for (const char c : one.substr(0, sep))
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '+' && c != '-' && c != '.')
+                return false;
+        for (const char c : one.substr(sep + 3))
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != ':' && c != '[' && c != ']')
+                return false;
+    }
+    return true;
+}
+static constexpr std::string_view origins_usage =
+    "--origins requires origins such as https://app.example.com (a scheme, a host and a port, nothing after), "
+    "comma-separated, or *; never null, which every sandboxed page sends\n";
 
 static bool parse_duration_flag(const char* flag, std::string_view value,
                                 uint64_t max_seconds, uint64_t& out)
@@ -990,9 +1022,9 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         case fnv1a("--origins"):
         {
             const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
-            if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
+            if (!origins_ok(next))
             {
-                flag_out() << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                flag_out() << origins_usage;
                 return 1;
             }
             srv->set_origins(pa.args[++i]);
@@ -1941,9 +1973,9 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             return 0;
         // The web origins a browser may call it from.
         case fnv1a("--origins"):
-            if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
+            if (!origins_ok(next))
             {
-                flag_out() << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                flag_out() << origins_usage;
                 return 1;
             }
             db->set_origins(pa.args[++i]);
@@ -2095,9 +2127,9 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
             mc->set_anonymous(true);
             return 0;
         case fnv1a("--origins"):
-            if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
+            if (!origins_ok(next))
             {
-                flag_out() << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                flag_out() << origins_usage;
                 return 1;
             }
             mc->set_origins(pa.args[++i]);

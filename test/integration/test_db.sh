@@ -7,6 +7,7 @@
 #   * a version that does not grow, or an If-Match / If-None-Match that does not hold a write back
 #   * an account reading or writing another's document, or anybody writing without signing in
 #   * a page of another site writing with the browser's cookie, or an origin not named getting CORS
+#   * --origins taking null, a path or a pattern, which a browser's Origin never matches or every sandboxed page does
 #   * an access token of the provider not taken as the account it names, or a key's secret matched loosely
 #   * a transaction made in part, or a unique value taken twice
 #   * the documents, the schema or the keys lost across a restart of the runtime or of the daemon
@@ -346,6 +347,14 @@ sy=$(echo "$st" | sed -n 's/^syncs://p'); wr=$(echo "$st" | sed -n 's/^writes://
 cfg=$("$BIN" show data 2>&1)
 case "$cfg" in *'"schema"'*'"keys"'*'"idp": "auth"'*'"origins"'*) ok ;; *) bad "show carries the schema, keys, idp and origins" "$cfg" ;; esac
 
+# An origin is matched whole as a browser writes it, so a list naming null (what every sandboxed page and file sends,
+# which would let any site in with the user's sign-in), a path, a pattern or a bare host is refused, not kept unmatched.
+for o in null "http://app.test,null" "https://app.test/" "https://*.app.test" "*.app.test" "app.test" "http://app.test,"; do
+    out=$("$BIN" create db badorigin -p $((PD + 40)) --schema "$T/schema" --keys "$T/keys" --origins "$o" -s 2>&1); rc=$?
+    case "$out" in *"never null"*) [ "$rc" -ne 0 ] && ok || bad "--origins $o is refused" "rc $rc" ;;
+        *) bad "--origins $o is refused, saying what an origin is" "rc $rc: $out" ;; esac
+    "$BIN" stop badorigin >/dev/null 2>&1; "$BIN" remove badorigin >/dev/null 2>&1
+done
 out=$("$BIN" edit data --origins "http://other.test" 2>&1); rc=$?
 case "$out" in *"cannot be changed with \`edit\`"*"import"*) [ "$rc" -eq 1 ] && ok || bad "edit refuses a db's own flag with exit 1" "rc $rc" ;;
     *) bad "edit sends a db's own flag to import" "rc $rc: $out" ;; esac

@@ -118,6 +118,10 @@ upgrade_status() {
 create_ok "server with listed origins" "$BIN" create server ws_listed -p "$P_LISTED" \
     --origins https://app.example,http://other.example:8080 -s
 create_ok "server with any origin" "$BIN" create server ws_any -p "$P_ANY" --origins '*' -s
+# null is what every sandboxed page sends, so a list naming it would upgrade any site's page: refused when made.
+out=$("$BIN" create server ws_null -p "$P_ANY" --origins https://app.example,null -s 2>&1) && rc=0 || rc=$?
+"$BIN" stop ws_null >/dev/null 2>&1 || true; "$BIN" remove ws_null >/dev/null 2>&1 || true
+assert_eq "$rc $(echo "$out" | grep -c 'never null' || true)" "1 1" "--origins naming null is refused"
 sleep 0.3
 
 assert_eq "$(upgrade_status "$PORT")" "101" "no Origin is not a browser, and is upgraded"
