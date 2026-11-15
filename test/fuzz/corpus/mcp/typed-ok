@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"typed","arguments":{"path":"a/b1","count":3,"mode":"r","tags":["x"],"opts":{"deep":true}}}}
