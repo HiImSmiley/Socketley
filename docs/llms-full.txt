@@ -12156,7 +12156,7 @@ mcp.prompt{ name = "summarize", arguments = { { name = "order", required = true 
   get = function(args, who) return "Summarize order " .. args.order end }
 ```
 
-A tool's **input** and **output** are each a JSON Schema, given as a table or as JSON text. Write an empty object as JSON text, because a table cannot tell it apart from an empty array. A tool takes four hints: **read_only** (default **false**), **destructive** (default: the opposite of read_only), **idempotent** (default: the same as read_only) and **open_world** (default **true**). A tool with **admin** is offered only to an admin's key.
+A tool's **input** and **output** are each a JSON Schema, given as a table or as JSON text. Write an empty object as JSON text, because a table cannot tell it apart from an empty array. A call's arguments are checked against **input** before the handler runs; arguments that do not fit are answered as the tool's error (**isError**), saying where, and the handler never sees them. A tool declared without **input** takes no arguments. The check reads type, properties, required, additionalProperties, patternProperties, propertyNames, items, prefixItems, enum, const, the lengths, counts and bounds, multipleOf, pattern (RE2 syntax), allOf, anyOf, oneOf, not, if/then/else and references within the schema (**#/...**); other keywords are notes. A schema that refers outside itself, or that cannot be read, admits no call. A tool takes four hints: **read_only** (default **false**), **destructive** (default: the opposite of read_only), **idempotent** (default: the same as read_only) and **open_world** (default **true**). A tool with **admin** is offered only to an admin's key.
 
 A handler's return value becomes the tool's result:
 

@@ -333,6 +333,19 @@ int skl_mcp_tool(skl_runtime* runtime, const char* name, const char* description
         return -1;
     }
     namespace mcp = socketley::mcp;
+    // The schema is shown to clients inside tools/list and holds every call, so one that is no JSON object is refused
+    // here rather than breaking the list or every call after.
+    if (input_schema_json)
+    {
+        socketley::json::jvalue schema;
+        socketley::json::json_policy policy;
+        policy.max_depth = 64;
+        if (!socketley::json::json_reader(input_schema_json, policy).document(schema))
+        {
+            set_err(err, "input_schema_json is no JSON object");
+            return -1;
+        }
+    }
     engine_state& s = *runtime->s;
     std::string why;
     const bool ran = s.call([&] {

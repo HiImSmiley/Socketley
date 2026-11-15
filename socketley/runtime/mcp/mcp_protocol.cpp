@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <optional>
 
+#include "mcp_schema.h"
 #include "../../shared/json/json_escape.h"
 
 namespace socketley::mcp
@@ -188,6 +189,15 @@ std::optional<reply> dispatch(backend& b, const server_info& info, const message
                                                                           given->k != js::jvalue::kind::null)
             return error_reply(m, invalid_params, "arguments is an object");
         ++stats().tool_calls;
+        // Held to the schema the tool declared before its handler sees them, as every revision asks; what does not
+        // fit is the model's to read and correct, a tool's error rather than the protocol's (2025-11-25).
+        if (std::string why; !schema_admits(it->input_schema, args ? *args : no_args, why))
+        {
+            tool_result out;
+            out.content = "[{\"type\":\"text\",\"text\":" + js::quote(why) + "}]";
+            out.is_error = true;
+            return tool_reply(m, info, true, out, {});
+        }
         b.call_tool(*it, args ? *args : no_args, who,
                     [m, info, later](bool ok, tool_result out, std::string why) { later(tool_reply(m, info, ok, out, why)); });
         return std::nullopt;

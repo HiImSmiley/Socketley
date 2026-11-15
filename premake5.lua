@@ -1824,7 +1824,9 @@ project "fuzz_mcp"
         "test/fuzz/fuzz_mcp.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/runtime/mcp/mcp_protocol.cpp"
+        "socketley/runtime/mcp/mcp_protocol.cpp",
+        "socketley/runtime/mcp/mcp_schema.cpp",
+        "socketley/shared/util/regex.cpp"
     }
 
     fuzz_target_settings()
@@ -3819,7 +3821,8 @@ project "test_mcp"
         "socketley"
     }
 
-    files { "test/unit/test_mcp.cpp", "socketley/runtime/mcp/mcp_protocol.cpp" }
+    files { "test/unit/test_mcp.cpp", "socketley/runtime/mcp/mcp_protocol.cpp", "socketley/runtime/mcp/mcp_schema.cpp",
+            "socketley/shared/util/regex.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
