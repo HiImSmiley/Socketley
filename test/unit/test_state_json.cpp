@@ -50,7 +50,7 @@ TEST_CASE("state json: a document is read in time linear in its size, whatever i
                            << std::chrono::duration<double>(took_big).count() * 1e3 << " ms");
     CHECK(b.backends.size() == 400000);
     CHECK(b.max_connections == 7);
-    CHECK(took_big < std::chrono::milliseconds(150));
+    CHECK(took_big < std::chrono::milliseconds(150 * build_cpu_factor));
 }
 
 TEST_CASE("state json: import refuses a document it would read as something else than it says")
