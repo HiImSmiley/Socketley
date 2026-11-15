@@ -11,6 +11,7 @@ Prints one PASS or FAIL line per assertion and a final "Results:" line, and exit
 """
 import asyncio
 import contextlib
+import os
 import socket
 import sys
 
@@ -20,7 +21,7 @@ try:
     from aioquic.h3.events import DataReceived, HeadersReceived
     from aioquic.quic.configuration import QuicConfiguration
     from aioquic.quic.connection import QuicConnection
-    from aioquic.quic.events import StreamReset
+    from aioquic.quic.events import ConnectionTerminated, StreamDataReceived, StreamReset
     import aioquic
 except ImportError:
     print("  SKIP: the python aioquic library is not installed (pip install aioquic)")
@@ -114,6 +115,94 @@ async def connection(server_name):
         transport.close()
 
 
+def peak_mib():
+    """The largest peak resident size, in MiB, of the processes of this test's daemon."""
+    want = ("SOCKETLEY_SOCKET=" + os.environ.get("SOCKETLEY_SOCKET", "")).encode()
+    best = 0
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open("/proc/%s/environ" % d, "rb") as f:
+                if want not in f.read().split(b"\0"):
+                    continue
+            with open("/proc/%s/status" % d) as f:
+                for line in f:
+                    if line.startswith("VmHWM:"):
+                        best = max(best, int(line.split()[1]) // 1024)
+        except OSError:
+            pass
+    return best
+
+
+def qint(prefix_bits, first, v):
+    m = (1 << prefix_bits) - 1
+    if v < m:
+        return bytes([first | v])
+    out = [first | m]
+    v -= m
+    while v >= 128:
+        out.append((v & 0x7f) | 0x80)
+        v >>= 7
+    out.append(v)
+    return bytes(out)
+
+
+def varint(v):
+    return bytes([v]) if v < 0x40 else (v | 0x4000).to_bytes(2, "big") if v < 0x4000 else (v | 0x80000000).to_bytes(4, "big")
+
+
+class Raw(QuicConnectionProtocol):
+    """QUIC with HTTP/3 written by hand, for what aioquic's own encoder would never send."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.got, self.closed = {}, None
+
+    def quic_event_received(self, ev):
+        if isinstance(ev, StreamDataReceived):
+            self.got.setdefault(ev.stream_id, bytearray()).extend(ev.data)
+        elif isinstance(ev, StreamReset):
+            self.got[ev.stream_id] = "reset"
+        elif isinstance(ev, ConnectionTerminated):
+            self.closed = ev.error_code
+
+
+async def qpack_expansion(authority, refs):
+    """One 4000-byte field put into the entrance's QPACK table, then a request whose header block names it `refs`
+    times at one byte each.  Answers what came back on the stream: its first bytes, "reset", or "closed"."""
+    cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN, max_stream_data=16 << 20, max_data=64 << 20)
+    cfg.load_verify_locations(CA)
+    cfg.server_name = authority
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    transport, proto = await loop.create_datagram_endpoint(lambda: Raw(QuicConnection(configuration=cfg)), sock=sock)
+    try:
+        proto.connect(("127.0.0.1", PORT))
+        await asyncio.wait_for(proto.wait_connected(), 3)
+        q = proto._quic
+        q.send_stream_data(q.get_next_available_stream_id(is_unidirectional=True), b"\x00\x04\x00")
+        value = b"A" * 4000
+        q.send_stream_data(q.get_next_available_stream_id(is_unidirectional=True),
+                           b"\x02" + qint(5, 0x20, 4096) + qint(5, 0x40, 3) + b"x-a" + qint(7, 0, len(value)) + value)
+        q.send_stream_data(q.get_next_available_stream_id(is_unidirectional=True), b"\x03")
+        block = bytes([2, 0, 0xD1, 0xD7, 0xC1]) + b"\x50" + qint(7, 0, len(authority)) + authority.encode()
+        block += b"\x80" * refs
+        sid = q.get_next_available_stream_id()
+        q.send_stream_data(sid, b"\x01" + varint(len(block)) + block, end_stream=True)
+        proto.transmit()
+        for _ in range(150):
+            await asyncio.sleep(0.1)
+            if proto.closed is not None or sid in proto.got:
+                break
+        g = proto.got.get(sid)
+        return "closed" if proto.closed is not None else "nothing" if g is None else g if isinstance(g, str) else bytes(g)
+    finally:
+        proto.close()
+        transport.close()
+
+
 async def main():
     big = open(BIG, "rb").read()
 
@@ -176,6 +265,17 @@ async def main():
 
         check("a stream ends, so the next request on the connection is answered too",
               await c.request("one.example.com", "/who.txt"), ("200", b"from-one\n"))
+
+    # A header block is QPACK: one byte may name a 4000-byte field of the dynamic table, so 100 KB of them was 400 MB of
+    # fields, all gathered before the head's size was judged -- 2.4 GB of peak memory from a 200 KB request.  The head
+    # is measured as it arrives and gathered no further than its bound, and the request is answered 431.
+    before = peak_mib()
+    got = await qpack_expansion("one.example.com", 100000)
+    after = peak_mib()
+    check("a header block naming one 4000-byte field 100000 times is answered 431",
+          "431" if isinstance(got, bytes) and b"431" in got[:16] else got, "431")
+    check("and gathering it costs the entrance no more than 64 MiB of peak memory (%d -> %d MiB)" % (before, after),
+          after - before < 64, True)
 
     print("Results: %d passed, %d failed" % (PASS, FAIL))
     return FAIL

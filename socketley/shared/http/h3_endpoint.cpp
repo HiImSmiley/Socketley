@@ -67,6 +67,9 @@ constexpr uint64_t conn_window_max = 64u << 20;
 // The most connections one client address holds is a sixteenth of them, so that one address cannot take the table
 // whole: sixteen at least always find room.
 size_t per_address_cap(size_t conns) { return std::max<size_t>(conns / 16, 1); }
+// The field section a request's head may be, as RFC 9114 4.2.2 counts it and as SETTINGS_MAX_FIELD_SECTION_SIZE tells
+// the client; one larger is answered 431.
+constexpr size_t   max_field_section = 64 * 1024;
 constexpr size_t   pull_slice      = 64 * 1024;
 constexpr size_t   rx_buf          = 64 * 1024;
 // Packets written at once and sent in one sendmsg by UDP GSO: as many of ngtcp2's largest (its default
@@ -959,16 +962,34 @@ bool endpoint::app_ready(conn& hc)
             hc->ep->begin(*hc, sid);
             return 0;
         };
-        c.recv_header = [](nghttp3_conn*, int64_t, int32_t, nghttp3_rcbuf* name, nghttp3_rcbuf* value, uint8_t, void*,
+        c.recv_header = [](nghttp3_conn*, int64_t, int32_t, nghttp3_rcbuf* name, nghttp3_rcbuf* value, uint8_t, void* ud,
                            void* sud) -> int
         {
             auto* st = static_cast<stream*>(sud);
-            if (!st)
+            // Trailers are read and dropped, so nothing of them is kept either.
+            if (!st || st->opened || st->head_over)
                 return 0;
             const nghttp3_vec n = nghttp3_rcbuf_get_buf(name), v = nghttp3_rcbuf_get_buf(value);
-            auto& f = st->fields;
-            f.emplace_back(std::string(reinterpret_cast<const char*>(n.base), n.len),
-                           std::string(reinterpret_cast<const char*>(v.base), v.len));
+            // QPACK names a field of its dynamic table in a byte, so the fields a header block decodes to may be
+            // thousands of times its size, and gathering them all before request_head judged the head let 200 KB of
+            // a block take gigabytes.  Counted as at least what each adds to the HTTP/1.1 head request_head builds and
+            // bounds by max_head -- a value with the space or ": " and CRLF around it, a regular field's name, a
+            // cookie crumb's "; " -- so a head this stops was answered 431 already, give or take the few bytes of
+            // :scheme; the rest of its fields are not kept.
+            const bool pseudo = n.len > 0 && n.base[0] == ':';
+            const bool crumb = n.len == 6 && std::memcmp(n.base, "cookie", 6) == 0;
+            st->head_bytes += v.len + (pseudo ? 1 : crumb ? 2 : n.len + 4);
+            // And as RFC 9114 counts a field section, which is the size this side announced it takes: every field
+            // costs 32 however short, so a block of empty ones is bounded by their number too.
+            st->section_bytes += n.len + v.len + 32;
+            if (st->head_bytes > static_cast<conn*>(ud)->ep->o.max_head || st->section_bytes > max_field_section)
+            {
+                st->head_over = true;
+                std::vector<std::pair<std::string, std::string>>().swap(st->fields);
+                return 0;
+            }
+            st->fields.emplace_back(std::string(reinterpret_cast<const char*>(n.base), n.len),
+                                    std::string(reinterpret_cast<const char*>(v.base), v.len));
             return 0;
         };
         c.end_headers = [](nghttp3_conn*, int64_t, int fin, void* ud, void* sud) -> int
@@ -1004,7 +1025,7 @@ bool endpoint::app_ready(conn& hc)
     nghttp3_settings_default(&settings);
     settings.qpack_max_dtable_capacity = 4096;
     settings.qpack_blocked_streams = 100;
-    settings.max_field_section_size = 64 * 1024;
+    settings.max_field_section_size = max_field_section;
     if (nghttp3_conn_server_new(&hc.h, &cb, &settings, nghttp3_mem_default(), &hc) != 0)
         return false;
     nghttp3_conn_set_max_client_streams_bidi(hc.h, ngtcp2_conn_get_local_transport_params2(hc.q)->initial_max_streams_bidi);
@@ -1366,7 +1387,7 @@ void endpoint::deliver_head(stream& st, bool fin)
     st.opened = true;
     st.remote_closed = fin;
     mux::request mr;
-    const mux::verdict v = mux::request_head(st.fields, fin, o.max_head, mr);
+    const mux::verdict v = st.head_over ? mux::verdict::too_large : mux::request_head(st.fields, fin, o.max_head, mr);
     std::vector<std::pair<std::string, std::string>>().swap(st.fields);
     if (v == mux::verdict::malformed)
     {

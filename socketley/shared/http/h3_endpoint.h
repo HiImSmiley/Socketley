@@ -47,6 +47,12 @@ struct stream
 
     // The request's fields as they came, until its head is complete.
     std::vector<std::pair<std::string, std::string>> fields;
+    // The head measured as it arrives, since QPACK names a field of its table in a byte: what the fields so far are
+    // at least of the HTTP/1.1 head built from them, their size as RFC 9114 4.2.2 counts it, and whether either passed
+    // its bound, after which no more of them is kept.
+    size_t   head_bytes{0};
+    size_t   section_bytes{0};
+    bool     head_over{false};
     bool     opened{false};
     // DATA received and not yet handed to whatever reads it.
     std::deque<std::string> rxq;
