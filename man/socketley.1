@@ -16402,7 +16402,11 @@ with
 The reader sees only what it may read, as with a query: an account sees its own
 documents of an owner collection.
 .B GET /_feed
-streams the changes of every collection, to a key. A stream that broke resumes
+streams the changes of every collection, to a key.
+One address holds at most 32 streams open at once on each shard (a key's are not counted; behind the entrance,
+the address is the client it names); one more is answered
+.BR 429 .
+A stream whose reader takes nothing of what it is sent for two minutes is closed. A stream that broke resumes
 from the last change it read, with
 .B Last\-Event\-ID
 (or
@@ -25665,7 +25669,7 @@ Inherited by worker processes, which have no command line of their own.
 A test aid that sets how many seconds a server or proxy client with no
 .B \-\-idle\-timeout
 may take nothing of its answer before the connection is reset, and how many a
-storage's client may before its connection or stream is let go. The range is 1
+storage's client, or a db's stream of changes, may before its connection or stream is let go. The range is 1
 to 86400. Default: 120 seconds.
 .IP
 Inherited by worker processes, which have no command line of their own.

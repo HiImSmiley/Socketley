@@ -99,6 +99,9 @@ private:
         uint64_t at_seq{0};
         size_t at_skip{0};
         bool behind{false};
+        // Who a stream not asked by a key is counted against, and when its reader last took a byte of it.
+        std::string client;
+        int64_t took_at{0};
         // The turn stamp of the request being answered.
         uint64_t began_ns{0};
         // A read answered once the documents it needed from the disk were brought through the ring: those, by where
@@ -138,6 +141,7 @@ private:
     void serve(const std::shared_ptr<socketley::http::server_conn>& c) override;
     void accepted(const std::shared_ptr<socketley::http::server_conn>& c) override;
     bool written(const std::shared_ptr<socketley::http::server_conn>& c) override;
+    void wrote(const std::shared_ptr<socketley::http::server_conn>& c, size_t n) override;
     bool keeps_open(const socketley::http::server_conn& c) const override;
     void closing(const std::shared_ptr<socketley::http::server_conn>& c) override;
     void arm_tick();

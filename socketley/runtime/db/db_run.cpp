@@ -24,6 +24,7 @@
 #include "../../shared/http/url.h"
 #include "../../shared/http/status.h"
 #include "../../shared/http/request_head.h"
+#include "../../shared/util/settings.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/crypto/mac.h"
@@ -41,6 +42,9 @@ constexpr size_t  max_body  = 4u << 20;
 constexpr size_t  max_conns = 4096;
 // What a stream holds unsent before it takes further changes from the history as it drains, not into memory.
 constexpr size_t  feed_window = 256u << 10;
+// Streams one address holds open at once, unless a key asks: each holds a window and a connection for as long as it
+// likes, so one client cannot take the runtime's connections and their memory.
+constexpr size_t  max_feeds_per_client = 32;
 // The changes kept for a stream that resumes: while one is open on any shard or closed within resume_secs (a replica
 // takes up to a minute to call a silent stream dead, then two seconds to dial again), and else only a few.
 constexpr size_t  history_bytes      = 32u << 20;
@@ -1108,6 +1112,11 @@ bool db_run::written(const std::shared_ptr<socketley::http::server_conn>& sc)
     return true;
 }
 
+void db_run::wrote(const std::shared_ptr<socketley::http::server_conn>& sc, size_t)
+{
+    static_cast<conn&>(*sc).took_at = wall::now_sec_coarse();
+}
+
 bool db_run::keeps_open(const socketley::http::server_conn& c) const
 {
     return static_cast<const conn&>(c).feed;
@@ -1191,11 +1200,27 @@ void db_run::tick()
     if (m_stopped)
         return;
     const int64_t now = wall::now_sec_coarse();
+    // A stream whose reader has taken nothing of what it is owed for as long as a stalled answer is given is let go,
+    // and resumes from where it stood when it comes again; the sweep never takes a stream.
+    static const int64_t stall_secs =
+        static_cast<int64_t>(socketley::settings::number<uint64_t>("SOCKETLEY_WRITE_STALL_SECS").value_or(120));
+    std::vector<std::shared_ptr<conn>> stalled;
+    for (const auto& c : m_feeds)
+    {
+        if (c->dead)
+            continue;
+        if (c->unsent() == 0)
+            c->took_at = now;
+        else if (now - c->took_at >= stall_secs)
+            stalled.push_back(c);
+    }
+    for (const auto& c : stalled)
+        m_http.close_conn(c);
     // A comment now and then, so a stream nothing changes on is not taken for a dead one.
     for (size_t i = 0; i < m_feeds.size(); ++i)
     {
         const std::shared_ptr<conn> c = m_feeds[i];
-        if (!c->dead && now - c->last >= 15)
+        if (!c->dead && c->unsent() == 0 && now - c->last >= 15)
         {
             c->last = now;
             c->out += ": ping\n\n";
@@ -1496,7 +1521,23 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
             respond(c, 503, error_body("starting", "this shard is still reading the log; try again"), allow);
             return;
         }
+        if (who.kind != principal::key)
+        {
+            c->client = socketley::http::key_bar::client(c->peer, rq.forwarded_for);
+            if (!c->client.empty() &&
+                static_cast<size_t>(std::count_if(m_feeds.begin(), m_feeds.end(), [&](const std::shared_ptr<conn>& f) {
+                    return !f->dead && f->client == c->client;
+                })) >= max_feeds_per_client)
+            {
+                respond(c, 429,
+                        error_body("too_many_streams", "an address holds at most " +
+                                                           std::to_string(max_feeds_per_client) + " streams at once"),
+                        allow + "Retry-After: 10\r\n");
+                return;
+            }
+        }
         c->who = who;
+        c->took_at = wall::now_sec_coarse();
         open_feed(c, rq, coll, !feed, path == "/_replicate");
         return;
     }
