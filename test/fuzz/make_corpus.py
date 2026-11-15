@@ -3160,8 +3160,12 @@ def statejson_seeds():
     }
 
 def wsreassembly_seeds():
-    # A read-size byte, a --read-buffer byte (64, 128 or 192 KiB), then per frame a kind and a length (0xF0 and up: two bytes more).
-    TEXT, BIN, FIRST_T, FIRST_B, MID, LAST, PING, PONG, CLOSE, UNMASKED, RESOP, RESBIT, BADTEXT = range(13)
+    # A read-size byte, a --read-buffer byte (64, 128 or 192 KiB; its top bit the mqtt runtime, whose largest packet
+    # is 1 KiB times one more than its low six bits), then per frame a kind and a length: 0xE0-0xE7 a short one in the
+    # 16-bit form, 0xE8-0xEF in the 64-bit form, 0xF0 and up 126 + 32 * the next byte (0xF8 and up: the 64-bit form).
+    # A close's length byte picks its body (0 none, 1 one byte, 2-14 fixed codes and reasons, 15 a code from two bytes).
+    TEXT, BIN, FIRST_T, FIRST_B, MID, LAST, PING, PONG, CLOSE, UNMASKED, RESOP, RESBIT, BADTEXT, HUGE, JUNK = range(15)
+    MQTT = 0x80
     def seed(chunk, cap, *frames):
         out = bytes([chunk, cap])
         for f in frames:
@@ -3187,6 +3191,29 @@ def wsreassembly_seeds():
         "big_under_cap": seed(0xff, 2, (FIRST_B, 0xFF, 255), *[(MID, 0xFF, 255)] * 11, (LAST, 4), (TEXT, 3)),
         "many_small": seed(7, 1, *[(TEXT, i % 30) for i in range(120)]),
         "pings_only": seed(1, 0, *[(PING, 125)] * 40),
+        # Lengths in the forms the RFC asks be minimal and neither runtime refuses, and ones no runtime takes.
+        "len64_short": seed(0, 0, (TEXT, 0xE9), (BIN, 0xEF), (FIRST_T, 0xE3), (PING, 0xEA), (LAST, 0xEC)),
+        "len16_short": seed(2, 0, (BIN, 0xE5), (FIRST_B, 0xE0), (LAST, 0xE7)),
+        "len64_big": seed(0x30, 1, (BIN, 0xF8, 40), (FIRST_B, 0xFC, 3), (LAST, 0xFF, 9), (TEXT, 3)),
+        "huge_past_16mib": seed(0, 0, (TEXT, 2), (HUGE, 0)),
+        "huge_top_bit": seed(0xff, 0, (FIRST_B, 3), (HUGE, 1)),
+        # Every Close body: the code it is answered with is the model's.
+        **{"close_body_%02d" % v: seed(v * 3, 0, (TEXT, 2), (CLOSE, v) if v < 15 else (CLOSE, v, 0x0f, 0xa0))
+           for v in range(16)},
+        "close_code_odd": seed(0, 0, (CLOSE, 0x0f, 0x0b, 0xb9)),
+        "close_inside_fragments": seed(0, 0, (FIRST_T, 4), (CLOSE, 13), (LAST, 2)),
+        # MQTT over WebSocket: a CONNECT and PINGREQs cut across frames of every data opcode, pings between.
+        "mqtt_connect_ping": seed(0, MQTT, (BIN, 15), (BIN, 6), (PING, 3), (BIN, 4)),
+        "mqtt_cut_everywhere": seed(0xff, MQTT, *[(i % 6, 1 + i % 5) for i in range(40)], (PING, 0), (BIN, 7)),
+        "mqtt_close": seed(5, MQTT, (BIN, 17), (CLOSE, 3), (BIN, 4)),
+        "mqtt_unmasked": seed(0, MQTT, (BIN, 15), (UNMASKED, 2)),
+        "mqtt_reserved": seed(0, MQTT, (BIN, 15), (RESBIT, 2)),
+        "mqtt_huge": seed(0, MQTT, (BIN, 16), (HUGE, 1)),
+        "mqtt_junk": seed(1, MQTT, (BIN, 15), (JUNK, 6, 0x30, 0x04, 0x00, 0x01, 0x74, 0x78), (BIN, 2)),
+        "mqtt_len64": seed(0, MQTT, (BIN, 0xEA), (TEXT, 0xF9, 2), (PING, 0xE9)),
+        "mqtt_over_bound": seed(0x40, MQTT, (BIN, 15), (BIN, 0xF8, 200)),
+        "mqtt_under_bound": seed(0x40, MQTT | 0x3f, (BIN, 15), (BIN, 0xF8, 200), (BIN, 4)),
+        "mqtt_pings_only": seed(3, MQTT, *[(PING, 125)] * 30),
     }
 
 def respdispatch_seeds():
