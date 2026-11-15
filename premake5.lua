@@ -3108,9 +3108,12 @@ project "test_sync_index"
         "socketley"
     }
 
-    links { "dl" }
+    -- The index syncs through the loop's file_io, which the ring cases drive themselves.
+    links { "dl", "uring:static" }
 
-    files { "test/unit/test_sync_index.cpp", "socketley/runtime/sync/sync_index.cpp" }
+    files { "test/unit/test_sync_index.cpp", "socketley/runtime/sync/sync_index.cpp",
+            "socketley/shared/loop/event_loop.cpp", "socketley/shared/net/orderly_close.cpp",
+            "socketley/shared/loop/file_io.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

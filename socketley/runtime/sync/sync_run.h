@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -240,6 +241,18 @@ private:
     socketley::http_request signed_bucket_request(const target& t, std::string_view query) const;
     bool m_pull_due{false};
     bool m_pulling{false};
+    // What the listing brought here and removed here, by folder, recorded once the folder is synced at its end.
+    struct unrecorded
+    {
+        char kind{'p'};
+        std::string target;
+        std::string rel;
+        index_entry e;
+    };
+    std::map<std::string, std::vector<unrecorded>> m_unrecorded;
+    size_t m_folder_syncs{0};
+    // Syncs the folders m_unrecorded names, a few at a time, and records what each holds once it is synced.
+    void settle_folders();
     // Fetched files whose sync is in the ring, which a pull is not over before.
     size_t m_placing{0};
     // The listing is still being read, so no fetch is decided yet.

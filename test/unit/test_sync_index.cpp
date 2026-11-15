@@ -13,10 +13,15 @@
 
 #include <cstdio>
 #include <fcntl.h>
+#include <filesystem>
+#include <memory>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 #include "runtime/sync/sync_index.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/file_io.h"
 
 using namespace socketley::sync;
 
@@ -340,4 +345,181 @@ TEST_CASE("a target no longer named is forgotten, and stays forgotten")
     CHECK(ix.size() == 1);
     CHECK(ix.find("ui/photos", "a") != nullptr);
     CHECK(ix.find("old/photos", "a") == nullptr);
+}
+
+// ─── THROUGH THE RING ───────────────────────────────────────────────────────
+// A sync job's index syncs through its loop's file_io, so a disk that takes seconds over one fdatasync holds up no
+// other job. What would go wrong: a record counted on the disk that a crash can still take back, a rewrite renamed
+// over the index before what it holds is synced, records written while a rewrite is synced left out of it, and a
+// waiter that is never answered, which wedges the listing that waits on it.
+
+namespace
+{
+
+struct ring : io_handler
+{
+    event_loop loop{256};
+    std::unique_ptr<socketley::file_io> io;
+
+    ring()
+    {
+        REQUIRE(loop.init());
+        io = std::make_unique<socketley::file_io>(loop, this);
+    }
+
+    void on_cqe(struct io_uring_cqe* cqe) override
+    {
+        auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+        if (req && socketley::file_io::owns_type(req->type))
+            io->on_cqe(cqe);
+    }
+
+    // Turns the loop until `done` says so or the ring owes nothing, and says which.
+    template <class F>
+    bool until(F done)
+    {
+        for (int i = 0; i < 20000 && !done(); ++i)
+            loop.poll_completions(1);
+        return done();
+    }
+};
+
+}   // namespace
+
+TEST_CASE("through the ring, a record is counted on the disk only once its sync ends, and the waiter is answered then")
+{
+    const tmp_file tf(temp_path());
+    std::string why;
+    ring r;
+    std::vector<std::string> failures;
+    sync_index ix;
+    ix.attach(*r.io, [&](const std::string& w) { failures.push_back(w); });
+    REQUIRE(ix.open(tf.path, "/srv\nlaptop", why));
+    // Nothing written: nothing to wait for.
+    bool answered = false;
+    ix.when_durable([&](bool ok) { answered = ok; });
+    CHECK(answered);
+
+    REQUIRE(ix.carried("t", "a", made(1, 1, "a"), why));
+    CHECK_FALSE(ix.durable());
+    answered = false;
+    int calls = 0;
+    ix.when_durable([&](bool ok) {
+        answered = ok;
+        ++calls;
+    });
+    // Not on the loop: the answer waits for the ring's completion.
+    CHECK_FALSE(answered);
+    // Written while that sync is in flight: a second waiter, answered by the sync after it.
+    REQUIRE(ix.carried("t", "b", made(2, 2, "b"), why));
+    bool second = false;
+    ix.when_durable([&](bool ok) { second = ok; });
+    REQUIRE(r.until([&] { return answered && second; }));
+    CHECK(calls == 1);
+    CHECK(ix.durable());
+    CHECK(failures.empty());
+    REQUIRE(r.until([&] { return r.io->inflight() == 0; }));
+
+    sync_index again;
+    REQUIRE(again.open(tf.path, "/srv\nlaptop", why));
+    CHECK(again.size() == 2);
+}
+
+TEST_CASE("through the ring, records written while a rewrite is synced are carried into it, and none is lost")
+{
+    const tmp_file tf(temp_path());
+    std::string why;
+    ring r;
+    std::vector<std::string> failures;
+    int round = 0;
+    {
+        sync_index ix;
+        ix.attach(*r.io, [&](const std::string& w) { failures.push_back(w); });
+        REQUIRE(ix.open(tf.path, "/srv\nlaptop", why));
+        for (int i = 0; i < 300; ++i)
+            REQUIRE(ix.carried("t", "f" + std::to_string(i), made(i, i, "e" + std::to_string(i)), why));
+        // Dead records, so the rewrite has something to drop.
+        for (int i = 0; i < 100; ++i)
+            REQUIRE(ix.gone("t", "f" + std::to_string(i), why));
+        // A sync of the old file in flight as the rewrite begins, which the rename waits for.
+        bool before = false;
+        ix.when_durable([&](bool ok) { before = ok; });
+        REQUIRE(ix.compact(why, true));
+        REQUIRE(ix.rewriting());
+        // Records go on being written while it is synced, and a waiter comes in between.
+        bool waited = false;
+        for (int spins = 0; spins < 20000 && ix.rewriting(); ++spins)
+        {
+            r.loop.poll_completions(1);
+            if (round < 20)
+            {
+                REQUIRE(ix.carried("t", "n" + std::to_string(round), made(7, 7, "n"), why));
+                REQUIRE(ix.gone("t", "f" + std::to_string(100 + round), why));
+                ++round;
+            }
+            if (round == 3 && !waited)
+            {
+                waited = true;
+                ix.when_durable([](bool) {});
+            }
+        }
+        REQUIRE_FALSE(ix.rewriting());
+        CHECK(before);
+        CHECK(round > 0);
+        bool after = false;
+        ix.when_durable([&](bool ok) { after = ok; });
+        REQUIRE(r.until([&] { return after; }));
+        REQUIRE(r.until([&] { return r.io->inflight() == 0; }));
+        CHECK(failures.empty());
+        CHECK_FALSE(std::filesystem::exists(tf.path + ".new"));
+        // The rewrite dropped the dead records: smaller than the same records appended, as a blocking index keeps them.
+        const tmp_file twin_file(temp_path());
+        {
+            sync_index twin;
+            REQUIRE(twin.open(twin_file.path, "/srv\nlaptop", why));
+            for (int i = 0; i < 300; ++i)
+                REQUIRE(twin.carried("t", "f" + std::to_string(i), made(i, i, "e" + std::to_string(i)), why));
+            for (int i = 0; i < 100 + round; ++i)
+                REQUIRE(twin.gone("t", "f" + std::to_string(i), why));
+            for (int i = 0; i < round; ++i)
+                REQUIRE(twin.carried("t", "n" + std::to_string(i), made(7, 7, "n"), why));
+        }
+        CHECK(file_size(tf.path) < file_size(twin_file.path));
+    }
+    sync_index again;
+    REQUIRE(again.open(tf.path, "/srv\nlaptop", why));
+    for (int i = 0; i < 300; ++i)
+        CHECK_MESSAGE((again.find("t", "f" + std::to_string(i)) == nullptr) == (i < 100 + round), "f" << i);
+    for (int i = 0; i < round; ++i)
+        CHECK(again.find("t", "n" + std::to_string(i)) != nullptr);
+    CHECK(again.size() == size_t(300 - 100));
+}
+
+TEST_CASE("through the ring, an index let go of with writes, a sync and a rewrite in flight is not touched by them")
+{
+    const tmp_file tf(temp_path());
+    std::string why;
+    ring r;
+    {
+        auto ix = std::make_unique<sync_index>();
+        ix->attach(*r.io, [](const std::string&) {});
+        REQUIRE(ix->open(tf.path, "/srv\nlaptop", why));
+        for (int i = 0; i < 100; ++i)
+            REQUIRE(ix->carried("t", "f" + std::to_string(i), made(i, i, "e"), why));
+        bool answered = false;
+        ix->when_durable([&](bool) { answered = true; });
+        REQUIRE(ix->compact(why, true));
+        REQUIRE(ix->rewriting());
+        // Queued behind the write in flight, and written as the index goes.
+        REQUIRE(ix->carried("t", "late", made(1, 1, "l"), why));
+        ix.reset();
+        CHECK_FALSE(answered);
+    }
+    // Their completions find nothing of the index; the descriptors they name stay open until they are done.
+    REQUIRE(r.until([&] { return r.io->inflight() == 0; }));
+    CHECK_FALSE(std::filesystem::exists(tf.path + ".new"));
+    sync_index again;
+    REQUIRE(again.open(tf.path, "/srv\nlaptop", why));
+    CHECK(again.size() == 101);
+    CHECK(again.find("t", "late") != nullptr);
 }

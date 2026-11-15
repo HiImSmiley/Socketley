@@ -59,6 +59,8 @@ constexpr int default_pull_secs = 60;
 constexpr const char* temp_dir = ".socketley-sync";
 // The most fetched files whose sync is in the ring at once.
 constexpr size_t max_placing = 32;
+// Folders synced at once at the end of a listing, each holding a descriptor and a kernel worker.
+constexpr size_t max_folder_syncs = 16;
 // One read of inotify takes this much: some hundred events, more than a burst of saves makes.
 constexpr uint32_t watch_buf_size = 64 * 1024;
 // A file is looked at once it is written and closed, moved in, touched or removed; one merely created is still being
@@ -407,6 +409,9 @@ bool sync_run::start(std::string& why)
     }
     // The directory and the prefix decide which object a path is, so an index kept for others is begun again.
     const std::string scope = std::string(m_rt.get_dir()) + "\n" + std::string(m_rt.get_prefix());
+    // Its writes and syncs go through the ring, so a disk that takes seconds over one holds up nothing else of this
+    // job: its exchanges, its inotify and the daemon's link to its worker go on meanwhile.
+    m_index.attach(m_io, [this](const std::string& what) { note(what); });
     if (!m_index.open(index.string(), scope, why))
         return false;
     if (!resolve_targets(why))
@@ -471,6 +476,8 @@ void sync_run::stop()
         }
     m_iter.reset();
     m_walking = false;
+    // What was brought or removed here is still recorded, once its folder is synced.
+    settle_folders();
     m_index.flush();
     // Through the loop, which cancels the read standing on it; its completion still comes here, which is why a
     // stopped run is kept until drained().
@@ -1622,24 +1629,75 @@ void sync_run::decide_pull(target& t)
         const auto [folder, leaf] = split_rel(rel);
         const int at = dir_beneath(m_root_fd, folder, false);
         struct stat st{};
+        bool unlinked = false;
         if (at >= 0 && ::fstatat(at, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
             uint64_t(st.st_size) == had->size && mtime_of(st) == had->mtime_ns)
         {
             if (::unlinkat(at, leaf.c_str(), 0) == 0)
+            {
                 ++m_stats.removed_here;
+                unlinked = true;
+            }
             else
                 note(rel + ": " + std::strerror(errno));
         }
         if (at >= 0)
             ::close(at);
+        // Recorded gone once its folder is synced, at the end of the listing.
+        if (unlinked)
+        {
+            m_unrecorded[folder].push_back(unrecorded{'d', t.name, rel, {}});
+            continue;
+        }
         // One changed here since is this side's now, and the walk carries it out again as a new file.
         if (!m_index.gone(t.name, rel, why))
             note(why);
     }
     m_stats.indexed = m_index.size();
     m_remote.clear();
-    if (m_fetches.empty())
+    if (m_fetches.empty() && m_placing == 0)
         finish_pull();
+}
+
+void sync_run::settle_folders()
+{
+    // A few at a time, each folder once however many files of the listing it took or gave up.
+    while (m_folder_syncs < max_folder_syncs && !m_unrecorded.empty())
+    {
+        auto node = m_unrecorded.extract(m_unrecorded.begin());
+        const std::string folder = node.key();
+        auto records = std::make_shared<std::vector<unrecorded>>(std::move(node.mapped()));
+        // For reading, since a path's descriptor, which dir_beneath gives, takes no sync.
+        const int fd = open_beneath(m_root_fd, folder, O_RDONLY | O_DIRECTORY);
+        const int err = errno;
+        ++m_folder_syncs;
+        const auto done = [this, fd, folder, records](int64_t res) {
+            if (fd >= 0)
+                ::close(fd);
+            --m_folder_syncs;
+            // A folder that could not be synced may hold or lack the files after a crash as they were before: they are
+            // not recorded, so the next listing meets them as new, and the walk's condition answers for the rest.
+            if (res < 0)
+                note((folder.empty() ? std::string(".") : folder) + ": syncing it here failed: " +
+                     std::strerror(static_cast<int>(-res)));
+            else
+            {
+                std::string why;
+                for (const unrecorded& r : *records)
+                    if (!(r.kind == 'p' ? m_index.carried(r.target, r.rel, r.e, why) : m_index.gone(r.target, r.rel, why)))
+                        note(why);
+                m_stats.indexed = m_index.size();
+            }
+            // A stop has synced the index already; the run is kept until this sync is done too.
+            if (m_stopped)
+                m_index.flush();
+            settle_folders();
+        };
+        if (fd < 0)
+            done(-err);
+        else if (!m_io.fsync(fd, false, done))
+            done(::fsync(fd) == 0 ? 0 : -errno);
+    }
 }
 
 void sync_run::pump_fetch(target& t)
@@ -1818,15 +1876,22 @@ void sync_run::place_fetched(const std::string& target_name, fetch& fr, bool syn
             placed = true;
             ++m_stats.brought;
             m_stats.bytes_carried += f->size;
-            std::string why;
+            m_stats.failing = 0;
             // The name as the storage has it is now the same on both sides; a conflict copy is new to both, and the
             // walk carries it out, as it does this side's file over the storage's, which it now knows the etag of.
-            if (name == f->rel && ::fstatat(at, name_leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
-                !m_index.carried(target_name, f->rel, index_entry{uint64_t(st.st_size), mtime_of(st), f->etag}, why))
-                note(why);
-            if (name != f->rel && !m_index.carried(target_name, f->rel, index_entry{0, -1, f->etag}, why))
-                note(why);
-            m_stats.failing = 0;
+            index_entry e{0, -1, f->etag};
+            bool record = name != f->rel;
+            if (!record && ::fstatat(at, name_leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0)
+            {
+                e.size = uint64_t(st.st_size);
+                e.mtime_ns = mtime_of(st);
+                record = true;
+            }
+            // Recorded once the rename is on the disk, which syncing the folder at the end of the listing makes it:
+            // an index on another disk could otherwise keep a file brought that a crash took back, and the walk
+            // would take the storage's copy away as one deleted here.
+            if (record)
+                m_unrecorded[folder].push_back(unrecorded{'p', target_name, f->rel, e});
         }
         else
             note(name + ": it could not be put in place: " + (!reason.empty() ? reason : std::string(std::strerror(errno))));
@@ -1843,12 +1908,20 @@ void sync_run::finish_pull()
 {
     if (!m_pulling)
         return;
+    // What the listing brought and removed here is recorded once the folders it touched are synced; the next turn
+    // after the last of those syncs ends the listing.
+    if (!m_unrecorded.empty() || m_folder_syncs != 0)
+    {
+        settle_folders();
+        return;
+    }
     m_pulling = false;
     m_last_pull = std::chrono::steady_clock::now();
     m_stats.indexed = m_index.size();
     std::string why;
     if (!m_index.compact(why))
         note(why);
+    // Begun in the ring and waited for by nothing: every record it holds is of a file already on the disk here.
     m_index.flush();
     ::rmdir((std::string(m_rt.get_dir()) + "/" + temp_dir).c_str());
     if (pushes())
