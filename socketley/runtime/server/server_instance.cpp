@@ -1044,7 +1044,9 @@ void server_instance::rebuild_http_cache()
             if (m_http_root_fd >= 0)
             {
                 struct open_how how{};
-                how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC);
+                // O_NONBLOCK: a FIFO put in place of the file since the walk looked at it would hold this open, and
+                // with it the loop, until somebody wrote to it.
+                how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC | O_NONBLOCK);
                 how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
                 const long r = ::syscall(__NR_openat2, m_http_root_fd, rel.c_str(),
                                          &how, sizeof(how));
@@ -1071,7 +1073,7 @@ void server_instance::rebuild_http_cache()
         // Read through the descriptor that was checked, because opening the path again reads whatever it names by then.
         std::string content;
         struct stat cst{};
-        if ((cfd >= 0 ? ::fstat(cfd, &cst) : ::stat(entry.path().c_str(), &cst)) != 0)
+        if ((cfd >= 0 ? ::fstat(cfd, &cst) : ::stat(entry.path().c_str(), &cst)) != 0 || !S_ISREG(cst.st_mode))
         {
             if (cfd >= 0)
                 ::close(cfd);
@@ -1480,7 +1482,10 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         {
             const char* rel = rel_path;
             struct open_how how{};
-            how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC);
+            // O_NONBLOCK, because a FIFO in the root opened without it blocked this loop -- every connection the
+            // runtime holds -- until something wrote to it: one GET of it, and the server answered nothing more.
+            // Taken off again below once the descriptor is known to be a regular file.
+            how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC | O_NONBLOCK);
             how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
             long r = ::syscall(__NR_openat2, m_http_root_fd, rel, &how, sizeof(how));
             if (r >= 0)
@@ -1524,7 +1529,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
 
         // O_CLOEXEC, because this is on the request path and a worker forked
         // while a file is being served would inherit a descriptor on it.
-        ffd = open(resolved.c_str(), O_RDONLY | O_CLOEXEC);
+        ffd = open(resolved.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         }
         if (ffd < 0)
         {
@@ -1537,7 +1542,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         }
 
         struct stat st = held_st;
-        if (!held && (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode)))
+        if (!held && (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) ||
+                      ::fcntl(ffd, F_SETFL, ::fcntl(ffd, F_GETFL) & ~O_NONBLOCK) != 0))
         {
             close_tracked(ffd);
             queue_http_response(conn, http_404_response(conn->http_keep_alive));

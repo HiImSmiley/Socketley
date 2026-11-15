@@ -246,6 +246,10 @@ int proxy_instance::fcgi_open(std::string_view rel, int flags, struct stat& st) 
     if (m_fcgi_root_fd < 0)
         return -1;
     const std::string path = rel.empty() ? std::string(".") : std::string(rel);
+    // O_NONBLOCK until the descriptor is known to be a regular file: a FIFO under --root would otherwise hold the
+    // open, and the loop with it, until something wrote to it.
+    if (!(flags & O_PATH))
+        flags |= O_NONBLOCK;
     struct open_how how{};
     how.flags = static_cast<uint64_t>(flags | O_CLOEXEC);
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
@@ -261,7 +265,9 @@ int proxy_instance::fcgi_open(std::string_view rel, int flags, struct stat& st) 
     }
     if (r < 0)
         return -1;
-    if (::fstat(static_cast<int>(r), &st) != 0)
+    if (::fstat(static_cast<int>(r), &st) != 0 ||
+        ((flags & O_NONBLOCK) && S_ISREG(st.st_mode) &&
+         ::fcntl(static_cast<int>(r), F_SETFL, ::fcntl(static_cast<int>(r), F_GETFL) & ~O_NONBLOCK) != 0))
     {
         ::close(static_cast<int>(r));
         return -1;

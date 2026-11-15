@@ -531,7 +531,9 @@ loaded load_factory(lua_State* L, cache& c, int root_fd, const std::string& rel,
             lua_pop(L, 1);
         }
     struct open_how how{};
-    how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC);
+    // O_NONBLOCK: a FIFO named like a page would hold this open, and the worker, until something wrote to it; the
+    // read of a regular file below is not changed by it.
+    how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
     const long r = ::syscall(__NR_openat2, root_fd, rel.c_str(), &how, sizeof(how));
     if (r < 0)
