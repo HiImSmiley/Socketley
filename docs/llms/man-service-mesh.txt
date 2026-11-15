@@ -45,6 +45,8 @@ A request is answered **400 Bad Request** and its connection is closed, without 
 - both **Content-Length** and **Transfer-Encoding**, or more than one **Content-Length** field
 - a **Content-Length** that is not a whole decimal number (**Content-Length: 6x**)
 - a **Transfer-Encoding** whose final coding is not **chunked** (**Transfer-Encoding: gzip**, **Transfer-Encoding: chunked, gzip**, or **chunked** listed twice); such a request has no determinable body length at all
+- a NUL byte in a field value
+- a request line whose method is not a token, whose target holds a control byte, a space or DEL, or whose version is not **HTTP/1.***digit* (**GET /a HTTP/1.1 junk**, a vertical tab inside the target); a backend that splits the line at any whitespace, or stops at a NUL, would read another target than the one this proxy routed and checked. An HTTP/2 or HTTP/3 request at an entrance is written back as such a line and refused the same way.
 
 Every request on a connection is framed and checked on its own, including one pipelined behind another. Only the body that a request declares travels with it. Bytes past its **Content-Length** are not body: the proxy holds them back and parses them as the next request instead of forwarding them. Pipelining still works, and a second request sent before the first is answered is still served. But it is answered in turn, after the same checks. A smuggling attempt hidden behind a clean request is refused exactly as if it had been sent first.
 

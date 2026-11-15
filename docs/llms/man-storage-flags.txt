@@ -13,7 +13,7 @@ Like every other runtime, it runs in a worker process of its own. It speaks HTTP
 
 ### `--dir path`
 
-Sets the directory that holds the buckets. It is required, is created if it does not exist, and is made absolute against the caller's directory. A runtime is one process on one directory or, with **--shards**, several processes that share it. Two runtimes on one path would append to each other's journals.
+Sets the directory that holds the buckets. It is required, is created if it does not exist, and is made absolute against the caller's directory. A runtime is one process on one directory or, with **--shards**, several processes that share it. Two runtimes on one path would append to each other's journals. What the runtime keeps there is readable by its own account alone: a directory it creates is mode 0700, every bucket's folder is 0700 (a bucket made by an older version is narrowed when the runtime starts), and its files — objects, indexes naming every key with its metadata and tags, policies and other bucket configuration — are 0600. A directory that already existed keeps its own mode.
 
 ### `--access-key key` / `--secret-key secret`
 
