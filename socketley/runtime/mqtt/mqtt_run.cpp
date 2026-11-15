@@ -1260,7 +1260,7 @@ void mqtt_run::tick()
         for (auto& [id, c] : m_conns)
         {
             bool admin = false;
-            if (!c->idp_sub.empty() && !c->closing && !m_idp->holds(c->idp_sub, c->idp_signed_in_ms, admin))
+            if (!c->idp_sub.empty() && !c->closing && !m_idp->holds(c->idp_sub, c->idp_signed_in_ms, c->idp_sid, admin))
                 gone.push_back(c.get());
         }
         for (conn* c : gone)
@@ -1474,6 +1474,7 @@ void mqtt_run::authenticate(const auth_ask& ask, std::function<void(auth_answer)
                 {
                     it->second->idp_sub = who.sub;
                     it->second->idp_signed_in_ms = who.issued_ms;
+                    it->second->idp_sid = who.sid;
                 }
                 finish(true, reason::success, who.username.empty() ? who.sub : who.username);
                 return;

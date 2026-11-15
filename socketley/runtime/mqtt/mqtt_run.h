@@ -139,10 +139,12 @@ private:
         // The broker asked it closed once what it owes has gone; the time it asked, for a peer that never reads.
         bool closing{false};
         int64_t closing_ms{0};
-        // The idp account an access token let this connection in as, and when it was signed in, asked again each few
-        // seconds: a connection outlives no disable, reset, removal or sign-out everywhere of its account.
+        // The idp account an access token let this connection in as, when it was signed in and the sign-in (sid) it
+        // is of, asked again each few seconds: a connection outlives no disable, reset, removal or sign-out everywhere
+        // of its account, nor the end of its own sign-in alone (its code or refresh token used again).
         std::string idp_sub;
         int64_t idp_signed_in_ms{0};
+        std::string idp_sid;
         SSL* ssl{nullptr};
         bool handshaken{false};
         // The kernel holds the send key, and what is sent goes to the socket as plaintext, a payload as a slice of its

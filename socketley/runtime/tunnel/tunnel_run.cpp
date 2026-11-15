@@ -1447,7 +1447,7 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
             LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" connected from " +
                       client_of(c->peer, head)).c_str());
         upgraded(c, link::kind::person, who.username, name.empty() ? std::string() : "Tunnel-Share: " + name + "\r\n",
-                 who.sub, who.issued_ms, who.admin);
+                 who.sub, who.issued_ms, who.admin, who.sid);
         if (!name.empty())
         {
             // The link gone already, in the upgrade, takes its share with it.
@@ -1467,7 +1467,8 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
 }
 
 void tunnel_run::upgraded(const std::shared_ptr<http::server_conn>& c, link::kind k, std::string who,
-                          std::string_view extra_headers, std::string sub, int64_t signed_in_ms, bool admin)
+                          std::string_view extra_headers, std::string sub, int64_t signed_in_ms, bool admin,
+                          std::string sid)
 {
     auto& f = static_cast<front_conn&>(*c);
     c->out += "HTTP/1.1 101 Switching Protocols\r\nUpgrade: " + std::string(upgrade_token) +
@@ -1476,6 +1477,7 @@ void tunnel_run::upgraded(const std::shared_ptr<http::server_conn>& c, link::kin
     f.l->admin = admin;
     f.l->sub = std::move(sub);
     f.l->signed_in_ms = signed_in_ms;
+    f.l->sid = std::move(sid);
     ++m_c.links;
     f.l->s.hello({{"edge", std::string(m_owner.get_name())}}, f.l->out);
     if (k == link::kind::agent)
@@ -1504,7 +1506,7 @@ void tunnel_run::upgraded(const std::shared_ptr<http::server_conn>& c, link::kin
 bool tunnel_run::person_holds(link& l)
 {
     bool admin = false;
-    if (!m_idp || !m_idp->holds(l.sub, l.signed_in_ms, admin))
+    if (!m_idp || !m_idp->holds(l.sub, l.signed_in_ms, l.sid, admin))
         return false;
     l.admin = admin;
     return true;

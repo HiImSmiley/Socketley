@@ -17,6 +17,7 @@
 #   * a port of the edge's machine reached as an agent's service the edge does not serve
 #   * a join that replaces an agent already joined without being asked to
 #   * a person's link kept open, and its streams opened, after the idp took the sign-in back
+#   * a person's link outliving its own sign-in ended alone (its refresh token used again), or ending another's
 set -uo pipefail
 USER=${USER:-$(id -un)}   # unset under a service, cron or a container's exec
 
@@ -80,6 +81,7 @@ for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$I/jwks")
 "$BIN" idp-user auth add alice --password alicepassword1 >/dev/null 2>&1
 "$BIN" idp-user auth add boss --password bosspassword1 --groups admins >/dev/null 2>&1
 "$BIN" idp-user auth add carol --password carolpassword1 >/dev/null 2>&1
+"$BIN" idp-user auth add dan --password danpassword1 >/dev/null 2>&1
 out=$("$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && case "$out" in *"--forward needs --idp"*) true ;; *) false ;; esac && ok || bad "--forward without --idp is refused" "rc $rc: $out"
 "$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX,127.0.0.1:$PS" --idp auth -s >/dev/null 2>&1 \
@@ -145,6 +147,43 @@ kill -0 "$HELD" 2>/dev/null && bad "a link held open ends once its account is si
 grep -q 'tunnel e: the sign-in of "carol" no longer holds' "$SOCKETLEY_DLOG" && ok || bad "and the log says why" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
 exec 7>&-
 kill "$HELD" 2>/dev/null; wait "$HELD" 2>/dev/null
+
+# And with the sign-in its token is of, ended alone: dan's refresh token used a second time ends that sign-in (its
+# family, the access token's sid) and nothing else of his, so his link closes and alice's goes on.
+login_as dan danpassword1 "" "$T/dan" || bad "dan signs in" "$(cat "$T/login.out")"
+open_held() {   # open_held <config dir> <tag>: a link held open, its pid in HELD_<tag>, its stdin on fd 7 or 6
+    mkfifo "$T/$2.in"
+    XDG_CONFIG_HOME="$1" "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" < "$T/$2.in" \
+        > "$T/$2.out" 2>"$T/$2.err" &
+    eval "HELD_$2=$!"
+}
+open_held "$T/dan" dan; exec 7>"$T/dan.in"
+open_held "$T/alice" ali; exec 6>"$T/ali.in"
+printf 'held' >&7; printf 'held' >&6
+for _ in $(seq 1 50); do [ "$(cat "$T/dan.out")$(cat "$T/ali.out")" = heldheld ] && break; sleep 0.1; done
+[ "$(cat "$T/dan.out")$(cat "$T/ali.out")" = heldheld ] && ok || bad "dan's and alice's streams are carried" "$(cat "$T/dan.err" "$T/ali.err")"
+reuse=$(python3 - "$I" "$(cat "$T"/dan/socketley/tokens/*.json)" <<'PY'
+import json, sys, urllib.request, urllib.parse, urllib.error
+I, kept = sys.argv[1], json.loads(sys.argv[2])
+def refresh(rt):
+    r = urllib.request.Request(I + "/token", method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               data=urllib.parse.urlencode(dict(grant_type="refresh_token", refresh_token=rt,
+                                                                client_id=kept["client_id"])).encode())
+    try:
+        with urllib.request.urlopen(r) as resp: return resp.status
+    except urllib.error.HTTPError as e: return e.code
+print(refresh(kept["refresh_token"]), refresh(kept["refresh_token"]))
+PY
+)
+[ "$reuse" = "200 400" ] && ok || bad "dan's refresh token used again is refused" "got '$reuse'"
+for _ in $(seq 1 50); do kill -0 "$HELD_dan" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$HELD_dan" 2>/dev/null && bad "a link held open ends once its own sign-in is ended alone" "still open after 5 s" || ok
+grep -q 'tunnel e: the sign-in of "dan" no longer holds' "$SOCKETLEY_DLOG" && ok || bad "and the log says why" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
+printf ' still' >&6
+for _ in $(seq 1 30); do [ "$(cat "$T/ali.out")" = "held still" ] && break; sleep 0.1; done
+[ "$(cat "$T/ali.out")" = "held still" ] && kill -0 "$HELD_ali" 2>/dev/null && ok || bad "while alice's link goes on" "$(cat "$T/ali.out") $(cat "$T/ali.err")"
+exec 7>&- 6>&-
+kill "$HELD_dan" "$HELD_ali" 2>/dev/null; wait "$HELD_dan" "$HELD_ali" 2>/dev/null
 
 login_as alice alicepassword1 other "$T/other" || true
 out=$(printf 'x' | XDG_CONFIG_HOME="$T/other" "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" 2>&1); rc=$?

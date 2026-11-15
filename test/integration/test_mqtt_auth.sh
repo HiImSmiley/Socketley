@@ -5,7 +5,7 @@
 #
 # What each part would catch:
 #   * a wrong password, an unknown user or a forged token let in, or a right one refused
-#   * a connection a token let in outliving its account's disable
+#   * a connection a token let in outliving its account's disable, or its own sign-in ended alone
 #   * a password guessed at without end from one address, or its guesses shutting out another address or the entrance
 #   * mqtt-passwd writing a file the broker does not read, or one others can read
 #   * a users or rules file changed while running and not taken
@@ -76,6 +76,7 @@ EOF
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PI/jwks")" != 000 ] && break; sleep 0.1; done
 DAVE=$("$BIN" idp-user auth add dave --password davepassword1 2>&1)
 [ ${#DAVE} -eq 22 ] && ok || bad "an account is made" "$DAVE"
+"$BIN" idp-user auth add erin --password erinpassword1 >/dev/null 2>&1 || bad "a second account is made" "rc $?"
 
 "$BIN" create mqtt a -p "$PA" --users "$T/users" --acl "$T/acl" --idp auth --idp-audience spa --ws "$PW" -s >/dev/null 2>&1 \
     && ok || bad "a broker with users, rules, an idp and WebSocket is made" "$(tail -3 "$SOCKETLEY_DLOG")"
@@ -122,16 +123,18 @@ def at(method, path, form):
             return resp.status, resp.read().decode(), resp.headers
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode(), e.headers
-def access_token(user, password):
+def access_token(user, password, again=False):
     verifier = base64.urlsafe_b64encode(os.urandom(40)).rstrip(b"=").decode()
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     cb = "http://localhost:5173/cb"
     st, _, h = at("POST", "/authorize", dict(client_id="spa", redirect_uri=cb, response_type="code", scope="openid",
                   state="s", code_challenge=challenge, code_challenge_method="S256", username=user, password=password))
     code = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(h.get("Location", "")).query)).get("code")
-    st, body, _ = at("POST", "/token", dict(grant_type="authorization_code", code=code, redirect_uri=cb,
-                     client_id="spa", code_verifier=verifier))
-    return json.loads(body).get("access_token") if st == 200 else None
+    form = dict(grant_type="authorization_code", code=code, redirect_uri=cb, client_id="spa", code_verifier=verifier)
+    st, body, _ = at("POST", "/token", form)
+    tok = json.loads(body).get("access_token") if st == 200 else None
+    # With `again`, the code exchanged a second time as well: what it gave is revoked, that sign-in alone ended.
+    return (tok, lambda: at("POST", "/token", form)[0]) if again else tok
 
 if phase == "main":
     def passwords():
@@ -326,6 +329,21 @@ if phase == "held":
         truth("and is closed within seconds of its account being disabled", c.closed_within(8))
     guarded("held", held)
 
+if phase == "ended":
+    # A connection a token let in ends with that token's own sign-in, ended alone -- here by its code being used
+    # again, which revokes what the code gave -- while another sign-in of the same account goes on.
+    def ended():
+        tok, use_again = access_token("erin", "erinpassword1", again=True)
+        other = access_token("erin", "erinpassword1")
+        c = connected(pa, "erin-ended", password=tok)
+        o = connected(pa, "erin-other", password=other)
+        truth("a token's connection stays open while its sign-in stands", not c.closed_within(2.5))
+        check("its code used again is refused", use_again(), 400)
+        truth("and the connection is closed within seconds of that sign-in alone ending", c.closed_within(8))
+        truth("while the account's other sign-in stays connected", not o.closed_within(0.5))
+        o.disconnect()
+    guarded("ended", ended)
+
 if phase == "guessing":
     def guessing():
         # Ten wrong passwords from one address, and it is told nothing more, the right password included.
@@ -355,6 +373,7 @@ tally < <(run reread)
 printf '# every rule taken out\n' > "$T/acl"
 tally < <(run emptyacl)
 tally < <(run guessing)
+tally < <(run ended)
 tally < <(run held)
 
 st=$("$BIN" stats a 2>&1)
