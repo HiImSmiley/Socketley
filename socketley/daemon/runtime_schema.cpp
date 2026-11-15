@@ -220,7 +220,7 @@ constexpr row rows[] = {
     {"--logs", "R", "switch", "Logs", "Keep every line the daemon and its runtimes log, queried with LogQL as Grafana queries Loki.", "Logs"},
     {"--no-logs", "R", "switch", "No logs", "Keep no log lines; the default.", "Logs", {}, {}, {}, true},
     {"--logs-keep", "R", "duration", "Keep logs", "How long the log lines are kept.", "Logs", {}, "14d"},
-    {"--receive", "R", "switch", "Take remote_write", "Store what a Prometheus or agent sends to /api/v1/write.", "Metrics"},
+    {"--receive", "R", "switch", "Take remote_write", "Store what a Prometheus or agent sends to /api/v1/write, with a key or an admin's token when guarded.", "Metrics"},
     {"--archive", "R", "text", "Archive", "An S3 bucket every finished block is copied to, so it outlives --keep.", "Archive", {}, "https://s3.example.com/metrics/home"},
     {"--archive-credentials", "R", "path", "Archive keys", "A file with the bucket's access_key and secret_key, in the form sync reads.", "Archive", {}, "/etc/socketley/metrics.s3"},
 

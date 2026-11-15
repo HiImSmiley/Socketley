@@ -7,6 +7,7 @@
 
 #include "metrics_instance.h"
 #include "metrics_remote.h"
+#include "metrics_text.h"
 #include "../../shared/crypto/mac.h"
 #include "../../shared/http/http_framing.h"
 #include "../../shared/http/request_head.h"
@@ -315,6 +316,9 @@ namespace
 // A WriteRequest's series into the store, each refused one counted rather than failing the rest.
 struct write_into final : remote::write_sink
 {
+    static constexpr size_t max_labels = text_limits{}.max_labels;
+    static constexpr size_t max_name = text_limits{}.max_name;
+    static constexpr size_t max_series_bytes = text_limits{}.max_line;
     store& st;
     label_set ls;
     uint64_t appended{0}, refused{0};
@@ -322,6 +326,20 @@ struct write_into final : remote::write_sink
 
     void on_series(const remote::series& s) override
     {
+        // Held to what a scraped line may carry: its labels, a name's length and the line's bytes, so one request of
+        // its 32 MiB cannot make a series of any size, nor the series bound of any memory.
+        size_t bytes = 0;
+        bool fits = s.labels.size() <= max_labels;
+        for (const auto& l : s.labels)
+        {
+            fits = fits && l.name.size() <= max_name;
+            bytes += l.name.size() + l.value.size();
+        }
+        if (!fits || bytes > max_series_bytes)
+        {
+            refused += s.samples.size();
+            return;
+        }
         ls.clear();
         for (const auto& l : s.labels)
             if (!l.value.empty())
@@ -662,6 +680,14 @@ void metrics_run::handle(const std::shared_ptr<socketley::http::server_conn>& c,
             return respond(*c, 404, "text/plain; charset=utf-8", "remote_write is taken with --receive\n");
         if (rq.method != "POST")
             return respond(*c, 405, "text/plain; charset=utf-8", "remote_write is a POST\n");
+        // Samples written are what every rule and page reads, so they are taken from a sender this runtime trusts with
+        // that: a key, or an admin's token; a browser's cookie, which a sibling's page can have sent along, never.
+        if (m_owner.guarded() && (!admin || rq.authorization.empty()))
+        {
+            ++m_c.unauthorized;
+            return respond(*c, 403, "text/plain; charset=utf-8",
+                           "remote_write is taken with a key of --keys or the token of an admin of --idp\n");
+        }
         std::string why;
         if (!receive(rq.body, why))
         {
