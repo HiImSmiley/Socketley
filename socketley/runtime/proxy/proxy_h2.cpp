@@ -277,7 +277,12 @@ bool proxy_instance::h2_child_pull(proxy_client_connection* child)
         child->partial += "\r\n";
     };
 
-    while (!st.rxq.empty() && child->partial.size() < read_buffer_bytes())
+    // Nothing is taken while the backend's queue is over the watermark, as a TCP client's read is not re-armed then:
+    // what is held keeps its window, so the client is stopped at the stream's window, and handle_backend_write's
+    // resume arms this read again once the queue drains.  Without it every DATA frame was forwarded as it came and
+    // its window given back, the queue reached --write-buffer in front of a backend slower than the client, and the
+    // request was reset there -- 19 MiB into a 32 MiB upload with the defaults -- where HTTP/1.1 is only slowed.
+    while (!st.rxq.empty() && child->partial.size() < read_buffer_bytes() && !backend_backpressured(child))
     {
         std::string front = std::move(st.rxq.front());
         st.rxq.pop_front();

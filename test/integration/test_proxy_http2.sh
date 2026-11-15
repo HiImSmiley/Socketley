@@ -13,7 +13,8 @@
 #   routing      a stream is routed by its own `:authority`, and two names reach
 #                their two different runtimes, each over its own connection
 #   bodies       a POST over a stream reaches the backend whole, with and
-#                without a stated length
+#                without a stated length, and one faster than its backend
+#                reads is held at the stream's window rather than reset
 #   framing      an answer ends, so a client reads a complete body and a
 #                second request on the same connection still works
 #   the bound    more streams at once than the session allows are refused,
@@ -331,6 +332,13 @@ python3 "$T/slow.py" $((P+9)) & SLOW_PID=$!
     -s >/dev/null 2>&1
 for _ in $(seq 1 60); do f=$(find "$T" -name 'routes-ent2' | head -1)
     [ -n "$f" ] && grep -q slow.example.com "$f" && grep -q echo.example.com "$f" && break; sleep 0.2; done
+# The same upload over HTTP/2: a stream's DATA waits while the backend's queue is over the watermark, and its window
+# with it, rather than being forwarded until the queue reached --write-buffer and the stream was reset.
+head -c $((32 << 20)) /dev/zero | tr '\0' u >"$T/up32.bin"
+expect "a 32 MiB HTTP/2 upload to a backend that reads nothing for 3 s arrives whole" \
+    "$(curl -sk --http2 --noproxy '*' -m 60 --resolve "slow.example.com:$E2:127.0.0.1" --data-binary @"$T/up32.bin" \
+        -w ' %{http_code} %{http_version}' "https://slow.example.com:$E2/up" 2>&1)" "len=$((32 << 20)) 200 2"
+rm -f "$T/up32.bin"
 h3out=$(python3 "$HERE/lib_proxy_http3.py" "$E" "$T/e.pem" "$T/big.txt" "$E2" 2>&1)
 echo "$h3out" | sed -n 's/^  \(PASS\|FAIL\|SKIP\)/  \1/p'
 h3p=$(echo "$h3out" | sed -n 's/^Results: \([0-9]*\) passed.*/\1/p')
