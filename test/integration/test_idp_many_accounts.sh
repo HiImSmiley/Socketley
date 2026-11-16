@@ -32,7 +32,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: an identity provider with 100,000 accounts ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate idpmany
 T=$SOCKETLEY_TMPD
 PI=$((SL_PORT_BASE + 1953))
@@ -222,9 +222,11 @@ PY
 read -r readers worst_reader <<<"$out"
 reopened=$("$BIN" stats auth 2>/dev/null | awk -F: '$1 == "reopened" { n += $2 } END { print n + 0 }')
 echo "  at two shards: the reading shard's worst answer beside 120 writes ${worst_reader:-?} ms, reading the accounts again $reopened time(s)"
-[ "${readers:-0}" -gt 0 ] && [ "$reopened" -ge 2 ] && ok || bad "the reading shard is asked while it reads the accounts again" "$out, reopened $reopened"
+# The stall is what the reads again are measured for, so under a sanitizer, where writes come too slowly to be read
+# twice, neither is asked.
 if [ "$sanitized" = 1 ]; then echo "  SKIP [reader stall]: milliseconds measure the sanitizer, not the store"
 else
+    [ "${readers:-0}" -gt 0 ] && [ "$reopened" -ge 2 ] && ok || bad "the reading shard is asked while it reads the accounts again" "$out, reopened $reopened"
     awk -v m="${worst_reader:-9999}" 'BEGIN{exit !(m < 100)}' && ok || bad "a reading shard reads the accounts again off its loop" "$out"
 fi
 r=$("$BIN" idp-user auth show u6 2>&1 | grep '^name:')

@@ -11,6 +11,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_ports.sh"
+. "$HERE/lib_sdk.sh"
 ROOT=$(cd "$HERE/../.." && pwd)
 BINDIR=$(dirname "$BIN")
 LIB="$BINDIR/libsocketley.so"
@@ -38,8 +39,8 @@ print(s.recv(99).decode().strip())" "$@" 2>&1 | tail -1; }
 mcp() { python3 "$HERE/lib_mcp_call.py" "$@" 2>&1 | tail -1; }
 wait_ready() { for _ in $(seq 1 300); do grep -q '^READY' "$T/$1.out" 2>/dev/null && return 0; kill -0 "$HOST" 2>/dev/null || return 1; sleep 0.1; done; return 1; }
 
-case "$BINDIR" in
-*Sanitize*) echo "  SKIP: a Rust or Node process carries no sanitizer runtime for the library to link" ;;
+case "$(sdk_sanflags "$BINDIR")" in
+?*) echo "  SKIP: a Rust or Node process carries no sanitizer runtime for the library to link" ;;
 *)
 P=$SL_PORT_BASE
 

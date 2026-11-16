@@ -28,7 +28,7 @@ PS=$((SL_PORT_BASE + 1761))
 trap 'daemon_stop' EXIT
 daemon_start "$BIN"
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 
 "$BIN" create mqtt wk -p "$P" --anonymous -s >/dev/null 2>&1 \
     && ok || bad "a broker is made" "$(tail -3 "$SOCKETLEY_DLOG")"

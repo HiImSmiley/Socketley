@@ -181,8 +181,7 @@ int main(int argc, char** argv)
 }
 PROBE_EOF
 
-SANFLAGS=""
-case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+SANFLAGS=$(sdk_sanflags "$BINDIR")
 
 if sdk_cxx "$SOCKETLEY_TMPD/probe.cpp" \
      -I"$ROOT" -I"$ROOT/sdk/include/linux" \

@@ -93,7 +93,9 @@ after=$(ticks "$AUTH")
 cores=$(python3 -c "import os,sys; print('%.2f' % ((int(sys.argv[2])-int(sys.argv[1]))/os.sysconf('SC_CLK_TCK')/(float(sys.argv[4])-float(sys.argv[3]))))" \
         "$before" "$after" "$start" "$(date +%s.%N)")
 echo "  sign-ins over IMAP: ${logins:-0} in 22s, the idp spending $cores cores"
-if [ "${logins:-0}" -gt 100 ] && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) >= 0.6 else 1)" "$cores"; then
+# A hundred sign-ins in Release, fewer by what each costs in this build: a scrypt under a sanitizer is ~64 times one.
+want_logins=$(( 100 / $(build_cost) )); [ "$want_logins" -ge 2 ] || want_logins=2
+if [ "${logins:-0}" -ge "$want_logins" ] && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) >= 0.6 else 1)" "$cores"; then
     ok "the load is one the watchdog would report if it counted no answer: sign-ins answered, over half a core"
 else
     bad "the load spends half a core" "${logins:-0} sign-ins, $cores cores; a lighter load proves nothing below"

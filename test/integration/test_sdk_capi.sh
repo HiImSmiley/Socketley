@@ -31,8 +31,7 @@ HOST=""
 cleanup() { [ -n "$HOST" ] && kill -9 "$HOST" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 
-SANFLAGS=""
-case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+SANFLAGS=$(sdk_sanflags "$BINDIR")
 
 cat > "$T/host.c" <<'C'
 #define _GNU_SOURCE

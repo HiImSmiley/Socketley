@@ -35,7 +35,7 @@ command -v tc >/dev/null 2>&1 && tc qdisc add dev lo root netem delay 0ms 2>/dev
     || { echo "  SKIP: no netem here"; exit 0; }
 curl -V 2>/dev/null | grep -qi nghttp2 || { echo "  SKIP: this curl has no HTTP/2"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate h2path
 T=$SOCKETLEY_TMPD
 P=$((SL_PORT_BASE + 1995))

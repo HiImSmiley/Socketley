@@ -37,7 +37,7 @@ command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; ec
 # Not grep -q: it exits at the first match, nm dies of SIGPIPE, and pipefail
 # reports the pipeline as failed -- this check never fired under Sanitize.
 SANITIZED=""
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && SANITIZED=1
+build_sanitized && SANITIZED=1
 
 P=$((SL_PORT_BASE + 117)); BP=$((P + 1))
 BUDGET_MB=16          # 4 MiB of ring and the relay's own buffers; 512 x 64 KiB read 33

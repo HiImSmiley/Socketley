@@ -140,7 +140,10 @@ if [ -n "$BIN_PEAK" ] && [ -n "$HTML_PEAK" ]; then
             "no longer distinguishes anything"
     fi
 
-    if awk -v x="$HTML_X" 'BEGIN{exit !(x < 2.5)}'; then
+    # TSan's shadow of what a request touches is several times it, where ASan's is an eighth.
+    if [ "$(build_kind)" = tsan ]; then
+        echo "  SKIP [memory]: the .html's ${HTML_X}x is TSan's shadow of the copies, not the copies"
+    elif awk -v x="$HTML_X" 'BEGIN{exit !(x < 2.5)}'; then
         ok "the read path holds the file once, not three times (added ${HTML_X}x)"
     else
         bad "one large .html is one copy of itself, plus the response" \

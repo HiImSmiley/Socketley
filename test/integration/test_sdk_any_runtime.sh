@@ -29,8 +29,7 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done; rm -rf "$T"; }
 trap cleanup EXIT
 
-SANFLAGS=""
-case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+SANFLAGS=$(sdk_sanflags "$BINDIR")
 
 sdk_cxx "$ROOT/sdk/examples/basic/any_runtime.cpp" $("$ROOT/sdk/socketley-config" --config "$CFG" --cflags --libs) -o "$T/any" 2>"$T/gxx.err" ||
     { bad "the example builds" "$(head -5 "$T/gxx.err")"; echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"; exit 1; }

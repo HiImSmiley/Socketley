@@ -65,8 +65,7 @@ echo "=== Integration: attaching, detaching, and being removed ==="
 
 if ! command -v g++ >/dev/null 2>&1; then echo "  SKIP: g++ is required"; exit 0; fi
 
-SANFLAGS=""
-case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+SANFLAGS=$(sdk_sanflags "$BINDIR")
 
 # A SIGTERM handler rather than letting it kill us: without one the old
 # behaviour is a dead process and an empty file, which reads the same as a

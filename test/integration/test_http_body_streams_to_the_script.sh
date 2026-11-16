@@ -101,7 +101,7 @@ SANITIZED=""
 # read "not sanitized" precisely when it WAS, and the two RSS assertions below
 # stayed armed under ASan.  test_abrupt_client_abort.sh spells it this way for
 # the same reason, and this tree's notes record the same trap three times over.
-if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then SANITIZED="ASan"; fi
+if build_sanitized; then SANITIZED=$(build_kind); fi
 not_asserted() {
     TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
     echo "  NOT ASSERTED [$1]: $2"

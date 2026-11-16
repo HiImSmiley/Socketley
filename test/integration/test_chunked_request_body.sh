@@ -79,7 +79,7 @@ check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "expected '$2', got '$3'"; 
 # `set -o pipefail` the pipeline reports 141 -- so the check reads "not
 # sanitized" precisely when it is.
 SANITIZED=""
-if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then SANITIZED="ASan"; fi
+if build_sanitized; then SANITIZED=$(build_kind); fi
 not_asserted() {
     TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
     echo "  NOT ASSERTED [$1]: $2"

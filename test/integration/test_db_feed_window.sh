@@ -36,9 +36,11 @@ WORKER=$(ss -ltnp 2>/dev/null | awk -v p=":$PD" '$4 ~ p"$" {
     if (match($0, /pid=[0-9]+/)) print substr($0, RSTART+4, RLENGTH-4) }' | head -1)
 [ -n "${WORKER:-}" ] || { echo "  FAIL: no worker pid for the listener"; exit 1; }
 
-tally < <(python3 - "$PD" "$WORKER" 2>&1 <<'PY'
+sanitized=0
+build_sanitized && sanitized=1
+tally < <(python3 - "$PD" "$WORKER" "$sanitized" 2>&1 <<'PY'
 import sys, json, socket, time, urllib.request, urllib.error
-pd, worker = sys.argv[1], sys.argv[2]
+pd, worker, sanitized = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 KEY = {"Authorization": "Bearer feedwindowsecret0123456789", "Content-Type": "application/json"}
 def check(name, got, want):
     print(("ok " if got == want else "bad ") + name + ("" if got == want else ": got %r, want %r" % (got, want)))
@@ -52,6 +54,12 @@ def rss():
         if line.startswith("VmRSS:"):
             return int(line.split()[1]) // 1024
     return 0
+def held(grew, bound, name):
+    """A bound on the worker's growth, which under a sanitizer measures its shadow and quarantine instead."""
+    if sanitized:
+        print("SKIP [memory]: %s -- a sanitizer's shadow, not the window" % name)
+    else:
+        print(("ok " if grew < bound else "bad ") + name)
 def stuck(path):
     """A stream opened by nobody that reads nothing, its receive buffer as small as the kernel allows."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -98,7 +106,7 @@ base = rss()
 early = [stuck("/c/pub/_feed?since=0") for _ in range(12)]
 time.sleep(1.5)
 grew = rss() - base
-print(("ok " if grew < 48 else "bad ") + "twelve unread streams from the start hold a window each, not the history (%d MB grew)" % grew)
+held(grew, 48, "twelve unread streams from the start hold a window each, not the history (%d MB grew)" % grew)
 
 # Sixteen live streams that stop reading while 9.6 MB of changes come: each kept every one before.
 live = [stuck("/c/pub/_feed") for _ in range(16)]
@@ -109,7 +117,7 @@ for _ in range(24):
     put(n)
 time.sleep(1.5)
 grew = rss() - base
-print(("ok " if grew < 60 else "bad ") + "sixteen unread live streams hold a window each while changes come (%d MB grew)" % grew)
+held(grew, 60, "sixteen unread live streams hold a window each while changes come (%d MB grew)" % grew)
 
 # A stream that was behind reads every change in order once it reads, and the next one live, with no reset.
 got = events(early[0], n)

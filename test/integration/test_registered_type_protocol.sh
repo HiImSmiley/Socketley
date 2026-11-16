@@ -57,8 +57,7 @@ command -v g++ >/dev/null 2>&1 || { echo "  SKIP: g++ is required"; exit 0; }
 command -v nc  >/dev/null 2>&1 || { echo "  SKIP: nc is required"; exit 0; }
 [ -f "$BINDIR/libsocketley_sdk.a" ] || { echo "  SKIP: libsocketley_sdk.a is not built"; exit 0; }
 
-SANFLAGS=""
-case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+SANFLAGS=$(sdk_sanflags "$BINDIR")
 SDKFLAGS=$("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) || {
     echo "  FAIL [socketley-config answers]: $SDKFLAGS"
     echo "  Results: 0/1 passed (1 failed)"

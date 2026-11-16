@@ -123,6 +123,9 @@ deny "and no script sees the operator's globals" "socketley" '$3 | nil' \
   '[["EVAL","return type(socketley)","0"]]'
 
 echo "--- 2. the deadline, and what survives it ---"
+if build_defers_signals; then
+    echo "  SKIP [deadline]: the stop signal's handler never runs inside the script's loop under TSan"
+else
 START=$(date +%s)
 got=$(resp '[["EVAL","while true do end","0"]]')
 ELAPSED=$(( $(date +%s) - START ))
@@ -131,6 +134,7 @@ case "$got" in *deadline*) ok "a runaway script is stopped (${ELAPSED}s)" ;;
 [ "$ELAPSED" -lt 30 ] && ok "and stopped in time, not left running" \
                       || bad "deadline" "took ${ELAPSED}s"
 want "the cache answers afterwards" "PONG" '[["PING"]]'
+fi
 
 echo "--- 3. an error is one line, and the next reply survives it ---"
 # Two commands down one connection: if the error reply ends early, the PING's

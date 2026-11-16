@@ -9,6 +9,7 @@
 # daemon, and puts daemon_stop last in cleanup because it deletes the state
 # directory.
 . "$(dirname "${BASH_SOURCE[0]}")/lib_clock.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/lib_build.sh"
 
 # Claim a private socket, state directory and log, before the first CLI command
 # auto-starts a daemon against whatever SOCKETLEY_SOCKET says -- HOME included,

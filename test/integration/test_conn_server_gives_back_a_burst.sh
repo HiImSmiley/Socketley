@@ -20,7 +20,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: a quiet conn_server connection gives back what a burst grew ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 # The sanitizer brings an allocator of its own, which neither trims nor reports as glibc's does.
-if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null; then echo "  SKIP: the sanitizer's allocator is not glibc's"; exit 0; fi
+if build_sanitized; then echo "  SKIP: the sanitizer's allocator is not glibc's"; exit 0; fi
 daemon_isolate cstrim
 P=$((SL_PORT_BASE + 1940))
 unset SOCKETLEY_CONFIG

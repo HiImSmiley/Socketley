@@ -73,7 +73,10 @@ sleep 0.5
 
 LOOPS=()
 HELPERS_WIDE=0; HELPERS=0; HASHERS=0; SINGLE=""
+# TSan starts a thread of its own in every process before the worker pins its loop, so it keeps the loop's mask.
+SANITIZER_THREADS=0
 for w in $(pgrep -P "$SOCKETLEY_DPID" -x socketley); do
+    [ "$(build_kind)" = tsan ] && SANITIZER_THREADS=$((SANITIZER_THREADS+1))
     loop=$(allowed "$w" "$w")
     for t in /proc/$w/task/*; do
         t=${t##*/}
@@ -95,7 +98,7 @@ check "four shard loops are each on one CPU" "${#LOOPS[@]}" "4"
 check "and on four different ones" "$(printf '%s\n' "${LOOPS[@]}" | sort -u | tr '\n' ' ')" "0 1 2 3 "
 check "the one-shard runtime keeps the whole set" "${SINGLE# }" "0-3"
 [ "$HELPERS" -gt 0 ] || bad "a worker has helper threads to look at"
-check "every helper thread of a worker keeps the whole set" "$HELPERS_WIDE of $HELPERS" "$HELPERS of $HELPERS"
+check "every helper thread of a worker keeps the whole set" "$HELPERS_WIDE of $HELPERS" "$((HELPERS - SANITIZER_THREADS)) of $HELPERS"
 check "and the idp's two shards start four hashing threads between them" "$HASHERS" "4"
 check "stats names each shard's CPU" "$("$BIN" stats pa 2>&1 | awk -F: '/^cpus:/ {print $2}' | sort | tr '\n' ' ')" \
       "$(printf '%s\n' "${LOOPS[@]}" | sort | head -2 | tr '\n' ' ')"

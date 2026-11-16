@@ -59,8 +59,7 @@ fi
 #
 # The sanitizer runtimes must match the library's, because libsocketley_sdk.a
 # from a Sanitize tree carries __asan_* references.
-SANFLAGS=""
-case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+SANFLAGS=$(sdk_sanflags "$BINDIR")
 
 WORKER="$SOCKETLEY_TMPD/greeter-worker"
 SDKFLAGS=$("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) || {

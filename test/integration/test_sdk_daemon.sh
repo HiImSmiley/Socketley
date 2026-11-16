@@ -85,8 +85,7 @@ if [ ! -f "$BINDIR/libsocketley_sdk.a" ]; then
     exit 0
 fi
 
-SANFLAGS=""
-case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+SANFLAGS=$(sdk_sanflags "$BINDIR")
 
 build() {   # build <src> <out>
     sdk_cxx "$1" \

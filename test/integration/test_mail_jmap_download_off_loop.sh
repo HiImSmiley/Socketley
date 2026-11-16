@@ -25,7 +25,7 @@ echo "=== Integration: a JMAP download of a large attachment is made off the loo
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 # Under the sanitizer every row runs but the ones that time something.
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate jmapdl
 T=$SOCKETLEY_TMPD
 PI=$((SL_PORT_BASE + 1981)); PS=$((SL_PORT_BASE + 1982)); P=$((SL_PORT_BASE + 1983))

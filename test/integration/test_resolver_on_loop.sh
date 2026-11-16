@@ -106,7 +106,9 @@ done
 grep -q 'k.told' "$T/hook.log" 2>/dev/null && ok "a webhook named by a host the loop's resolver answers is told" \
     || bad "a webhook named by a host the loop's resolver answers is told" "$(tail -3 "$T/hook.log" 2>/dev/null)"
 after=$(threads "$WP")
-[ "$before" = 1 ] && [ "$peak" = 1 ] && [ "$after" = 1 ] && ok "and no thread was started to resolve it" \
+# The loop's thread, and under TSan the sanitizer's own background thread beside it.
+own=1; [ "$(build_kind)" = tsan ] && own=2
+[ "$before" = "$own" ] && [ "$peak" = "$own" ] && [ "$after" = "$own" ] && ok "and no thread was started to resolve it" \
     || bad "and no thread was started to resolve it" "the worker had $before thread(s) before and $after after, not its loop's alone"
 
 # ─── a nameserver that does not answer ──────────────────────────────────────

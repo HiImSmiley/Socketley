@@ -27,7 +27,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: a storage looks over the share links that burn, and lists a user's, not every link ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate burnmarks
 T=$SOCKETLEY_TMPD
 P=$((SL_PORT_BASE + 1954)); U="http://127.0.0.1:$P"

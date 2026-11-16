@@ -24,7 +24,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: a worker gives back the heap a burst freed ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 # The sanitizer brings an allocator of its own, which this does not speak to.
-if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null; then echo "  SKIP: the sanitizer's allocator is not glibc's"; exit 0; fi
+if build_sanitized; then echo "  SKIP: the sanitizer's allocator is not glibc's"; exit 0; fi
 daemon_isolate heaptrim
 P=$((SL_PORT_BASE + 1976))
 unset SOCKETLEY_CONFIG

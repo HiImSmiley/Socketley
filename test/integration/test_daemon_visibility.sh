@@ -81,7 +81,7 @@ A_PID=$!
 SDK_BIN=""
 if command -v g++ >/dev/null 2>&1 && [ -f "$BINDIR/libsocketley_sdk.a" ]; then
     SANFLAGS=""
-    case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+    SANFLAGS=$(sdk_sanflags "$BINDIR")
     cat > "$SOCKETLEY_TMPD/mine.cpp" <<'EOF'
 #include <socketley/daemon.h>
 int main(int argc, char** argv)

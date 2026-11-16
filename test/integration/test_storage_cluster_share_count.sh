@@ -23,7 +23,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: a cluster node takes another's share link counts off its loop ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate clshare
 T=$SOCKETLEY_TMPD
 D=$(mktemp -d /var/tmp/socketley-clshare-XXXXXX)

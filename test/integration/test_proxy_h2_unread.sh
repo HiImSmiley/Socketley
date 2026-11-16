@@ -154,7 +154,7 @@ else
     echo "  eight GETs of a 48 MB file, no window granted: the entrance grew $ADDED MB ($(cat "$T/streams.out"))"
     # ASan's quarantine keeps what was freed, so a sanitized entrance is held to twice the bound, still far below 384.
     LIMIT=128
-    if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then LIMIT=256; fi
+    if build_sanitized; then LIMIT=256; fi
     if [ "$(cat "$T/streams.out")" = held ] && [ "$ADDED" -lt "$LIMIT" ]; then
         ok "eight unread answers are held to the pacing point ($ADDED MB for 384 MB asked, under $LIMIT)"
     else

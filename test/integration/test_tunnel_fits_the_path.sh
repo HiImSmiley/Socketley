@@ -36,7 +36,7 @@ ip link set lo up
 command -v tc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || { echo "  SKIP: tc and python3 are required"; exit 0; }
 # Under the sanitizer every row runs but the ones that time something.
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate tunnelpath
 PE=$((SL_PORT_BASE + 1990)); PT=$((SL_PORT_BASE + 1991)); PU=$((SL_PORT_BASE + 1992))
 PX=$((SL_PORT_BASE + 1993)); PB=$((SL_PORT_BASE + 1994))

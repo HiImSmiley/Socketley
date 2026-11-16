@@ -30,16 +30,16 @@ set -uo pipefail
 # tree, the same ratio the defect itself showed (193 against 76).  The rule
 # test_idle_connection_costs_little.sh states: measure the allocator the bound
 # was drawn from, and say so when handed another.
-if [ "${SOCKETLEY_CONFIG:-}" = "Sanitize" ]; then
-    echo "  SKIP: RSS under a flood measures ASan's quarantine under Sanitize"
-    exit 0
-fi
-
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
 . "$HERE/lib_ports.sh"
+if build_sanitized; then
+    echo "  SKIP: RSS under a flood measures the sanitizer's shadow and quarantine"
+    exit 0
+fi
+
 daemon_isolate wspingflood
 
 PASS=0; FAIL=0; TOTAL=0

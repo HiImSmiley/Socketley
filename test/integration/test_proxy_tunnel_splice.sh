@@ -123,7 +123,7 @@ read -r st got want bad_at tail <<<"$out"
 [ "$bad_at" = "-1" ] && ok || bad "the stream's bytes are the backend's, in order" "first wrong byte near $bad_at"
 [ "$tail" = "ok" ] && ok || bad "the client's next message and the answer to it cross the tunnel, which then ends" "after the stream: '$tail'"
 
-if [ "${SOCKETLEY_CONFIG:-}" = "Sanitize" ] || [[ "$BIN" == */Sanitize/* ]]; then
+if build_sanitized; then
     echo "  SKIP [cpu]: CPU per GiB measures the sanitizer, not the splice"
 else
     per=$(( (c1 - c0) * 1000 / $(getconf CLK_TCK) * 1024 / MB ))

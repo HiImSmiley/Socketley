@@ -73,7 +73,7 @@ echo "=== Integration: metrics say which daemon they came from ==="
 WORKER=""
 if command -v g++ >/dev/null 2>&1 && [ -f "$BINDIR/libsocketley_sdk.a" ]; then
     SANFLAGS=""
-    case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+    SANFLAGS=$(sdk_sanflags "$BINDIR")
     if sdk_cxx \
            "$ROOT/sdk/examples/custom-type/greeter_worker.cpp" \
            -I"$ROOT" -I"$ROOT/sdk/include/linux" \

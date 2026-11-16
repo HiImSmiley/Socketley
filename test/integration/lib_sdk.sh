@@ -1,5 +1,9 @@
 # Building a program against the SDK -- only ever sourced, since run_all.sh
 # globs test_*.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_build.sh"
+
+# The sanitizer flags a program linked against $1's libsocketley_sdk.a needs: its objects call that sanitizer's runtime.
+sdk_sanflags() { BIN="$1/socketley" build_sanflags; }
 
 # A sanitizer link of the SDK holds about 1.2 GiB, and seven files link one
 # beside the others: five at once passed the cgroup's memory.high and each took

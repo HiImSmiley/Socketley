@@ -25,7 +25,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: a sync runtime syncs the files it brings through the ring ==="
 command -v curl >/dev/null 2>&1 || { echo "  SKIP: curl is required"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate syncring
 T=$SOCKETLEY_TMPD
 P=$((SL_PORT_BASE + 1962))

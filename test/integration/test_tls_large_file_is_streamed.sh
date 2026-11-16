@@ -122,7 +122,7 @@ SAMPLE_PID=$WORKER
 # grep with a redirect and not -q: under `set -o pipefail` a -q that matches
 # early reports 141, which this tree has read as "not sanitized" four times.
 SANITIZED=0
-if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then SANITIZED=1; fi
+if build_sanitized; then SANITIZED=1; fi
 
 # What a request ADDS, sampled: a sanitizer build's own baseline is not the
 # question and the delta is the same question in both builds.

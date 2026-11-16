@@ -33,7 +33,7 @@ ip link set lo up; ip link set dev lo mtu 1500
 command -v tc >/dev/null 2>&1 || { echo "  SKIP: tc is required"; exit 0; }
 python3 -c "import h2" 2>/dev/null || { echo "  SKIP: the python h2 library is required"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate h2stream
 T=$SOCKETLEY_TMPD
 S=$((SL_PORT_BASE + 1937)); E=$((SL_PORT_BASE + 1938))

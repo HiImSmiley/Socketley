@@ -43,13 +43,13 @@ daemon_start "$BIN"
 # thirty gives six ticks of separation.
 N=32
 # A sanitizer worker holds about 200 MiB, and past the memory a run has they measure reclaim, not an idle loop.
-case "$BIN" in *Sanitize*)
+if build_sanitized; then
     . "$(dirname "$0")/../lib_suite.sh"
     if [ "$(suite_mem_slots 209715200)" -le "$N" ]; then
         echo "  SKIP: $((N + 1)) sanitizer processes of ~200 MiB do not fit in the memory this run may use"
         exit 0
-    fi ;;
-esac
+    fi
+fi
 for i in $(seq 1 $N); do
     "$BIN" create server "idle$i" -p $((PORT + i)) -s >/dev/null 2>&1 || true
 done
@@ -149,7 +149,7 @@ echo "  $N idle runtimes: $PER us/s of CPU each (daemon + its workers)"
 # Asked of the binary rather than of $SOCKETLEY_CONFIG or the path: agents in
 # this tree copy the build elsewhere under other names, which is the same reason
 # lib_daemon.sh stopped identifying daemons by process name.
-if grep -aqm1 __asan_init "$BIN"; then
+if build_sanitized; then
     echo "  (not asserted: this is a sanitizer build — see the note above)"
 elif [ "$PER" -le 60 ]; then
     ok "an idle runtime costs $PER us/s (bound 60; a 250 ms publish costs ~180-215)"

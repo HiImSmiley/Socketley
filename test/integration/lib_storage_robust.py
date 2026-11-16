@@ -318,8 +318,8 @@ time.sleep(2.0)
 rss_full = status_kib("VmRSS")
 note("%d uploads each with 3 MiB of 8 sent: RSS %d KiB (was %d), %.2f MiB per upload" %
      (N_FULL, rss_full, rss_before_full, (rss_full - rss_before_full) / 1024.0 / N_FULL))
-check("an upload with its body flowing holds under 3 MiB of the worker's memory (%d uploads grew it %d KiB)" %
-      (N_FULL, rss_full - rss_before_full), rss_full - rss_before_full < N_FULL * 3 * 1024, rss_full - rss_before_full)
+rss_check(check, PID, "an upload with its body flowing holds under 3 MiB of the worker's memory (%d uploads grew it %d KiB)" %
+          (N_FULL, rss_full - rss_before_full), rss_full - rss_before_full < N_FULL * 3 * 1024, rss_full - rss_before_full)
 for s in socks:
     s.close()
 check("they leave, and their temporary files with them", wait_for(lambda: not others(), 15), len(others()))

@@ -44,7 +44,7 @@ fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; for l in "
 echo "=== Integration: a TCP relay's multishot arm is earned by exchanges ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 SANITIZED=""
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && SANITIZED=1
+build_sanitized && SANITIZED=1
 
 P=$((SL_PORT_BASE + 113)); BP=$((P + 1))
 
@@ -119,7 +119,7 @@ for _ in $(seq 1 50); do listening_now=$(ss -ltn 2>/dev/null) && grep -q ":$BP "
 
 # ── 1. a stream holds what single-shot holds ────────────────────────────────
 if [ -n "$SANITIZED" ]; then
-    echo "  SKIP: RSS measures ASan's redzones and quarantine under Sanitize"
+    echo "  SKIP: RSS measures the sanitizer's redzones, shadow and quarantine"
 else
     SOCKETLEY_RECV_MULTISHOT=0 run_proxy single
     SINGLE=$(held_mb 16 4194304)

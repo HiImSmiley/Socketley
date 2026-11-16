@@ -59,8 +59,7 @@ WORK=$(mktemp -d /tmp/socketley-exbuild-XXXXXX)
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-SANFLAGS=""
-case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
+SANFLAGS=$(sdk_sanflags "$BINDIR")
 
 SDKFLAGS=$("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) || {
     echo "  FAIL [socketley-config answers]: $SDKFLAGS"

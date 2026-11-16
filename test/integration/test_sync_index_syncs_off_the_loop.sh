@@ -36,7 +36,7 @@ if ! sudo -n dmsetup targets 2>/dev/null | grep -q '^delay'; then
 fi
 command -v mkfs.ext4 >/dev/null 2>&1 || { echo "  SKIP: mkfs.ext4 is required"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 
 daemon_isolate syncslow
 T=$SOCKETLEY_TMPD

@@ -56,13 +56,13 @@ set -euo pipefail
 # Loosening the bounds to fit both would leave numbers that guard nothing in
 # either build.  So this measures the allocator it was written about and says
 # so when it is handed a different one.
-if [ "${SOCKETLEY_CONFIG:-}" = "Sanitize" ]; then
-    echo "  SKIP: RSS per connection measures the sanitizer's redzones under Sanitize"
+BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+if build_sanitized; then
+    echo "  SKIP: RSS per connection measures the sanitizer's redzones and shadow"
     exit 0
 fi
 
-BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
-. "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ports.sh"
 . "$(dirname "$0")/lib_ready.sh"

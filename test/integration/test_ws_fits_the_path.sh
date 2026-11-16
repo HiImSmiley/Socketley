@@ -34,7 +34,7 @@ echo "=== Integration: a websocket client's PONG fits the path ==="
 ip link set lo up; ip link set dev lo mtu 1500
 command -v tc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || { echo "  SKIP: tc and python3 are required"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate wspath
 P=$((SL_PORT_BASE + 1936))
 unset SOCKETLEY_CONFIG
