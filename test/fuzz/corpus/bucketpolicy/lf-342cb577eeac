@@ -1,0 +1,1 @@
+{"Version":"2012-10-17","Statement":[{"Sid":"DenyI","Effect":"Deny","Principal":"*","Action":"s3:PutObject","NotResource":"arn:aws:s3:::pu*b/*","Condition":{"StringNotEquals":{"s3:x-amz-aption":"true"}}}]}

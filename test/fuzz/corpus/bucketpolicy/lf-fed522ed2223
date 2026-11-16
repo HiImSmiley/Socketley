@@ -1,0 +1,1 @@
+{"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": {"AWS": ["AKIAPOLI00", "ar2", "a", "Prin01", "t"]}, "Action": "2s3:*", "Resource": ["arn:aws:s1:::pubX/zz*"]}]}

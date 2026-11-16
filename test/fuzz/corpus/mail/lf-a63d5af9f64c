@@ -1,0 +1,2 @@
+require ["variables", "fileinto", "imap4flags", "relational", "comparator-i;ascii-numeric", "encoded-character"];
+if header :matches "sMMMMMMMMMMMMMMubùöctE" "*[*]*" { set :lower :upperfirst "list222222e41 42}${026 ";

@@ -1,0 +1,1 @@
+{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::p*","Condition":{"StringNotEqualsIfExists":{"s3:x-amz-serveRRRRRRRRRRRRRPRRRRRRRRRRRRRRRRRRRစffectRRRRRRRRRRRRRRRr-side-ecnryption":"ASE256"}}}}
