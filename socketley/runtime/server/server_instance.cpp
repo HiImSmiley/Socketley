@@ -3405,16 +3405,13 @@ void server_instance::inv_check_reachable(int fd, const char* where)
     if (!conn)
         return;   // already torn down: nothing left that needs waking
 
-    const auto fill = [](const server_connection* c) {
+    const auto fill = [this](const server_connection* c) {
         skl_inv::half h{};
         if (!c) return h;
         h.present   = true;
-        // A cache request counts, because the channel's own wakeup is in the
-        // ring and the reply comes back here, which is what the invariant is
-        // about.
-        h.in_flight = c->read_pending || c->write_pending ||
-                      c->file_read_pending || c->splice_in_pending || c->splice_out_pending ||
-                      c->cache_pending > 0;
+        // What keeps the struct from reuse -- a direct send this turn's end finishes, a TLS wait and a streamed file's
+        // read among it -- and a cache request, whose reply comes back here through the channel's wakeup in the ring.
+        h.in_flight = conn_ops_pending(c) || c->cache_pending > 0;
         h.queued    = !c->write_queue.empty();
         h.closing   = c->closing;
         h.fd        = c->fd;

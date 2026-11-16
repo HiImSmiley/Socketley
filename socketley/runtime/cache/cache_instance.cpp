@@ -1610,8 +1610,9 @@ void cache_instance::inv_check_reachable(int fd, const char* where)
 
     skl_inv::half c{};
     c.present   = true;
+    // A connection being handed on is owed the sibling's answer, or the link's drain, by the link's own operations.
     c.in_flight = conn->read_pending || conn->write_pending
-               || !conn->batches.empty();
+               || !conn->batches.empty() || conn->ho_state != client_connection::handoff::none;
     // response_buf counts as queued too: it is answers already built and not yet
     // handed to the write path, which is the same loss with one hop less.
     c.queued    = !conn->write_queue.empty() || !conn->response_buf.empty();

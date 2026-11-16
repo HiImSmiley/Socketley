@@ -2988,14 +2988,17 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
         return;   // already torn down: nothing left that needs waking
     }
 
+    // A stream has no operation of its own, being woken by its parent connection's (HTTP/2) or by the datagrams of
+    // its endpoint (HTTP/3); a wait for room to send a close_notify is one, though the teardown counts it apart.
+    const auto client_driven = [](const proxy_client_connection* x) {
+        return client_op_in_flight(x) || x->tls_wait;
+    };
     skl_inv::half c{}, b{};
     if (cconn)
     {
         c.present   = true;
-        c.in_flight = cconn->read_pending || cconn->write_pending ||
-                      cconn->splice_in_pending ||
-                      cconn->splice_out_pending || cconn->connect_pending ||
-                      cconn->abort_watch_pending;
+        c.in_flight = client_driven(cconn) || cconn->h3s != nullptr ||
+                      (cconn->h2_parent != nullptr && client_driven(cconn->h2_parent));
         c.queued    = !cconn->write_queue.empty();
         c.closing   = cconn->closing;
         c.fd        = cconn->fd;
@@ -3003,9 +3006,7 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
     if (bconn)
     {
         b.present   = true;
-        b.in_flight = bconn->read_pending || bconn->write_pending ||
-                      bconn->splice_in_pending ||
-                      bconn->splice_out_pending;
+        b.in_flight = backend_op_in_flight(bconn);
         b.queued    = !bconn->write_queue.empty();
         b.closing   = bconn->closing;
         b.fd        = bconn->fd;
@@ -7625,6 +7626,11 @@ bool proxy_instance::splice_now(int in, int out, uint32_t len, io_request* req)
     }
     if (in_toggled && ::fcntl(in, F_SETFL, in_flags) < 0) {}
     if (out_toggled && ::fcntl(out, F_SETFL, out_flags) < 0) {}
+#ifdef SOCKETLEY_INVARIANTS
+    // Charged here as send_now charges its bytes, since the completion on_cqe charges was the poll before this call.
+    if (moved > 0)
+        inv_check_progress(req->fd, static_cast<int>(moved), op_splice, "proxy::splice_now");
+#endif
     struct io_uring_cqe done{};
     done.res = moved > 0 ? static_cast<int32_t>(moved) : (err != 0 ? -err : 0);
     handle_splice(&done, req);
@@ -7988,7 +7994,9 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     }
                     return;
                 }
-                close_pair(conn->client_fd, conn->fd);
+                // A splice into the client that failed is a client that is gone, as handle_client_write says of a
+                // write: with force, since no answer reaches it however much is owed.
+                close_pair(conn->client_fd, conn->fd, cqe->res < 0 ? close_reason::force : close_reason::normal);
                 return;
             }
 
