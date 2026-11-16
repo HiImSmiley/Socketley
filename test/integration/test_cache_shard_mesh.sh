@@ -298,6 +298,14 @@ fi
 for i in $(seq 1 80); do
     redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.25
 done
+# The keys go out once every shard holds its seven links: a crossing made while a link is still being made is relayed,
+# which on a loaded machine left a shard with no direct crossing at all after a fixed wait; a mis-wired slot never
+# gets its link, so it is still red after the wait.
+for i in $(seq 1 120); do
+    ST8=$("$BIN" stats meshc 2>&1 || true)
+    [ "$(printf '%s\n' "$ST8" | awk -F: '/^mesh_links:/ && $2+0 == 7 {n++} END{print n+0}')" -eq 8 ] && break
+    sleep 0.25
+done
 for i in $(seq 1 120); do redis-cli -p "$PORT" SET "z$i" "u$i" >/dev/null 2>&1; done
 MISS=0
 for i in $(seq 1 120); do
@@ -306,8 +314,12 @@ done
 [ "$MISS" -eq 0 ] && ok "eight shards read every key back (120/120)" \
     || bad "eight shards read every key back" "$MISS of 120 missing"
 
-sleep 3
-ST8=$("$BIN" stats meshc 2>&1 || true)
+# A worker publishes its figures on an interval, so the crossings are waited for, as long as the fixed wait was.
+for i in $(seq 1 12); do
+    sleep 0.25
+    ST8=$("$BIN" stats meshc 2>&1 || true)
+    [ "$(printf '%s\n' "$ST8" | awk -F: '/^mesh_direct:/ && $2+0 > 0 {n++} END{print n+0}')" -eq 8 ] && break
+done
 SHARDS8=$(printf '%s\n' "$ST8" | grep -c '^\[shard')
 # The denominator has to be counted, not assumed.  A shard that reports NO
 # mesh_direct line at all contributes nothing to SILENT, so without this the
