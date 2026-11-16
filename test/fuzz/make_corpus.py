@@ -26,8 +26,9 @@ WHAT ELSE IS TRACKED, AND WHAT IS NOT
 Two kinds of file live in test/fuzz/corpus/ and no third kind:
 
   * the seeds this script generates, named "<label>-<digest>"; and
-  * "found-<digest>" — a discovery kept because it reaches a coverage edge no
-    generated seed reaches, or a crash case somebody reduced by hand.
+  * a discovery kept because it reaches a coverage edge no generated seed
+    reaches ("found-<digest>", or "lf-<sha1 prefix>" when a coverage-guided
+    libFuzzer run picked it), or a crash case somebody reduced by hand.
 
 Everything libFuzzer finds during a run goes to bin/fuzz-corpus/ instead, which
 is gitignored and is what CI carries between runs through actions/cache.  It
@@ -2400,23 +2401,38 @@ def raftmsg_seeds():
 # the curated discoveries described above, plus headroom for a reduced crash
 # case.  The numbers are deliberately specific: a set that has grown past its
 # budget has had a fuzz run write into it, and that is the failure this catches.
+# "lf-<sha1 prefix>" files are inputs picked from coverage-guided libFuzzer runs for the edges they add (69702a427,
+# 2f62dc0f7, 4e710b888); a further pick raises its set's number in the same commit.
 KEPT_BUDGET = {
-    "resp": 32,        # 22 kept: coverage edges the 40 generated seeds miss
-    "ws": 8,           # 0 kept
-    "http": 8,         # 0 kept
-    "httpresp": 8,     # 0 kept
-    "cache": 260,      # 240 kept: cache_store has far more reachable state than
-                       # 37 hand-written programs can lay out
-    "eventloop": 24,   # 0 kept
-    "server": 8,       # 0 kept
-    "client": 8,       # 0 kept
-    "proxy": 8,        # 0 kept
-    "proxytunnel": 8,  # 0 kept
-    "raftmsg": 8,      # 0 kept
-    "s3sigv4": 8,      # 0 kept
-    "bucketpolicy": 8, # 0 kept
-    "mail": 24,        # 18 kept: a seed each for the cases the generator writes none for (ARC, SRS, MTA-STS, mbox,
-                       # POP3, ManageSieve, the DAV and JMAP readers, sorting), made by hand beside their cases
+    "resp": 32,          # 23 kept: coverage edges the 40 generated seeds miss
+    "ws": 8,             # 0 kept
+    "http": 40,          # 33 kept, 31 of them lf-
+    "httpresp": 8,       # 0 kept
+    "cache": 320,        # 313 kept, 66 of them lf-: cache_store has far more reachable state than
+                         # 39 hand-written programs can lay out
+    "eventloop": 24,     # 0 kept
+    "server": 8,         # 1 kept
+    "client": 8,         # 2 kept
+    "proxy": 104,        # 95 kept, 84 of them lf-, the rest the answer-ordering cases reduced by hand
+    "proxytunnel": 8,    # 0 kept
+    "raftmsg": 8,        # 2 kept
+    "s3sigv4": 40,       # 34 kept, 32 of them lf-
+    "bucketpolicy": 56,  # 50 kept, 44 of them lf-
+    "dns": 56,           # 49 kept, all lf-
+    "mqtt": 68,          # 60 kept, all lf-
+    "mail": 120,         # 110 kept, 90 of them lf-; the rest a seed each for the cases the generator writes none
+                         # for (ARC, SRS, MTA-STS, mbox, POP3, ManageSieve, the DAV and JMAP readers, sorting)
+    "tunnelmux": 44,     # 38 kept, 35 of them lf-
+    "sshcert": 8,        # 0 kept
+    "httpcodecs": 44,    # 37 kept, all lf-
+    "mailsessions": 72,  # 64 kept, 60 of them lf-
+    "h2session": 52,     # 44 kept, 43 of them lf-
+    "statejson": 68,     # 60 kept, all lf-
+    "editmerge": 68,     # 62 kept, 60 of them lf-
+    "wsreassembly": 84,  # 78 kept, all lf-
+    "respdispatch": 68,  # 60 kept, all lf-
+    "sievebudget": 76,   # 71 kept, 69 of them lf-
+    "decoders": 24,      # 18 kept, all lf-
 }
 
 
