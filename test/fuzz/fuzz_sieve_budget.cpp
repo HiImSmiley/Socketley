@@ -12,11 +12,18 @@
 //
 // What must hold, beside no report from the sanitizers:
 //
-//   * A compile and a run together take no more than five seconds of this thread's CPU, which is what a budget of
-//     1,000,000 steps promises with room for the sanitizers; a run that does not stop there spends a stranger's
-//     message on more than the budget says.
+//   * A compile and a run together take no more than five seconds of this thread's CPU in a build without
+//     sanitizers, which is what a budget of 1,000,000 steps promises with room to spare (the slowest input known,
+//     R10c-4, stops at the step bound after 0.35-0.54 s at GCC -O2); a run that does not stop there spends a
+//     stranger's message on more than the budget says.  Every build of this target has sanitizers -- the replay
+//     binary premake builds is ASan+UBSan as the libFuzzer one is -- and R10c-4 took 5-9 s in the one and 7.5-13 s
+//     in the other, still stopping at the step bound.  So the five seconds are scaled by what this build, on this
+//     machine, costs on this interpreter: a fixed reference run, timed once (sanitizer_factor()), against what it
+//     costs at GCC -O2.  Capped by build_cpu_factor, the slowdown no sanitizer build exceeds on any path, so a slow
+//     moment during the reference run cannot make the line looser than the shared one.
 //   * A run has at least one action; one that failed keeps the message and does nothing else, and says the line.
 
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <string_view>
@@ -24,6 +31,7 @@
 #include "fuzz_common.h"
 
 #include "../../socketley/runtime/mail/mail_sieve.h"
+#include "../../socketley/shared/util/build_cost.h"
 
 namespace
 {
@@ -140,6 +148,50 @@ double thread_cpu_s()
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
 }
 
+// How many times its plain cost the same Sieve work takes in this build.  The reference is wildcard :matches over a
+// long header and a long variable, a body test and a regex, the interpreter's slow paths and R10c-4's; it does not
+// reach the step bound.  14.5 ms at GCC -O2 (laptop, best of 5); 0.26 s under GCC's ASan+UBSan at -O3, 18x, where
+// R10c-4 measured 9-17x; 0.20 s under clang's at -O1 with coverage, 14x, so R10c-4's 7.5-13 s meets a line of 70 s.
+// Best of two, since a run can only be slowed by what else the machine does.
+constexpr double reference_plain_s = 0.0145;
+
+double sanitizer_factor()
+{
+    static const double factor = [] {
+        std::string msg = "From: a@example.org\r\nTo: me@example.com\r\nSubject: ";
+        for (int i = 0; i < 2000; ++i)
+            msg += "aaaaaaaa ";
+        msg += "\r\n";
+        for (int i = 0; i < 20; ++i)
+            msg += "Received: from h" + std::to_string(i) + " by mx\r\n";
+        msg += "\r\n";
+        for (int i = 0; i < 200; ++i)
+            msg += "body line of the message aaaa\r\n";
+        std::string script = "require [\"variables\", \"body\", \"regex\"];\n"
+                             "set \"v\" \"aaaaaaaa\";\n"
+                             "set \"v\" \"${v}${v}${v}${v}${v}${v}${v}${v}\";\n";
+        for (int i = 0; i < 16; ++i)
+            script += "if header :matches \"Subject\" \"*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b\" { keep; }\n"
+                      "if string :matches \"${v}${v}\" \"*a?a*a?a*a*a*a*b\" { keep; }\n"
+                      "if body :contains \"zzz\" { keep; }\n"
+                      "if header :regex \"Subject\" \"(a|b)*c\" { keep; }\n";
+        double best = 1e9;
+        for (int r = 0; r < 2; ++r)
+        {
+            const double began = thread_cpu_s();
+            std::string err;
+            const auto s = sieve::script::compile(script, err);
+            if (!s)
+                fuzz::fail("compile", __FILE__, __LINE__, "the reference script does not compile");
+            sieve::context c;
+            (void)s->run({msg, "a@example.org", "me@example.com"}, c);
+            best = std::min(best, thread_cpu_s() - began);
+        }
+        return std::clamp(best / reference_plain_s, 1.0, static_cast<double>(build_cpu_factor));
+    }();
+    return factor;
+}
+
 }   // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -194,11 +246,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
                        "a failed run that does more than keep, or does not say its line");
     }
     const double spent = thread_cpu_s() - began;
-    if (spent > 5.0)
+    const double allowed = 5.0 * sanitizer_factor();
+    if (spent > allowed)
     {
         fuzz::dump("the script", reinterpret_cast<const uint8_t*>(script.data()), script.size());
-        std::fprintf(stderr, "a compile and a run took %.2f s of CPU over a message of %zu bytes\n", spent, msg.size());
+        std::fprintf(stderr,
+                     "a compile and a run took %.2f s of CPU over a message of %zu bytes, "
+                     "allowed %.2f s (5 s x %.1f)\n",
+                     spent, msg.size(), allowed, sanitizer_factor());
     }
-    FUZZ_CHECK(spent <= 5.0, "a Sieve run took longer than its step budget allows");
+    FUZZ_CHECK(spent <= allowed, "a Sieve run took longer than its step budget allows");
     return 0;
 }
