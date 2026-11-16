@@ -48,6 +48,25 @@ public:
     // Ended: deregistered and its descriptor given to the loop, so it may be freed once the loop has drained it.
     bool ended() const { return m_fd < 0; }
 
+    // At the worker's end: a later line fails at the shell's send (EPIPE) and a queued one is answered not_taken, so
+    // the shell asks the daemon rather than read the close as a line lost after it was taken.
+    void refuse_rest()
+    {
+        if (m_fd < 0)
+            return;
+        if (::shutdown(m_fd, SHUT_RD) < 0) {}
+        for (;;)
+        {
+            const ssize_t n = ::recv(m_fd, m_buf.get(), max_message + 1, MSG_DONTWAIT);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                break;
+            const uint8_t st = not_taken;
+            if (::send(m_fd, &st, 1, MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {}
+        }
+    }
+
     void on_cqe(struct io_uring_cqe* cqe) override
     {
         if (static_cast<io_request*>(io_uring_cqe_get_data(cqe)) != &m_req || m_fd < 0)

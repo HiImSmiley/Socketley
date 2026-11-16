@@ -245,6 +245,8 @@ inline constexpr setting table[] = {
      "bytes of message bodies a mail spool keeps in memory beside its segments"},
     {"SOCKETLEY_STORAGE_STOP_HOLD_MS", kind::number, audience::test, 0, 3000, "0",
      "milliseconds a shard's stop holds its directory, times its shard number"},
+    {"SOCKETLEY_WORKER_END_HOLD_MS", kind::number, audience::test, 0, 10000, "0",
+     "milliseconds a worker that is ending waits, its runtime stopped, before it lets its links go"},
     {"SOCKETLEY_STORAGE_START_SPIN_MS", kind::number, audience::test, 0, 30000, "0",
      "milliseconds a shard's start works before it opens its store"},
     {"SOCKETLEY_STORAGE_START_SLEEP_MS", kind::number, audience::test, 0, 60000, "0",

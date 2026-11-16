@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 #include <fcntl.h>
@@ -564,6 +565,14 @@ public:
         for (int i = 0; i < 10; ++i)
             if (m_loop.poll_completions(1) == 0)
                 break;
+
+        // A test's end held here, the window in which a shell's line reaches a worker that runs nothing any more.
+        if (const auto v = socketley::settings::number<long>("SOCKETLEY_WORKER_END_HOLD_MS"))
+            std::this_thread::sleep_for(std::chrono::milliseconds(*v));
+
+        // A shell's line still queued on a link is answered not_taken, and any after it refused, now that nothing runs.
+        for (const auto& l : m_send_links)
+            l->refuse_rest();
 
         // The links come off the ring before the ring goes, through die(),
         // which sweeps the crossings each was carrying and answers them
