@@ -213,9 +213,14 @@ expect "forty puts over separate connections all land" "$bad_put" 0
 expect "and all read back" "$bad_get" 0
 keycount=$(curl -s "http://127.0.0.1:$PT/tcp?list-type=2" | grep -o '<Key>' | wc -l)
 expect "the listing has all forty" "$keycount" 40
-stt=$("$BIN" stats stgt 2>&1)
-sent=$(echo "$stt" | awk -F: '/^shard_commits_sent:/ {s+=$2} END {print s+0}')
-served=$(echo "$stt" | awk -F: '/^shard_commits_served:/ {s+=$2} END {print s+0}')
+# Each shard's figures are what it published at its last tick, so the sender's and the server's can be a tick apart.
+for _ in $(seq 1 100); do
+    stt=$("$BIN" stats stgt 2>&1)
+    sent=$(echo "$stt" | awk -F: '/^shard_commits_sent:/ {s+=$2} END {print s+0}')
+    served=$(echo "$stt" | awk -F: '/^shard_commits_served:/ {s+=$2} END {print s+0}')
+    [ "$sent" -gt 0 ] && [ "$served" = "$sent" ] && break
+    sleep 0.1
+done
 landed=$(echo "$stt" | awk -F: '/^shard_total_connections:/ {if ($2>0) c++} END {print c+0}')
 [ "$sent" -gt 0 ] && ok "some puts crossed between shards ($sent)" || bad "no put crossed" "$stt"
 expect "every crossing was served" "$served" "$sent"
