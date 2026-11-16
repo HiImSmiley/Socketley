@@ -816,6 +816,7 @@ inline void event_loop::arm(io_request* req, uint32_t target, uint32_t target2)
     // The submission side of the frame, after which everything is the kernel's
     // time until the completion comes back.
     SKL_TIMING_STAMP(req);
+    req->poll_out_wait = 0;
 
     uint32_t tok = 0;
     if (__builtin_expect(req->owner != nullptr, 1))
@@ -1243,6 +1244,8 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
     // can have set.
     if (__builtin_expect((cqe->user_data & 1u) != 0, 0))
     {
+        if (settle_half_close_pause(cqe->user_data))
+            return cqe_outcome::next;
         const uint32_t cfd = static_cast<uint32_t>(cqe->user_data >> 1);
         if (m_fd_cancels && cfd < m_fd_table_size && m_fd_cancels[cfd] > 0)
         {
@@ -1273,6 +1276,7 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
         // completion is for.
         const uint32_t rt1 = req->armed_target;
         const uint32_t rt2 = req->armed_target2;
+        const bool out_wait = req->poll_out_wait != 0;
 
         // Before the owner check, because a dropped completion consumed its
         // buffers exactly like a delivered one, and with no branch hint since
@@ -1299,7 +1303,10 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
         {
             // A multishot receive the kernel refused is re-armed as a single one here, once for every runtime,
             // rather than handed to a read chain that closes the connection over it.
-            if (__builtin_expect(cqe->res != -EINVAL, 1) || !rearm_refused_multishot(cqe, req, rtype, rt1))
+            if (__builtin_expect(out_wait, 0) && final_cqe && rearm_poll_out_after_half_close(cqe->res, req, rt1))
+            {
+            }
+            else if (__builtin_expect(cqe->res != -EINVAL, 1) || !rearm_refused_multishot(cqe, req, rtype, rt1))
             {
                 SKL_TIMING_HANDLER_BEGIN(req);
                 req->owner->on_cqe(cqe);
@@ -1353,6 +1360,67 @@ bool event_loop::rearm_refused_multishot(const struct io_uring_cqe* cqe, io_requ
         || ((m_fd_close_deferred[idx >> 6] >> (idx & 63)) & 1u))
         return false;
     return submit_read_provided(static_cast<int>(idx), req->buf_group, req);
+}
+
+bool event_loop::rearm_poll_out_after_half_close(int res, io_request* req, uint32_t target)
+{
+    // Only a wake that carried the half-close and none of what a writer acts on: room, an error, a hang-up.
+    if (res <= 0 || (res & POLLRDHUP) == 0 || (res & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) != 0
+        || target == IO_TARGET_NONE || (target & IO_TARGET_FIXED) != 0 || !m_ring_open)
+        return false;
+
+    // A number waiting to be closed takes the completion itself, as rearm_refused_multishot leaves it.
+    const int fd = static_cast<int>(target);
+    if (!fd_tracked(fd) || !m_fd_close_deferred || ((m_fd_close_deferred[target >> 6] >> (target & 63)) & 1u))
+        return false;
+
+    // Both entries or neither, since a linked timeout left without its poll would hold up whatever came next.
+    if (io_uring_sq_space_left(&m_ring) < 2)
+    {
+        io_uring_submit(&m_ring);
+        m_pending_submissions = 0;
+        if (io_uring_sq_space_left(&m_ring) < 2)
+            return false;
+    }
+    struct io_uring_sqe* pause = io_uring_get_sqe(&m_ring);
+    // Its -ETIME a success, so the poll follows the pause, and a cancelled pause a failure, so the poll is cancelled.
+    io_uring_prep_timeout(pause, &m_half_close_pause, 0, IORING_TIMEOUT_ETIME_SUCCESS);
+    pause->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data64(pause, half_close_pause_udata(req));
+    ++m_pending_submissions;
+    m_half_close_paused.push_back({req, fd});
+
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    io_uring_prep_poll_add(sqe, fd, POLLOUT);
+    io_uring_sqe_set_data(sqe, req);
+    arm(req, raw_target(fd));
+    req->poll_out_wait = 1;
+    return true;
+}
+
+// The pause's own completion, expired or cancelled, which ends its entry and is delivered to nobody.
+bool event_loop::settle_half_close_pause(uint64_t user_data)
+{
+    for (size_t i = 0; i < m_half_close_paused.size(); ++i)
+        if (half_close_pause_udata(m_half_close_paused[i].req) == user_data)
+        {
+            m_half_close_paused[i] = m_half_close_paused.back();
+            m_half_close_paused.pop_back();
+            return true;
+        }
+    return false;
+}
+
+void event_loop::cancel_half_close_pauses(const io_request* req, int fd)
+{
+    for (const auto& p : m_half_close_paused)
+        if (p.req == req || (fd >= 0 && p.fd == fd))
+            if (struct io_uring_sqe* sqe = get_sqe())
+            {
+                io_uring_prep_cancel64(sqe, half_close_pause_udata(p.req), 0);
+                io_uring_sqe_set_data(sqe, nullptr);
+                m_pending_submissions++;
+            }
 }
 
 // Batch-drain all available CQEs in one pass -- single io_uring_cq_advance.
@@ -1755,6 +1823,8 @@ bool event_loop::submit_cancel_fd(int fd)
     // SQE, without which the second completion arrives after the owning object
     // has been freed.
     io_uring_prep_cancel_fd(sqe, fd, IORING_ASYNC_CANCEL_ALL);
+    if (__builtin_expect(!m_half_close_paused.empty(), 0))
+        cancel_half_close_pauses(nullptr, fd);
 
     // Tagged with the descriptor rather than left null, because this SQE names
     // a number the kernel resolves late and its arrival is what close_fd()
@@ -2408,6 +2478,7 @@ bool event_loop::submit_poll_add(int fd, unsigned mask, io_request* req)
     io_uring_prep_poll_add(sqe, fd, mask);
     io_uring_sqe_set_data(sqe, req);
     arm(req, raw_target(fd));
+    req->poll_out_wait = (mask & (POLLOUT | POLLIN)) == POLLOUT;
     return true;
 }
 
@@ -2429,6 +2500,8 @@ bool event_loop::submit_cancel_request(const io_request* target)
     // being withdrawn keeps the one it already had and reports -ECANCELED.
     io_uring_sqe_set_data(sqe, nullptr);
     m_pending_submissions++;
+    if (__builtin_expect(!m_half_close_paused.empty(), 0))
+        cancel_half_close_pauses(target, -1);
     return true;
 }
 
@@ -2449,6 +2522,8 @@ bool event_loop::submit_poll_remove(io_request* target)
     // being withdrawn keeps the one it already had and reports -ECANCELED.
     io_uring_sqe_set_data(sqe, nullptr);
     m_pending_submissions++;
+    if (__builtin_expect(!m_half_close_paused.empty(), 0))
+        cancel_half_close_pauses(target, -1);
     return true;
 }
 

@@ -353,6 +353,10 @@ struct io_request
     // when the CQE carries IORING_CQE_F_BUFFER.
     uint8_t buf_group{NO_BUF_GROUP};
 
+    // A poll that waits for room to write and nothing else, which event_loop asks again when only a peer's half-close
+    // woke it; reset by every submission, so a request reused for another operation never carries it.
+    uint8_t poll_out_wait{0};
+
     // The numbers the SQE named, two because splice names a pipe and a socket,
     // read before dispatch since on_cqe may free this storage.
     uint32_t armed_target{IO_TARGET_NONE};

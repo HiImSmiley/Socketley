@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 #include <liburing.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -577,6 +578,19 @@ private:
     // The -EINVAL a kernel without IORING_RECV_MULTISHOT answers, turned into a single provided-buffer receive on
     // the same request, and true when that receive was armed and the completion must not be delivered.
     bool rearm_refused_multishot(const struct io_uring_cqe* cqe, io_request* req, uint8_t rtype, uint32_t target);
+    // io_uring wakes every poll with EPOLLRDHUP, so a wait for room on a socket whose peer has half-closed completes at
+    // once without POLLOUT, and a runtime that arms it again turns the loop: the same poll is asked again a moment
+    // later instead, and true when it was and the completion must not be delivered.
+    bool rearm_poll_out_after_half_close(int res, io_request* req, uint32_t target);
+    // The pause before that second asking, and each pause still running with its request and descriptor: a poll
+    // linked behind a timeout is found by no cancel, so a cancel of either cancels the pause, and the poll with it.
+    __kernel_timespec m_half_close_pause{0, 2'000'000};
+    struct half_close_pause { const io_request* req; int fd; };
+    std::vector<half_close_pause> m_half_close_paused;
+    static uint64_t half_close_pause_udata(const io_request* req)
+    { return static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(req)) | 1u; }
+    bool settle_half_close_pause(uint64_t user_data);
+    void cancel_half_close_pauses(const io_request* req, int fd);
     // Kernel support for IORING_RECV_MULTISHOT, established the same way at init().
     static bool probe_recv_multishot();
 
