@@ -75,6 +75,14 @@ int64_t search_day(std::string_view s)
     const size_t a = s.find('-'), b = s.rfind('-');
     if (a == std::string_view::npos || b == a)
         return -1;
+    // RFC 3501's date-day is two digits at most and its date-year four, and the bound is what keeps a day count in
+    // range: a year of sixteen digits made a day that an APPEND's milliseconds (day * 86400000) overflowed.
+    const auto digits = [](std::string_view d, size_t most) {
+        return !d.empty() && d.size() <= most &&
+               std::all_of(d.begin(), d.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+    };
+    if (!digits(s.substr(0, a), 2) || !digits(s.substr(b + 1), 4))
+        return -1;
     struct tm tm{};
     tm.tm_mday = std::atoi(std::string(s.substr(0, a)).c_str());
     tm.tm_year = std::atoi(std::string(s.substr(b + 1)).c_str()) - 1900;
@@ -2622,10 +2630,12 @@ bool matches(const crit& c, const imap_message& m, size_t idx, std::string_view 
     // No message has a THREADID here, as FETCH says NIL.
     if (k == "EMAILID" || k == "THREADID")
         return k == "EMAILID" && c.arg == imap_store::email_id(m.key);
-    // OLDER and YOUNGER count seconds back from now (RFC 5032).
+    // OLDER and YOUNGER count seconds back from now (RFC 5032), an interval its nz-number keeps under 2^32, so a
+    // longer one is that long: past it nothing is older, and the milliseconds of what a client wrote cannot overflow.
     if (k == "OLDER" || k == "YOUNGER")
     {
-        const bool older = m.date_ms <= socketley::wall::now_ms() - static_cast<int64_t>(c.num) * 1000;
+        const int64_t secs = static_cast<int64_t>(std::min<uint64_t>(c.num, 4294967295ull));
+        const bool older = m.date_ms <= socketley::wall::now_ms() - secs * 1000;
         return k == "OLDER" ? older : !older;
     }
     if (k == "SAVEDBEFORE" || k == "SAVEDON" || k == "SAVEDSINCE")

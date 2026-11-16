@@ -12,7 +12,8 @@
 #   * a COPY of hundreds whose UIDs or order are not the source's
 #   * RENAME of nothing making its destination, DELETE of Trash taken, CREATE a/b without a, or of a//b or ../x taken
 #   * a folder made again under its old name given its old UIDVALIDITY
-#   * APPEND's date-time read as a day, SENTBEFORE by the arrival rather than the Date header
+#   * APPEND's date-time read as a day, SENTBEFORE by the arrival rather than the Date header; a year of more than
+#     four digits taken as a date; SEARCH OLDER/YOUNGER past 2^32 seconds answered by an overflowed time
 #   * SEARCH missing a word in a base64 part, an encoded subject, or a header's second occurrence
 #   * a message the storage lost answered as empty, or an empty one without a BODYSTRUCTURE
 #   * an EXPUNGE that swallows what another session added meanwhile
@@ -183,6 +184,17 @@ if step == "first":
     say("SENTBEFORE reads the Date header, not the arrival", r[0].split()[2:] == [str(d)], r)
     r = b.cmd("UID SEARCH BEFORE 1-Jan-2020")
     say("and BEFORE the arrival", str(d) not in r[0].split()[2:], r)
+    # A year of five digits is no date-time (RFC 3501's date-year is four); one of sixteen overflowed the milliseconds.
+    b.cmd("CREATE Far")
+    b.append("Far", msg("far"), date="01-Jan-10000 10:00:00 +0000")
+    r = b.cmd("SELECT Far"); r = b.cmd("UID FETCH 1:* (INTERNALDATE)")
+    say("APPEND takes no date-time whose year has five digits", r[-1].split()[1] == "OK" and len(r) > 1 and
+        not any("9999" in x or "10000" in x for x in r[:-1]), r)
+    b.cmd("SELECT INBOX"); b.cmd("DELETE Far")
+    # An interval past RFC 5032's 2^32 seconds is that long, not one whose milliseconds overflow to a time ahead of now.
+    r, r2 = b.cmd("UID SEARCH OLDER 9300000000000000"), b.cmd("UID SEARCH YOUNGER 9300000000000000")
+    say("SEARCH OLDER than 2^32 seconds finds nothing, YOUNGER finds every message",
+        r[-1].split()[1] == "OK" and r[0].split()[2:] == [] and str(d) in r2[0].split()[2:], (r, r2))
     # Searches of what is encoded
     enc = base64.b64encode(b"the hidden needle is here\r\n").decode()
     r = b.append("INBOX", ("From: x@else.test\r\nSubject: =?utf-8?b?%s?=\r\nX-Tag: first\r\nX-Tag: second\r\nMIME-Version: 1.0\r\n"
