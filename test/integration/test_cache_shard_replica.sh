@@ -71,14 +71,20 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== Integration: replication and a sharded cache ==="
-command -v nc >/dev/null 2>&1 || { echo "  SKIP: nc required"; exit 0; }
 daemon_start "$BIN"
 
+# One line sent and its answer read back, done when the answer arrives: `nc -q1` waited a second for it and quit, and a
+# leader not scheduled within that second read as one that answered nothing.
+ask(){ local fd line=""
+    { exec {fd}<>"/dev/tcp/127.0.0.1/$1"; } 2>/dev/null || return 0
+    printf '%s\n' "$2" >&"$fd" 2>/dev/null && IFS= read -r -t "${3:-10}" line <&"$fd"
+    exec {fd}>&-
+    printf '%s\n' "${line%$'\r'}"; }
 ready(){ local i; for i in $(seq 1 100); do
-    printf 'set __r 1\n' | timeout 2 nc -q1 127.0.0.1 "$1" 2>/dev/null | grep -q '^ok$' && return 0
+    [ "$(ask "$1" 'set __r 1' 2)" = ok ] && return 0
     sleep 0.25; done; return 1; }
-g(){ printf "get $2\n" | timeout 2 nc -q1 127.0.0.1 "$1" 2>/dev/null | head -1; }
-sz(){ printf 'size\n' | timeout 3 nc -q1 127.0.0.1 "$1" 2>/dev/null | head -1; }
+g(){ ask "$1" "get $2"; }
+sz(){ ask "$1" size; }
 
 if ! "$BIN" create cache rl4 -p "$L4" --shards 4 -s >/dev/null 2>&1; then
     echo "  FATAL: --shards on a cache was refused.  It is a supported"
@@ -88,7 +94,7 @@ fi
 ready "$L4" || { echo "  FATAL: the four-shard cache never answered"; exit 2; }
 
 # ── a sharded leader refuses to become one ─────────────────────────────────
-RP=$(printf 'replicate\n' | timeout 5 nc -q1 127.0.0.1 "$L4" 2>/dev/null | head -1)
+RP=$(ask "$L4" replicate)
 case "$RP" in
     *"one shard"*)
         ok "a sharded cache refuses to be a replication leader, by name" ;;
@@ -102,7 +108,7 @@ esac
 # And a follower pointed at one really does stay empty.
 "$BIN" create cache rfx -p "$FX" --replicate "127.0.0.1:$L4" -s >/dev/null 2>&1 \
     || bad "the follower of the sharded leader starts" "create rfx failed"
-for i in $(seq 1 40); do printf "set s$i sv$i\n" | timeout 2 nc -q1 127.0.0.1 "$L4" >/dev/null 2>&1; done
+for i in $(seq 1 40); do ask "$L4" "set s$i sv$i" >/dev/null; done
 sleep 4
 FXSZ=$(sz "$FX")
 if ! [[ "$FXSZ" =~ ^[0-9]+$ ]]; then
@@ -127,8 +133,8 @@ ready "$L" || { echo "  FATAL: the leader never answered"; exit 2; }
     || { echo "  FATAL: the sharded follower was not created"; exit 2; }
 sleep 4
 
-for i in $(seq 1 30); do printf "set t$i tv$i\n" | timeout 2 nc -q1 127.0.0.1 "$L" >/dev/null 2>&1; done
-printf 'mset u1 a1 u2 a2 u3 a3 u4 a4\n' | timeout 3 nc -q1 127.0.0.1 "$L" >/dev/null 2>&1
+for i in $(seq 1 30); do ask "$L" "set t$i tv$i" >/dev/null; done
+ask "$L" 'mset u1 a1 u2 a2 u3 a3 u4 a4' >/dev/null
 sleep 4
 
 MISS=0
