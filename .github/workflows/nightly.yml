@@ -107,9 +107,27 @@ jobs:
       - uses: ./.github/actions/suite-tools
 
       - name: Build (Sanitize)
+        # Two links at a time.  Each part's runner died with "the runner has
+        # received a shutdown signal" in three or four of six parts every
+        # night, always while four links of the ASan SDK (test_sdk_runtime,
+        # test_sdk_engine, fuzz_http_request, fuzz_state_json) ran at once,
+        # and never in the TSan parts, whose links are smaller.  gcc finds its
+        # linker by -B before PATH, and LDFLAGS reaches every link line.
         run: |
+          free -m
+          mkdir -p "$RUNNER_TEMP/ld"
+          cat > "$RUNNER_TEMP/ld/ld" <<'SH'
+          #!/bin/bash
+          d=$(dirname "$0")
+          for s in a b; do exec 9>"$d/slot.$s"; flock -n 9 && exec /usr/bin/ld "$@"; done
+          exec 9>"$d/slot.a"; flock 9; exec /usr/bin/ld "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/ld/ld"
           ./scripts/premake5 gmake2
-          cd make && make config=sanitize_x64 -j"$(nproc)"
+          ( while sleep 60; do echo "memory: $(free -m | awk '/^Mem/ {print $3 " MiB used, " $7 " available"}')"; done ) &
+          watch=$!
+          cd make && make config=sanitize_x64 -j"$(nproc)" LDFLAGS="-B$RUNNER_TEMP/ld/"
+          kill "$watch"
 
       - name: Verify the build
         run: |
