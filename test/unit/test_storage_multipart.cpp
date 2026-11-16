@@ -84,7 +84,7 @@ TEST_CASE("a POST form's fields are read once however the body arrives, and as t
     const auto t0 = thread_cpu_now();
     for (size_t n = 1; n <= all.size() && last == form_scan::more; ++n)
         last = scan_post_form(type, std::string_view(all).substr(0, n), n == all.size(), trickled, err);
-    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0 * build_cpu_factor);
     REQUIRE(last == form_scan::ok);
     CHECK(trickled.fields == whole.fields);
     CHECK(trickled.fields.size() == 371);

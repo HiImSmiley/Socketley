@@ -112,7 +112,7 @@ TEST_CASE("a query cannot make its evaluation nest deeper, or its labels larger,
     d.src.add({{"__name__", "w"}, {"a", std::string(20, '1')}}, pts({{10, 1}}));
     const auto t0 = thread_cpu_now();
     CHECK(d.at("label_replace(w, \"b\", \"$1\", \"a\", \"" + groups + "\")", 100).size() == 1);
-    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0 * build_cpu_factor);
     CHECK(d.at("label_replace(x, \"b\", \"<$1$2>\", \"a\", \"(1)(.*)\")", 100).begin()->first ==
           "{__name__=\"x\",a=\"1\",b=\"<1>\"}");
     // label_join's value is bounded as a query's text is.

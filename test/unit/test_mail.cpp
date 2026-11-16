@@ -1251,7 +1251,7 @@ TEST_CASE("MIME: hostile shapes cost their length, and parameters and charsets r
         res += "Re: ";
     res += "Lunch";
     CHECK(socketley::mail::imap_order::base_subject(res) == "Lunch");
-    CHECK(thread_cpu_now() - t0 < std::chrono::seconds(2));
+    CHECK(thread_cpu_now() - t0 < std::chrono::seconds(2 * build_cpu_factor));
     // Fifty thousand empty parts are read as ten thousand at most.
     std::string many = "Content-Type: multipart/mixed; boundary=b\r\n\r\n";
     for (int i = 0; i < 50000; ++i)
@@ -1327,7 +1327,7 @@ TEST_CASE("SORT and THREAD: a display name with a comma, and a reply chain fifty
     }
     const auto t0 = thread_cpu_now();
     const std::string t = io::references(chain);
-    CHECK(thread_cpu_now() - t0 < std::chrono::seconds(3));
+    CHECK(thread_cpu_now() - t0 < std::chrono::seconds(3 * build_cpu_factor));
     CHECK(t.find("(50000") == std::string::npos);
     CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
 }

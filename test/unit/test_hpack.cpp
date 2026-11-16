@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "shared/http/h2_driver.h"
+#include "shared/util/build_cost.h"
 #include "shared/http/h2_frame.h"
 #include "shared/http/hpack.h"
 
@@ -85,7 +86,7 @@ TEST_CASE("a block of two-byte literals naming a large table entry costs its byt
         flood += std::string("\x7e\x00", 2);
     const auto t0 = std::chrono::steady_clock::now();
     CHECK(decode(d, flood, got, 64 * 1024) == decoder::result::error);
-    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(200));
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(200 * build_cpu_factor));
     // The same without indexing (0x0f 0x2f), past the list's limit: counted, not copied.
     decoder e;
     REQUIRE(decode(e, first, got) == decoder::result::ok);
@@ -94,7 +95,7 @@ TEST_CASE("a block of two-byte literals naming a large table entry costs its byt
         plain += std::string("\x0f\x2f\x00", 3);
     const auto t1 = std::chrono::steady_clock::now();
     CHECK(decode(e, plain, got, 64 * 1024) == decoder::result::too_large);
-    CHECK(std::chrono::steady_clock::now() - t1 < std::chrono::milliseconds(200));
+    CHECK(std::chrono::steady_clock::now() - t1 < std::chrono::milliseconds(200 * build_cpu_factor));
     // A block inserting a few hundred, as a client might, still decodes.
     decoder f;
     std::string some;

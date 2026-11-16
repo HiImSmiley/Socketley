@@ -592,8 +592,12 @@ TEST_CASE("IN over text literals is a lookup, and a query that costs more than i
     CHECK(run_failure(nums + ")", csv_none, rows) == "ExpressionTooLong");
     const double took = std::chrono::duration<double>(thread_cpu_now() - t1).count();
     CHECK(took < std::chrono::duration<double>(select_time_base).count() * 3);
-    // A literal of 200 KB made again for every record of two bytes.
-    CHECK(run_failure("SELECT _1 FROM S3Object WHERE _1 || '" + std::string(200000, 'x') + "' = 'q'", csv_none, rows) ==
+    // A literal of 200 KB made again for every record of two bytes, over records enough that the base allowance is
+    // the lesser part: a copy costs the same in every build, where a slower one is allowed more of everything.
+    std::string many;
+    for (int i = 0; i < (1 << 19); ++i)
+        many += "a\n";
+    CHECK(run_failure("SELECT _1 FROM S3Object WHERE _1 || '" + std::string(200000, 'x') + "' = 'q'", csv_none, many) ==
           "ExpressionTooLong");
 }
 

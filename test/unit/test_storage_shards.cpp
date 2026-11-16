@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
+#include "thread_cpu.h"
 
 #include "runtime/storage/bucket_policy.h"
 #include "runtime/storage/lifecycle.h"
@@ -2885,9 +2886,9 @@ TEST_CASE("a lifecycle rule names at most as many tags as an object can have, an
                             "</LifecycleConfiguration>";
     lifecycle_config c;
     s3_error err;
-    const auto start = std::chrono::steady_clock::now();
+    const auto start = thread_cpu_now();
     CHECK_FALSE(parse_lifecycle(doc, c, err));
-    CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+    CHECK(thread_cpu_now() - start < std::chrono::seconds(1 * build_cpu_factor));
     std::string ten;
     for (int i = 0; i < 10; ++i)
         ten += "<Tag><Key>k" + std::to_string(i) + "</Key><Value>v</Value></Tag>";

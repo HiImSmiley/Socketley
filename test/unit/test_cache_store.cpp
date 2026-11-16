@@ -136,7 +136,7 @@ TEST_CASE("cache_store keys made to share one hash cost what other keys do")
         found += store.get_ptr(k) != nullptr && store.sismember("s", k) && store.zscore("z", k, score) &&
                  store.hget("h", k).has_value();
     // 32,768 keys of one hash were a list in each table: about 5e8 comparisons of 240-byte names apiece.
-    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 2.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 2.0 * build_cpu_factor);
     CHECK(found == keys.size());
     CHECK(store.scard("s") == keys.size());
 }
@@ -244,7 +244,7 @@ TEST_CASE("cache_store ZCOUNT, a page of ZRANGEBYSCORE and ZREMRANGEBYRANK cost 
         CHECK(page.size() == 3);
     }
     // A million members walked for each was 1e9 steps.
-    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0 * build_cpu_factor);
     CHECK(total == 1000u * 1000000u);
     CHECK(store.zcount("z", 10, 12, true, true) == 3000);
     CHECK(store.zcount("z", 10, 12, false, false) == 1000);
@@ -4937,23 +4937,23 @@ TEST_CASE("glob_match answers a pattern built to backtrack in linear time")
     const std::string run(131072, 'a');
     bool m = true;
 
-    CHECK(glob_seconds("*" + run + "b", key, m) < 3.0);
+    CHECK(glob_seconds("*" + run + "b", key, m) < 3.0 * build_cpu_factor);
     CHECK_FALSE(m);
-    CHECK(glob_seconds("*" + run + "b*", key, m) < 3.0);
+    CHECK(glob_seconds("*" + run + "b*", key, m) < 3.0 * build_cpu_factor);
     CHECK_FALSE(m);
-    CHECK(glob_seconds("*" + run, key, m) < 3.0);
+    CHECK(glob_seconds("*" + run, key, m) < 3.0 * build_cpu_factor);
     CHECK(m);
-    CHECK(glob_seconds("*" + run + "*", key, m) < 3.0);
+    CHECK(glob_seconds("*" + run + "*", key, m) < 3.0 * build_cpu_factor);
     CHECK(m);
 
     // A wildcard in the run keeps the restart, and the budget is what ends it.
     std::string wild;
     for (size_t i = 0; i < 65536; ++i) wild += "a?";
-    CHECK(glob_seconds("*" + wild + "b", key, m) < 3.0);
+    CHECK(glob_seconds("*" + wild + "b", key, m) < 3.0 * build_cpu_factor);
     CHECK_FALSE(m);
 
     // One class as long as the subject was read once per subject byte.
-    CHECK(glob_seconds("*[" + std::string(131072, 'b') + "]", key, m) < 3.0);
+    CHECK(glob_seconds("*[" + std::string(131072, 'b') + "]", key, m) < 3.0 * build_cpu_factor);
     CHECK_FALSE(m);
 
     // KEYS reaches the same matcher.
@@ -4962,7 +4962,7 @@ TEST_CASE("glob_match answers a pattern built to backtrack in linear time")
     std::vector<std::string_view> out;
     const auto t0 = thread_cpu_now();
     store.keys("*" + run + "b", out);
-    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 3.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 3.0 * build_cpu_factor);
     CHECK(out.empty());
     store.keys("*" + run, out);
     CHECK(out.size() == 1);
