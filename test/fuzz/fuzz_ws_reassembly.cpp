@@ -173,7 +173,10 @@ close_body close_of(uint8_t pick, reader& r)
         case 14: return {code(1001, "cut \xe2\x9c"), 1007};
         default:
         {
-            const uint16_t c = static_cast<uint16_t>(r.byte() << 8 | r.byte());
+            // Two statements: in one expression the two reads may be taken in either order (GCC and clang differ).
+            const uint8_t high = r.byte();
+            const uint8_t low = r.byte();
+            const uint16_t c = static_cast<uint16_t>(high << 8 | low);
             const bool bad_reason = c & 1;
             return {code(c, bad_reason ? "\xff" : "x"), !sendable(c) ? uint16_t(1002) : bad_reason ? uint16_t(1007) : c};
         }

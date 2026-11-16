@@ -30,6 +30,9 @@ namespace
 
 namespace sieve = socketley::mail::sieve;
 
+// Every read of the input is a statement of its own, never two in one expression: the operands of `+`, `|` or a
+// call's arguments are evaluated in an order the language leaves open, and GCC and clang took different ones, so one
+// input built two different scripts (round 10b: a find took 0.002 s in the GCC replay and 0.78 s under clang -O2).
 struct reader
 {
     const uint8_t* p;
@@ -81,7 +84,11 @@ std::string test(reader& r, int depth)
         case 1: return "header :regex \"Subject\" " + regex_text(r);
         case 2: return "body :contains " + quoted(r);
         case 3: return "body :raw :matches " + quoted(r);
-        case 4: return "string :matches \"${v" + std::to_string(r.byte() % 3) + "}\" " + quoted(r);
+        case 4:
+        {
+            const std::string v = std::to_string(r.byte() % 3);
+            return "string :matches \"${v" + v + "}\" " + quoted(r);
+        }
         case 5: return "allof " + tests(r, depth);
         case 6: return "anyof " + tests(r, depth);
         case 7: return "not " + test(r, depth + 1);
@@ -100,8 +107,13 @@ std::string statement(reader& r, int depth)
     {
         case 0: return "set " + v + " " + quoted(r) + ";";
         case 1: return "set :upper " + v + " \"${v0}${v1}${v2}${v0}${v1}${v2}\";";
-        case 2: return "if " + test(r, depth) + " {" + statements(r, depth + 1, 4) + "} else {" +
-                       statements(r, depth + 1, 3) + "}";
+        case 2:
+        {
+            const std::string cond = test(r, depth);
+            const std::string then = statements(r, depth + 1, 4);
+            const std::string otherwise = statements(r, depth + 1, 3);
+            return "if " + cond + " {" + then + "} else {" + otherwise + "}";
+        }
         case 3: return "addheader \"X-F\" \"${v0}\";";
         case 4: return "deleteheader :matches \"Received\" " + quoted(r) + ";";
         case 5: return "if duplicate :uniqueid \"${v1}\" { keep; }";
@@ -141,7 +153,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     const std::string chunk = text(r, 64) + "\r\n";
     const size_t subject_times = 1 + r.byte() * 4;
     const size_t received = r.byte() % 64;
-    const size_t body_times = 1 + (static_cast<size_t>(r.byte()) << 4 | r.byte() >> 4);
+    const size_t body_high = r.byte();
+    const size_t body_low = r.byte();
+    const size_t body_times = 1 + (body_high << 4 | body_low >> 4);
     std::string msg = "From: \"A B\" <a@example.org>\r\nTo: me@example.com\r\nSubject: ";
     for (size_t i = 0; i < subject_times && msg.size() < (256u << 10); ++i)
         msg += chunk.substr(0, chunk.size() - 2) + " ";
