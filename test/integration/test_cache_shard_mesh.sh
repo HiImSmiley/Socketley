@@ -301,6 +301,56 @@ if [ -n "$VICTIM" ] && [ "${AFTER:-0}" -gt "${BEFORE:-0}" ]; then
 else
     bad "a shard killed while its siblings run is reported by them" "victim '${VICTIM:-none}', warnings ${BEFORE:-0} -> ${AFTER:-0}"
 fi
+
+# ── and its replacement is one socket away from every sibling again ────────
+#
+# The mesh was made only while the whole set was forked, so a shard restarted on its own came back with no links, its
+# siblings kept the dead ends, and every crossing to it or from it relayed through the daemon for the rest of the
+# runtime's life.  A link is counted while it lives, so the dead ends are not three links.
+per_shard() { awk -F: '/^\[shard /{s=$0; gsub(/[^0-9]/, "", s)} /^mesh_direct:/{d[s]=$2+0} /^mesh_relayed:/{r[s]=$2+0}
+                       END{for (k in d) print k, d[k], r[k]+0}' | sort; }
+# The replacement is up once four processes listen and the victim is not one of them; its section says what the dead
+# one last published until the new one publishes, which it does on an interval, so the links are read after that.
+listeners() { ss -Hltnp "sport = :$PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u; }
+for _ in $(seq 1 120); do
+    L=$(listeners)
+    [ "$(printf '%s\n' "$L" | grep -c .)" -eq 4 ] && ! printf '%s\n' "$L" | grep -qx "${VICTIM:-x}" && break
+    sleep 0.25
+done
+sleep 1.5
+RELINKS=0
+for _ in $(seq 1 120); do
+    STR=$("$BIN" stats meshc 2>&1 || true)
+    RELINKS=$(printf '%s\n' "$STR" | awk -F: '/^mesh_links:/ && $2+0 == 3 {n++} END{print n+0}')
+    [ "$RELINKS" -eq 4 ] && break
+    sleep 0.25
+done
+RBEFORE=$(printf '%s\n' "$STR" | per_shard)
+RMISS=0
+for i in $(seq 1 60); do redis-cli -p "$PORT" SET "r$i" "t$i" >/dev/null 2>&1; done
+for i in $(seq 1 60); do [ "$(redis-cli -p "$PORT" GET "r$i" 2>/dev/null)" = "t$i" ] || RMISS=$((RMISS+1)); done
+# Each shard's crossings since the restart, against what it reported before the keys went out.
+for _ in $(seq 1 12); do
+    sleep 0.25
+    RDELTA=$(join <(printf '%s\n' "$RBEFORE") <("$BIN" stats meshc 2>/dev/null | per_shard) \
+             | awk '{print $1, $4 - $2, $5 - $3}')
+    [ "$(printf '%s\n' "$RDELTA" | awk '$2 > 0 {n++} END{print n+0}')" -eq 4 ] && break
+done
+RQUIET=$(printf '%s\n' "$RDELTA" | awk '$2 > 0 {n++} END{print n+0}')
+RRELAY=$(printf '%s\n' "$RDELTA" | awk '{s+=$3} END{print s+0}')
+if [ "$RELINKS" -eq 4 ]; then
+    ok "after the restart every shard holds three live links again"
+else
+    bad "after the restart every shard holds three live links again" \
+        "$RELINKS of 4 shards report mesh_links 3: $(printf '%s\n' "$STR" | grep -E '^(\[shard|mesh_links:)' | paste -sd' ')"
+fi
+if [ "$RMISS" -eq 0 ] && [ "$RQUIET" -eq 4 ] && [ "$RRELAY" -eq 0 ]; then
+    ok "and every shard's keys cross directly, none relayed (60/60 read back)"
+else
+    bad "and every shard's keys cross directly, none relayed" \
+        "$RMISS of 60 missing, $RQUIET of 4 shards crossed directly, $RRELAY relayed" \
+        "(shard, direct, relayed since the restart: $(printf '%s\n' "$RDELTA" | paste -sd';'))"
+fi
 "$BIN" remove meshc >/dev/null 2>&1
 
 # ── eight shards: 56 links, and the assertion four shards cannot make ────

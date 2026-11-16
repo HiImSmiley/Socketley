@@ -203,6 +203,11 @@ void request_channel::drop_sink(const request_sink* sink)
         m_default_sink = nullptr;
 }
 
+size_t request_channel::drop_parked_for(const request_sink* sink)
+{
+    return drop_parked([sink](const parked_request& p) { return p.sink == sink; });
+}
+
 bool request_channel::origin_live(const request_origin* o) const
 {
     return std::find(m_origins.begin(), m_origins.end(), o) != m_origins.end();

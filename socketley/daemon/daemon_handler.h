@@ -604,6 +604,10 @@ private:
     // the log when it refuses.
     bool mesh_fits(size_t shards) const;
 
+    // New links between a shard of `name` about to be forked again and each sibling it was meshed with, one end for
+    // its fork and the other handed to the sibling, which replaces the end it held to the dead process.
+    void rewire_shard(const std::string& name, proxy_supervisor* restarting);
+
     // A `send` that came up from a worker's script, routed exactly as
     // cmd_send() routes the same verb typed at the CLI.
     void on_worker_deliver(proxy_supervisor* from, std::string_view name,

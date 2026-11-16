@@ -2,6 +2,7 @@
 #include "doctest.h"
 
 #include "../../socketley/shared/ipc/request_channel.h"
+#include "../../socketley/shared/ipc/shard_mesh.h"
 #include "../../socketley/shared/loop/event_loop.h"
 #include "../../socketley/shared/ipc/worker_protocol.h"
 
@@ -414,6 +415,162 @@ TEST_CASE("dropping a sink drops it as the fallback too")
     CHECK(origin.replies[0].st == request_status::no_target);
     CHECK(fallback.tickets.empty());
 
+    ch.detach();
+    loop.shutdown_ring();
+}
+
+TEST_CASE("a sink whose process died has its parked requests answered, and stays in the table")
+{
+    event_loop loop;
+    REQUIRE(loop.init());
+    request_channel ch;
+    ch.attach(loop);
+
+    deferred_sink    dead, other;
+    recording_origin origin;
+    ch.register_sink("dead", &dead);
+    ch.register_sink("other", &other);
+    REQUIRE(ch.post(&origin, 1, "dead", "GET a", request_class::client));
+    REQUIRE(ch.post(&origin, 2, "dead", "GET b", request_class::client));
+    REQUIRE(ch.post(&origin, 3, "other", "GET c", request_class::client));
+    pump(loop);
+    REQUIRE(ch.parked_count() == 3);
+    CHECK(ch.parked(dead.tickets[0]));
+
+    // A restarted worker never saw them, so they are answered once, now, and the late answer is ignored.
+    CHECK(ch.drop_parked_for(&dead) == 2);
+    CHECK_FALSE(ch.parked(dead.tickets[0]));
+    CHECK(ch.parked(other.tickets[0]));
+    REQUIRE(origin.replies.size() == 2);
+    CHECK(origin.replies[0].st == request_status::dropped);
+    ch.complete_deferred(dead.tickets[1], request_status::ok, "late");
+    CHECK(origin.replies.size() == 2);
+
+    // The name still reaches it, for the process that replaces the dead one.
+    REQUIRE(ch.post(&origin, 4, "dead", "GET d", request_class::client));
+    pump(loop);
+    CHECK(dead.tickets.size() == 3);
+
+    ch.detach();
+    loop.shutdown_ring();
+}
+
+// ─── a sibling's link replaced ──────────────────────────────────────────────
+//
+// A shard whose sibling restarted relays to it until the new link is switched in.  A crossing over the link would
+// overtake one relayed just ahead of it, so the sink keeps new crossings until every relayed one is answered and
+// then sends them over the link first, in the order they came.
+
+namespace {
+
+// The chan_req frames a link wrote, by ticket, in the order they are on the wire.
+std::vector<uint64_t> tickets_on(int fd)
+{
+    std::string in;
+    char buf[65536];
+    for (;;)
+    {
+        const ssize_t n = ::recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0)
+            break;
+        in.append(buf, static_cast<size_t>(n));
+    }
+    std::vector<uint64_t> out;
+    size_t off = 0;
+    worker_proto::frame_type type{};
+    uint16_t ver = 0;
+    std::string_view view;
+    bool fatal = false;
+    while (worker_proto::peek_frame(in, off, type, ver, view, fatal))
+    {
+        worker_proto::chan_request_view q;
+        if (type == worker_proto::frame_type::chan_req && worker_proto::decode_chan_request(view, q))
+            out.push_back(q.ticket);
+    }
+    return out;
+}
+
+}   // namespace
+
+TEST_CASE("a new link takes a sibling's crossings only once the relayed ones are answered, the kept ones first")
+{
+    event_loop loop;
+    REQUIRE(loop.init());
+    request_channel ch;
+    ch.attach(loop);
+
+    int sv[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    shard_link     fresh(sv[0], 1, &ch, nullptr, nullptr);
+    deferred_sink  daemon;
+    recording_origin origin;
+    mesh_sink sink(nullptr, &daemon, &ch, 1);
+    ch.register_sink("c#1", &sink);
+
+    REQUIRE(ch.post(&origin, 1, "c#1", "SET k 1", request_class::client));
+    pump(loop);
+    REQUIRE(daemon.tickets.size() == 1);
+    CHECK(sink.stat_relayed() == 1);
+
+    sink.hold_for(&fresh);
+    REQUIRE(ch.post(&origin, 2, "c#1", "GET k", request_class::client));
+    REQUIRE(ch.post(&origin, 3, "c#1", "SET k 2", request_class::client));
+    pump(loop);
+    CHECK(daemon.tickets.size() == 1);
+    CHECK(sink.relays_owed());
+    CHECK(tickets_on(sv[1]).empty());
+
+    ch.complete_deferred(daemon.tickets[0], request_status::ok, "+OK\r\n");
+    CHECK_FALSE(sink.relays_owed());
+    sink.switch_to(&fresh);
+    REQUIRE(ch.post(&origin, 4, "c#1", "GET k", request_class::client));
+    pump(loop);
+    fresh.pump();
+
+    // Every crossing went one way or the other, once: the first relayed, the rest over the link in order.
+    const std::vector<uint64_t> wire = tickets_on(sv[1]);
+    REQUIRE(wire.size() == 3);
+    CHECK(wire[0] < wire[1]);
+    CHECK(wire[1] < wire[2]);
+    CHECK(sink.stat_direct() == 3);
+    CHECK(sink.stat_relayed() == 1);
+    CHECK(sink.link() == &fresh);
+
+    ::close(sv[1]);
+    ch.detach();
+    loop.shutdown_ring();
+}
+
+TEST_CASE("a new link that ends before it is switched in sends what was kept the long way")
+{
+    event_loop loop;
+    REQUIRE(loop.init());
+    request_channel ch;
+    ch.attach(loop);
+
+    int sv[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    shard_link     fresh(sv[0], 1, &ch, nullptr, nullptr);
+    deferred_sink  daemon;
+    recording_origin origin;
+    mesh_sink sink(nullptr, &daemon, &ch, 1);
+    ch.register_sink("c#1", &sink);
+
+    sink.hold_for(&fresh);
+    REQUIRE(ch.post(&origin, 1, "c#1", "SET k 1", request_class::client));
+    REQUIRE(ch.post(&origin, 2, "c#1", "GET k", request_class::client));
+    pump(loop);
+    CHECK(daemon.tickets.empty());
+
+    fresh.die("test", /*expected=*/true);
+    sink.give_up_hold();
+    REQUIRE(daemon.tickets.size() == 2);
+    CHECK(daemon.tickets[0] < daemon.tickets[1]);
+    CHECK(daemon.payloads[0] == "SET k 1");
+    CHECK(sink.stat_relayed() == 2);
+    CHECK(origin.replies.empty());
+
+    ::close(sv[1]);
     ch.detach();
     loop.shutdown_ring();
 }

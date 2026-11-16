@@ -847,8 +847,10 @@ private:
 class mesh_sink : public deferred_request_sink
 {
 public:
-    mesh_sink(shard_link* link, request_sink* relay)
-        : m_link(link), m_relay(relay) {}
+    // `owed_in` is the channel whose tickets this sink is handed, given for a sibling's sink so its link can be
+    // replaced (hold_for()); `peer` is that sibling.
+    mesh_sink(shard_link* link, request_sink* relay, request_channel* owed_in = nullptr, uint32_t peer = 0)
+        : m_link(link), m_relay(relay), m_owed_in(owed_in), m_peer(peer) {}
 
     bool serve_deferred(uint64_t ticket, std::string_view target,
                         std::string_view payload) override
@@ -859,19 +861,64 @@ public:
             return true;
         }
 
+        // Kept for the new link rather than relayed, so the relayed ones only drain and the switch cannot be put
+        // off for as long as crossings keep coming; one past the bound sends what is kept the long way first.
+        if (m_next && m_next->alive() && m_owed_in)
+        {
+            if (m_held_bytes + payload.size() <= hold_bytes && m_held.size() < request_channel::MAX_PARKED)
+            {
+                m_held.push_back({ticket, std::string(target), std::string(payload)});
+                m_held_bytes += target.size() + payload.size();
+                return true;
+            }
+            m_next = nullptr;
+            release_held();
+        }
+
         // No link, or a link that has just given up, so the crossing is slower
         // here and never lost.
-        if (m_relay && m_relay->serve_deferred(ticket, target, payload))
-        {
-            ++m_relayed;
-            return true;
-        }
-        return false;
+        return relay(ticket, target, payload);
+    }
+
+    shard_link* link() const { return m_link; }
+    uint32_t    peer() const { return m_peer; }
+
+    // A new link to the sibling, written to once every crossing relayed before it has been answered, since one
+    // relayed is ~12 us behind one sent direct and a `get` over the link could be answered before the `set` relayed
+    // just ahead of it.  Until then the crossings are kept here.
+    void hold_for(shard_link* next)
+    {
+        if (m_next && m_next != next)
+            release_held();
+        m_next = next;
+    }
+    shard_link* held_for() const { return m_next; }
+
+    // Whether a crossing relayed is still unanswered, which is all switch_to() waits for.
+    bool relays_owed()
+    {
+        prune_relayed();
+        return !m_relayed_tickets.empty();
+    }
+
+    // The link from here on, with what was kept sent over it ahead of anything later.
+    void switch_to(shard_link* link)
+    {
+        m_link = link;
+        m_next = nullptr;
+        release_held();
+    }
+
+    // The new link ended before it was switched in, so what was kept goes the long way.
+    void give_up_hold()
+    {
+        m_next = nullptr;
+        release_held();
     }
 
     size_t request_room(std::string_view target) const override
     {
-        if (m_link && m_link->alive())
+        if ((m_link && m_link->alive()) || (m_next && m_next->alive()))
             return SIZE_MAX;
         return m_relay ? m_relay->request_room(target) : 0;
     }
@@ -886,8 +933,65 @@ public:
     uint64_t stat_relayed() const { return m_relayed; }
 
 private:
+    bool relay(uint64_t ticket, std::string_view target, std::string_view payload)
+    {
+        if (!m_relay || !m_relay->serve_deferred(ticket, target, payload))
+            return false;
+        ++m_relayed;
+        if (m_owed_in)
+        {
+            // Pruned when it doubles past what can be parked at once, so it stays bounded by that.
+            if (m_relayed_tickets.size() >= 2 * request_channel::MAX_PARKED)
+                prune_relayed();
+            m_relayed_tickets.push_back(ticket);
+        }
+        return true;
+    }
+
+    // What was kept, in the order it came, over the link when it takes it and the long way when not; one neither
+    // takes was already accepted, so it is answered here.
+    void release_held()
+    {
+        std::deque<held> out;
+        out.swap(m_held);
+        m_held_bytes = 0;
+        for (const held& h : out)
+        {
+            if (m_link && m_link->send_request(h.ticket, h.target, h.payload))
+            {
+                ++m_direct;
+                continue;
+            }
+            if (relay(h.ticket, h.target, h.payload))
+                continue;
+            if (m_owed_in)
+                m_owed_in->complete_deferred(h.ticket, refusal(h.target, h.payload.size()), {});
+        }
+    }
+
+    void prune_relayed()
+    {
+        if (m_owed_in)
+            std::erase_if(m_relayed_tickets, [this](uint64_t t) { return !m_owed_in->parked(t); });
+    }
+
+    struct held
+    {
+        uint64_t    ticket;
+        std::string target;
+        std::string payload;
+    };
+    // What a client's pipeline sends between a sibling's restart and its link's switch, which is one round trip.
+    static constexpr size_t hold_bytes = request_channel::MAX_PENDING_BYTES;
+
     shard_link*   m_link{nullptr};
     request_sink* m_relay{nullptr};
+    request_channel* m_owed_in{nullptr};
+    uint32_t      m_peer{0};
     uint64_t      m_direct{0};
     uint64_t      m_relayed{0};
+    std::vector<uint64_t> m_relayed_tickets;
+    shard_link*   m_next{nullptr};
+    std::deque<held> m_held;
+    size_t        m_held_bytes{0};
 };

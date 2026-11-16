@@ -10,6 +10,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cerrno>
 #include <cstring>
 #include <functional>
@@ -33,6 +34,27 @@ inline constexpr size_t max_name = 128;
 // and '@' is what makes it unambiguous: runtime_manager::valid_name() allows
 // only [alnum], '-', '_' and '.', so no runtime can ever be called this.
 inline constexpr std::string_view interactive_marker = "@i";
+
+// A link to a sibling shard restarted with the other end, named `#<index>`, which no runtime name can be either.
+inline std::string mesh_name(uint32_t shard) { return "#" + std::to_string(shard); }
+
+// The sibling a grant names, or false when it names a runtime.
+inline bool mesh_index(std::string_view name, uint32_t& shard)
+{
+    if (name.size() < 2 || name.size() > 11 || name.front() != '#')
+        return false;
+    uint64_t v = 0;
+    for (const char c : name.substr(1))
+    {
+        if (c < '0' || c > '9')
+            return false;
+        v = v * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (v > UINT32_MAX)
+        return false;
+    shard = static_cast<uint32_t>(v);
+    return true;
+}
 
 // The daemon's side.  Never blocking: this runs on the daemon's event-loop
 // thread, and a worker that has stopped reading its grant channel must cost a

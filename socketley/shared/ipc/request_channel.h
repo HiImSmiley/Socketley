@@ -131,6 +131,9 @@ public:
     void clear_sinks();
     void register_sink(std::string_view name, request_sink* sink);
     void drop_sink(const request_sink* sink);
+    // Answer `dropped` every request parked against `sink`, which stays in the table: the process behind it died
+    // with them and the next one never saw them.  How many.
+    size_t drop_parked_for(const request_sink* sink);
 
     // Where a request goes when nobody here holds the name; a worker also
     // registers its OWN name, or a request for itself would round-trip.
@@ -183,6 +186,8 @@ public:
     void withdraw(uint64_t ticket);
 
     size_t parked_count() const { return m_parked.size(); }
+    // Whether `ticket` is still waiting for its answer; a ticket is never handed out twice.
+    bool parked(uint64_t ticket) const { return m_parked.contains(ticket); }
 
     void on_cqe(struct io_uring_cqe* cqe) override;
 

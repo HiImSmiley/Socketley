@@ -81,6 +81,26 @@ constexpr int worker_link_fd = 7;
 // then closed it.
 constexpr int worker_mesh_base = 8;
 
+// Which slots of the block hold a socketpair end at exec, read before this process opens a descriptor of its own: a
+// shard restarted while a sibling would not take its new end has a hole in the block, and the loop's eventfd lands in it.
+uint64_t g_inherited_mesh = 0;
+
+void note_inherited_mesh()
+{
+    static_assert(max_shards <= 64, "one bit per slot");
+    for (uint32_t j = 0; j < max_shards; ++j)
+    {
+        const int fd = worker_mesh_base + static_cast<int>(j);
+        int type = 0;
+        socklen_t tlen = sizeof type;
+        struct sockaddr_storage sa{};
+        socklen_t alen = sizeof sa;
+        if (::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tlen) == 0 && type == SOCK_STREAM
+            && ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&sa), &alen) == 0 && sa.ss_family == AF_UNIX)
+            g_inherited_mesh |= uint64_t{1} << j;
+    }
+}
+
 // The line the daemon watches this worker's Lua callbacks through, past the
 // whole mesh block so no shard count can reach it, agreeing with
 // proxy_supervisor's child_deadline_fd.
@@ -479,6 +499,7 @@ public:
             // of this turn and not of any one completion.
             arm_pending_peers();
             reap_retired_peers();
+            arm_pending_mesh();
 
             // And whatever the runtime itself has that no completion returns
             // for, which today is a listener the ring refused to arm.
@@ -697,7 +718,12 @@ private:
         {
             uint64_t direct = 0, relayed = 0;
             mesh_counts(direct, relayed);
-            s.detail += "mesh_links:"   + std::to_string(m_mesh_sinks.size()) + "\n";
+            // A link counts while it lives, so a sibling that died is not still one of them.
+            size_t live = 0;
+            for (const auto& sk : m_mesh_sinks)
+                if (sk->link() && sk->link()->alive())
+                    ++live;
+            s.detail += "mesh_links:"   + std::to_string(live) + "\n";
             s.detail += "mesh_direct:"  + std::to_string(direct)  + "\n";
             s.detail += "mesh_relayed:" + std::to_string(relayed) + "\n";
             size_t held = 0;
@@ -1022,22 +1048,19 @@ private:
         if (cfg.shards > 1 && cfg.mesh_wired)
         {
             const uint32_t me = m_rt->get_shard_index();
+            m_mesh_wired  = true;
+            m_mesh_shards = std::min(cfg.shards, max_shards);
             // Read once, here: a cache's links carry client descriptors unless the operator said 0.
-            const bool hand_off = cfg.type == runtime_cache && socketley::settings::flag("SOCKETLEY_CACHE_HANDOFF", true);
-            for (uint32_t j = 0; j < cfg.shards; ++j)
+            m_hand_off = cfg.type == runtime_cache && socketley::settings::flag("SOCKETLEY_CACHE_HANDOFF", true);
+            for (uint32_t j = 0; j < m_mesh_shards; ++j)
             {
-                if (j == me)
+                if (j == me || (g_inherited_mesh & (uint64_t{1} << j)) == 0)
                     continue;
-                const int fd = worker_mesh_base + static_cast<int>(j);
-                if (::fcntl(fd, F_GETFD, 0) < 0)
-                    continue;
-                m_mesh_links.push_back(std::make_unique<shard_link>(
-                    fd, j, &m_manager.requests(), &worker_serve_mesh, this));
-                m_mesh_links.back()->set_noter(&worker_mesh_note);
-                if (hand_off)
-                    m_mesh_links.back()->enable_fd_passing(&worker_mesh_handoff);
+                m_mesh_links.push_back(make_mesh_link(worker_mesh_base + static_cast<int>(j), j));
             }
-            if (hand_off && !m_mesh_links.empty())
+            // Spent: a later config frame is the same process, whose block was taken here.
+            g_inherited_mesh = 0;
+            if (m_hand_off)
             {
                 m_rt->set_handoff_sink([this](uint32_t shard, std::string_view payload, int fd) {
                     for (auto& link : m_mesh_links)
@@ -1074,16 +1097,22 @@ private:
             m_manager.requests().register_sink(cfg.name, sink);
         m_manager.requests().set_default_sink(&m_remote);
 
-        // `name#j` for every sibling this process has a link to, registered
-        // after the default sink, so a sibling with no link is absent and
-        // falls through to the daemon.
+        // `name#j` for every sibling of a meshed shard, registered after the default sink, with no link yet where
+        // the daemon gave none, so a sibling's crossings are counted by route and its link can arrive later.
         for (auto& link : m_mesh_links)
-        {
             link->attach(m_loop);
-            m_mesh_sinks.push_back(std::make_unique<mesh_sink>(link.get(), &m_remote));
-            m_manager.requests().register_sink(
-                shard_target(cfg.name, link->peer()), m_mesh_sinks.back().get());
-        }
+        if (m_mesh_wired)
+            for (uint32_t j = 0; j < m_mesh_shards; ++j)
+            {
+                if (j == m_rt->get_shard_index())
+                    continue;
+                shard_link* link = nullptr;
+                for (auto& l : m_mesh_links)
+                    if (l->peer() == j)
+                        link = l.get();
+                m_mesh_sinks.push_back(std::make_unique<mesh_sink>(link, &m_remote, &m_manager.requests(), j));
+                m_manager.requests().register_sink(shard_target(cfg.name, j), m_mesh_sinks.back().get());
+            }
 
         // ── Links to other runtimes ────────────────────────────────────────
         // After the default sink, like the mesh's, so a peer this worker has
@@ -1111,6 +1140,11 @@ private:
                     if (peer == socketley::send_link::marker)
                     {
                         adopt_send_link(fd);
+                        return;
+                    }
+                    if (uint32_t shard = 0; socketley::peer_link::mesh_index(peer, shard))
+                    {
+                        adopt_mesh_link(shard, fd);
                         return;
                     }
                     adopt_peer_link(std::move(peer), fd);
@@ -1634,9 +1668,122 @@ private:
     {
         for (auto& link : m_mesh_links)
             f(*link);
+        for (auto& link : m_mesh_pending)
+            f(*link);
+        for (auto& link : m_mesh_retired)
+            f(*link);
         for (auto& e : m_peer_links)
             if (e.link)
                 f(*e.link);
+    }
+
+    // One link to sibling `peer`, as the fork placed it or a grant handed it over, not yet attached.
+    std::unique_ptr<shard_link> make_mesh_link(int fd, uint32_t peer)
+    {
+        auto link = std::make_unique<shard_link>(fd, peer, &m_manager.requests(), &worker_serve_mesh, this);
+        link->set_noter(&worker_mesh_note);
+        if (m_hand_off)
+            link->enable_fd_passing(&worker_mesh_handoff);
+        return link;
+    }
+
+    mesh_sink* mesh_sink_for(uint32_t peer)
+    {
+        for (auto& sk : m_mesh_sinks)
+            if (sk->peer() == peer)
+                return sk.get();
+        return nullptr;
+    }
+
+    // A link to sibling `peer`, which the daemon has just forked again with the other end.  Read from at once, since
+    // the new process writes to it from its start; written to only once arm_pending_mesh() switches it in.
+    void adopt_mesh_link(uint32_t peer, int fd)
+    {
+        if (!m_rt || !m_mesh_wired || peer >= m_mesh_shards || peer == m_rt->get_shard_index() || !mesh_sink_for(peer))
+        {
+            ::close(fd);
+            return;
+        }
+        // Granted without close-on-exec, and a program a script starts must not hold a sibling's link open.
+        if (::fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {}
+
+        // The end to the process that died, if this shard has not read its close yet, since nothing more comes on it.
+        for (auto& link : m_mesh_links)
+            if (link->peer() == peer && link->alive())
+                link->die("its shard was restarted");
+        // And an earlier grant not yet switched in, which was to a process that has been replaced as well.
+        for (size_t i = 0; i < m_mesh_pending.size(); )
+        {
+            if (m_mesh_pending[i]->peer() != peer)
+            {
+                ++i;
+                continue;
+            }
+            m_mesh_pending[i]->die("replaced by a newer link", /*expected=*/true);
+            m_mesh_retired.push_back(std::move(m_mesh_pending[i]));
+            m_mesh_pending.erase(m_mesh_pending.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+
+        auto link = make_mesh_link(fd, peer);
+        if (!link->attach(m_loop))
+            LOG_WARN(("shard mesh: could not arm the new link to shard " + std::to_string(peer)
+                      + "; its crossings keep relaying").c_str());
+        mesh_sink_for(peer)->hold_for(link.get());
+        m_mesh_pending.push_back(std::move(link));
+    }
+
+    // A restarted sibling's link, switched in once nothing relayed to that sibling is unanswered, which the sink
+    // holds new crossings for; see mesh_sink::hold_for().
+    void arm_pending_mesh()
+    {
+        for (size_t i = 0; i < m_mesh_pending.size(); )
+        {
+            shard_link* fresh = m_mesh_pending[i].get();
+            mesh_sink*  sink  = mesh_sink_for(fresh->peer());
+            if (fresh->alive() && sink && sink->relays_owed())
+            {
+                ++i;
+                continue;
+            }
+            std::unique_ptr<shard_link> taken = std::move(m_mesh_pending[i]);
+            m_mesh_pending.erase(m_mesh_pending.begin() + static_cast<std::ptrdiff_t>(i));
+            if (!taken->alive() || !sink)
+            {
+                // It ended before it carried anything of this shard's, and what was kept for it goes the long way.
+                if (sink && sink->held_for() == taken.get())
+                    sink->give_up_hold();
+                m_mesh_retired.push_back(std::move(taken));
+                continue;
+            }
+            bool placed = false;
+            for (auto& link : m_mesh_links)
+                if (link->peer() == taken->peer())
+                {
+                    link->die("replaced by a fresh link", /*expected=*/true);
+                    m_mesh_retired.push_back(std::move(link));
+                    link   = std::move(taken);
+                    placed = true;
+                    break;
+                }
+            if (!placed)
+                m_mesh_links.push_back(std::move(taken));
+            sink->switch_to(mesh_link_to(sink->peer()));
+            LOG_INFO(("shard mesh: the link to shard " + std::to_string(sink->peer()) + " is back").c_str());
+        }
+
+        // The ends replaced, freed once nothing in the ring names them; see reap_retired_peers() for why that is the
+        // licence and why a full owner table is not.
+        if (m_mesh_retired.empty() || m_loop.owner_table_full())
+            return;
+        std::erase_if(m_mesh_retired, [this](const auto& l) { return m_loop.owner_inflight(l.get()) == 0; });
+    }
+
+    shard_link* mesh_link_to(uint32_t peer)
+    {
+        for (auto& link : m_mesh_links)
+            if (link->peer() == peer)
+                return link.get();
+        return nullptr;
     }
 
     // A shell's link for `socketley send`, served until the shell closes it; the ended ones are freed here, once the
@@ -2636,6 +2783,14 @@ private:
     // Messages for a sibling's clients go over the links while every sibling has one that lives.
     bool m_notes_direct{false};
     std::vector<std::unique_ptr<mesh_sink>>  m_mesh_sinks;
+    // Whether this shard was forked into a mesh, of how many, and whether its links carry client descriptors.
+    bool     m_mesh_wired{false};
+    uint32_t m_mesh_shards{0};
+    bool     m_hand_off{false};
+    // Links to restarted siblings, read from at once and written to once arm_pending_mesh() switches them in; and
+    // the ends they replaced, freed once the ring is done with them.
+    std::vector<std::unique_ptr<shard_link>> m_mesh_pending;
+    std::vector<std::unique_ptr<shard_link>> m_mesh_retired;
 
     // ── Links to other runtimes' processes ─────────────────────────────────
     // The same two objects the mesh uses, keyed by a runtime name instead of a
@@ -2740,6 +2895,7 @@ int worker_main(int control_fd)
 {
     if (control_fd < 0)
         return 2;
+    note_inherited_mesh();
 
     // Ask the kernel to signal on the parent's death first and only then check
     // the parent, because a daemon that died before the prctl produces no

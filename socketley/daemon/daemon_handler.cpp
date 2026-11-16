@@ -561,6 +561,42 @@ bool daemon_handler::mesh_fits(size_t shards) const
     return false;
 }
 
+void daemon_handler::rewire_shard(const std::string& name, proxy_supervisor* restarting)
+{
+    const auto it = m_proxy_workers.find(name);
+    if (it == m_proxy_workers.end() || !restarting || !restarting->meshed())
+        return;
+    const auto& shards = it->second;
+    const uint32_t me = restarting->shard_index();
+    if (me >= shards.size() || shards[me].get() != restarting || !mesh_fits(shards.size()))
+        return;
+
+    // A sibling that will not take its end gets none, and the slot is left empty, so the two relay as before.
+    std::vector<int> row(shards.size(), -1);
+    size_t made = 0;
+    for (uint32_t j = 0; j < shards.size(); ++j)
+    {
+        proxy_supervisor* sib = shards[j].get();
+        if (j == me || !sib || !sib->meshed())
+            continue;
+        int sv[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0)
+            break;
+        const bool granted = sib->grant_mesh_link(me, sv[1]);
+        ::close(sv[1]);
+        if (!granted)
+        {
+            ::close(sv[0]);
+            continue;
+        }
+        row[j] = sv[0];
+        ++made;
+    }
+    if (made == 0)
+        return;
+    restarting->set_mesh_fds(std::move(row));
+}
+
 void daemon_handler::publish_shard_sinks(request_channel& ch)
 {
     for (auto& [name, shards] : m_proxy_workers)
@@ -8355,6 +8391,7 @@ void daemon_handler::reconcile_proxy_workers()
                                       const conn_ref& r, std::string_view pl)
                                { on_worker_route(f, to, frm, op, r, pl); });
         sup->set_stats_handler([this, name] { on_worker_stats(name); });
+        sup->set_respawn_handler([this, name](proxy_supervisor* s) { rewire_shard(name, s); });
 
         // A crossing this worker made to another runtime, which is what tells
         // the daemon the two processes have something to say to each other.

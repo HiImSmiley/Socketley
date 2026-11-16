@@ -363,6 +363,19 @@ bool proxy_supervisor::grant_send_link(int fd)
            && socketley::peer_link::grant(m_link_chan_fd, socketley::send_link::marker, fd);
 }
 
+bool proxy_supervisor::grant_mesh_link(uint32_t shard, int fd)
+{
+    if (m_link_chan_fd < 0 || fd < 0)
+        return false;
+    if (!socketley::peer_link::grant(m_link_chan_fd, socketley::peer_link::mesh_name(shard), fd))
+    {
+        LOG_WARN((who() + "could not hand over the new link to shard " + std::to_string(shard)
+                  + "; crossings to it keep relaying through the daemon").c_str());
+        return false;
+    }
+    return true;
+}
+
 bool proxy_supervisor::grant_suppressed(std::string_view peer)
 {
     // A plain unordered_map, so the key is built rather than looked up
@@ -1767,6 +1780,12 @@ bool proxy_supervisor::check_liveness()
     m_in.clear();
     m_part.clear();
 
+    // Every request handed to the dead child went with it, its answer included, so each is answered now and not
+    // at the parked deadline thirty seconds on; a sibling shard waiting on them also waits to switch to its link.
+    if (m_channel)
+        if (const size_t gone = m_channel->drop_parked_for(this); gone > 0)
+            LOG_WARN((who() + std::to_string(gone) + " request(s) it held were answered as dropped").c_str());
+
     // The binary and the status, because the usual cause is a worker binary
     // that never became a worker and the bare sentence sent operators looking
     // in the configuration path instead.
@@ -1831,7 +1850,15 @@ bool proxy_supervisor::check_liveness()
         }
     }
 
-    if (!spawn(cfg))
+    // New links to the siblings, which spawn() places in the child; the daemon's copies go once it has forked.
+    if (m_on_respawn)
+        m_on_respawn(this);
+    const bool spawned = spawn(cfg);
+    for (const int fd : m_mesh_fds)
+        if (fd >= 0)
+            ::close(fd);
+    m_mesh_fds.clear();
+    if (!spawned)
     {
         if (m_placeholder)
             m_placeholder->mark_failed();

@@ -4,6 +4,7 @@
 // `inspect` read it without knowing the runtime lives elsewhere -- and whose
 // socket is armed in the ring, because a request has somebody waiting on it
 // and a health-tick drain made a cross-process `cache set` cost 2000.02 ms.
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -181,6 +182,9 @@ public:
     // One end of a shell's link for `socketley send` (send_link.h), over the same channel.
     bool grant_send_link(int fd);
 
+    // One end of a link to sibling `shard`, restarted with the other end, over the same channel.
+    bool grant_mesh_link(uint32_t shard, int fd);
+
     // Whether this child has been introduced to `peer` recently enough that a
     // second grant would be waste rather than repair.
     bool grant_suppressed(std::string_view peer);
@@ -206,11 +210,21 @@ public:
       m_shard_clients_fd = clients_fd; }
     uint32_t shard_index() const { return m_shard_index; }
 
-    // The shard mesh ends this child inherits, consumed by the fork because
-    // the daemon closes its own copies once the whole set is forked, so a
-    // restarted shard relays instead.
-    void set_mesh_fds(std::vector<int> fds) { m_mesh_fds = std::move(fds); }
+    // The shard mesh ends this child inherits, placed by the fork and closed by whoever made them: the daemon once
+    // the whole set is forked, or check_liveness() once a restart has forked.
+    void set_mesh_fds(std::vector<int> fds)
+    {
+        m_meshed = m_meshed || std::any_of(fds.begin(), fds.end(), [](int fd) { return fd >= 0; });
+        m_mesh_fds = std::move(fds);
+    }
     void clear_mesh_fds() { m_mesh_fds.clear(); }
+    // Whether this shard was forked into a mesh, which its replacements are rewired into.
+    bool meshed() const { return m_meshed; }
+
+    // Called with a child that died just before its replacement is forked, so the daemon can make it new links to
+    // its siblings with set_mesh_fds(); the siblings are handed the other ends.
+    using respawn_handler = std::function<void(proxy_supervisor* restarting)>;
+    void set_respawn_handler(respawn_handler h) { m_on_respawn = std::move(h); }
 
     // Fork, exec, and send the config, leaving the placeholder `running` only
     // once the child is forked and the config written.
@@ -531,6 +545,8 @@ private:
     // which every unsharded runtime is.
     uint32_t     m_shard_index{0};
     std::vector<int> m_mesh_fds;
+    bool         m_meshed{false};
+    respawn_handler m_on_respawn;
     int          m_shard_region_fd{-1};
     int          m_shard_clients_fd{-1};
 
