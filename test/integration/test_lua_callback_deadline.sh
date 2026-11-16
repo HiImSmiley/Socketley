@@ -428,12 +428,18 @@ if [ "$TOP_RC" = "1" ]; then pass; else
          "this chunk runs synchronously inside the command — without a bound" \
          "the operator's terminal blocks on a create that never answers"
 fi
+# The reason is the stop signal's handler's to give, which under TSan never runs inside the chunk's loop: the create
+# is refused there all the same, when the worker does not answer its configuration.
+if build_defers_signals; then
+    echo "  SKIP [reason]: the stop signal's handler never runs inside the chunk's loop under TSan"
+else
 case "$TOP_OUT" in
     *"top level"*deadline*|*deadline*"top level"*) pass ;;
     *) fail "the refusal says the top level outran the deadline" \
             "create said: ${TOP_OUT:-<nothing>}" \
             "a refusal with no reason in it sends whoever reads it to the log" ;;
 esac
+fi
 
 # A callback_timeout_ms that cannot be a millisecond count refuses the create
 # and says so on the terminal that asked, in every build.

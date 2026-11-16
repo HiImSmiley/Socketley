@@ -148,13 +148,20 @@ try:
     # Past the 68 MiB the daemon queues for a stopped shard, one APPEND of 448 KiB from each of 200 connections on
     # the other shard, and the APPENDs past it are refused at once, their clients told why.
     opened = [socket.create_connection(("127.0.0.1", port)) for _ in range(440)]
-    out = subprocess.run(["ss", "-tnpH", "sport = :%d" % port], capture_output=True, timeout=10).stdout.decode()
-    by_port = {}
-    for line in out.splitlines():
-        f = line.split()
-        m = re.search(r"pid=(\d+)", line)
-        if len(f) >= 5 and m:
-            by_port[int(f[4].rpartition(":")[2])] = int(m.group(1))
+    # A connection still in the listener's queue has no process yet, so the table is read until every one has been
+    # taken: a slower build's shards took 113 of them by the first reading.
+    end = time.monotonic() + 5 * cost
+    while True:
+        out = subprocess.run(["ss", "-tnpH", "sport = :%d" % port], capture_output=True, timeout=10).stdout.decode()
+        by_port = {}
+        for line in out.splitlines():
+            f = line.split()
+            m = re.search(r"pid=(\d+)", line)
+            if len(f) >= 5 and m:
+                by_port[int(f[4].rpartition(":")[2])] = int(m.group(1))
+        if all(c.getsockname()[1] in by_port for c in opened) or time.monotonic() > end:
+            break
+        time.sleep(0.1)
     more = [c for c in opened if by_port.get(c.getsockname()[1]) not in (pids[held], None)][:200]
     for c in opened:
         if c not in more:

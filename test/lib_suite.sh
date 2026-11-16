@@ -58,13 +58,17 @@ suite_free_windows() {
 suite_mem_slots() {   # bytes per job -> how many fit
     local free cg lim l u n
     free=$(awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo)
+    # Up to the hierarchy's root and including it, which in a container's namespace is the container's own cgroup:
+    # a shell in the root ("0::/") walked from /sys/fs/cgroup/ to / and stayed there, as dirname / is /.
     cg="/sys/fs/cgroup$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)"
-    while [ -d "$cg" ] && [ "$cg" != /sys/fs/cgroup ]; do
+    cg=${cg%/}
+    while [ -d "$cg" ]; do
         for lim in memory.high memory.max; do
             l=$(cat "$cg/$lim" 2>/dev/null); u=$(awk '$1 == "anon" { print $2 }' "$cg/memory.stat" 2>/dev/null)
             case "$l$u" in ''|*[!0-9]*) continue ;; esac
             [ $((l - u)) -lt "$free" ] && free=$((l - u))
         done
+        [ "$cg" = /sys/fs/cgroup ] && break
         cg=$(dirname "$cg")
     done
     n=$((free / $1)); [ "$n" -lt 1 ] && n=1

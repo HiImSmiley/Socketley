@@ -216,7 +216,8 @@ if [ -n "$SDK_BIN" ]; then
         sleep 0.7
         # Asserted, because without a zombie there is nothing to measure and
         # the check below would pass on any build.
-        if [ "$(ps -o stat= -p "$C_PID" 2>/dev/null | tr -d ' ')" = "Z" ]; then ok; else
+        # Z and whatever follows it, as a process started under nice reads ZN.
+        if [[ "$(ps -o stat= -p "$C_PID" 2>/dev/null | tr -d ' ')" == Z* ]]; then ok; else
             bad "the corpse is actually a zombie" \
                 "state: $(ps -o stat= -p "$C_PID" 2>/dev/null | tr -d ' ')" \
                 "without one in Z the assertion below proves nothing"
