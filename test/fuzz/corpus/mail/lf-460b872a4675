@@ -1,0 +1,2 @@
+require ["vacation-seconds"];
+vacation :seconds 2 :mime "";

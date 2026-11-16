@@ -1,0 +1,2 @@
+require ["date", "relational", "fileinto", "variables"];
+if date :value "ge" :originalzone "date" "hour" "09" { feinto "wo1" "*T*" { set "dHEADER.FIE" "${11";

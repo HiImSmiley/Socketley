@@ -1,0 +1,2 @@
+require ["regex", "variables", "editheader", "duplicate", "enotify", "include", "regex", "environment", "spamtest", "index", "fileinto", "mailbox", "relational", "comparator-i;ascii-numeric"];
+include :global "lib"; 
