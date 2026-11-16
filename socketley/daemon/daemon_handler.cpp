@@ -8278,6 +8278,9 @@ void daemon_handler::reconcile_proxy_workers()
             // The placeholder gets a reader's mapping of the same region,
             // attached once, so every reader that asks it for figures loads
             // them at the moment it is called.
+            // The metrics thread sums the mapping under a shared lock, so it is put in place under the exclusive one,
+            // as close() takes it down.
+            std::unique_lock stats_lock(m_manager.mutex);
             if (!inst->shard_stats_table().mapped() && region.mapped())
                 if (!inst->shard_stats_table().attach_reader(shard_fd))
                     LOG_WARN(("could not attach to the shared figures table for "
