@@ -2233,8 +2233,21 @@ void bsock_respond(world& w, int idx, int shape)
     // and only the second one makes an answer blind.
     const bool nothing_owed = (b.owed_n == 0);
 
+    // Whether everything on the wire at this end has had its answer: nothing unread, or nothing unread past the
+    // horizon of a blind answer given already, which answered the requests lying there (see bsock_note_request()).
+    // Bytes past that horizon are a request this answer is blind over, and the horizon below takes it.
+    const bool wire_answered = unread == 0 || b.rx_bytes + unread <= b.blind_horizon;
+
     // An answer that takes the place of a request the proxy has queued for this socket: see bsock_request_coming().
-    const bool ahead = nothing_owed && unread == 0 && bsock_request_coming(w, b);
+    //
+    // Asked over wire_answered and not over unread == 0, because a request answered blind and not yet read is no
+    // less answered.  Measured on corpus/proxy/answer_ahead_behind_blind_answer (R10c-3, round 10c's desktop run):
+    // an encrypted leg; client 0 pipelined A and B; this end answered A blind, 200 with a length, with A's 181 bytes
+    // unread; the proxy took that whole answer, filed the socket, took it back for B through a clean probe and
+    // queued B in the ring; this end then wrote a headers-only answer, still before reading anything.  By position
+    // that answer is B's -- the proxy had nothing else outstanding there -- but with 181 bytes unread it was neither
+    // ahead nor blind past the horizon, so B read two steps later as a request handed a socket mid-response.
+    const bool ahead = nothing_owed && wire_answered && bsock_request_coming(w, b);
 
     uint32_t id = 0;
     if (b.owed_n > 0)
