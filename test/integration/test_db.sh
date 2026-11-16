@@ -340,7 +340,13 @@ PY
 
 tally < <(run main)
 
-st=$("$BIN" stats data 2>&1)
+# The daemon's copy of the worker's figures is a stats frame behind, at most 250 ms, and the whole run above can fit in
+# one: asked at once, it was the frame from before the first write.
+for _ in $(seq 1 40); do
+    st=$("$BIN" stats data 2>&1)
+    [ "$(sed -n 's/^syncs://p' <<<"$st")" -gt 0 ] 2>/dev/null && break
+    sleep 0.25
+done
 case "$st" in *"documents:"*"writes:"*"syncs:"*) ok ;; *) bad "stats name the documents, the writes and the syncs" "$st" ;; esac
 sy=$(echo "$st" | sed -n 's/^syncs://p'); wr=$(echo "$st" | sed -n 's/^writes://p')
 [ -n "$sy" ] && [ "$sy" -gt 0 ] && [ "$sy" -le "$wr" ] && ok || bad "every write is synced, a turn's writes together" "syncs $sy writes $wr"
