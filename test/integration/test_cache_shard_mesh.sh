@@ -170,7 +170,20 @@ m = r.reply()
 mget = sum(1 for i, v in enumerate(m or []) if v == val(i))
 print(setok, gets, mget)
 PY
-read -r BIGSET BIGGET BIGMGET < <(timeout 120 python3 "$SOCKETLEY_TMPD/big.py" "$PORT" 2>/dev/null || echo "0 0 0")
+# What the links hold is read while the burst runs and kept at its most: a link a second past its burst gives it back
+# (below), and a loaded machine reached the read after it more than a second late, measuring the busy trim instead.
+held_now() { "$BIN" stats meshc 2>/dev/null | awk -F: '/^mesh_held:/ {s+=$2} END{print s+0}'; }
+timeout 120 python3 "$SOCKETLEY_TMPD/big.py" "$PORT" > "$SOCKETLEY_TMPD/big.out" 2>/dev/null &
+BIGPID=$!
+HELDPEAK=0
+while kill -0 "$BIGPID" 2>/dev/null; do
+    H=$(held_now); [ "$H" -gt "$HELDPEAK" ] && HELDPEAK=$H
+    sleep 0.1
+done
+wait "$BIGPID" 2>/dev/null
+H=$(held_now); [ "$H" -gt "$HELDPEAK" ] && HELDPEAK=$H
+read -r BIGSET BIGGET BIGMGET < "$SOCKETLEY_TMPD/big.out" || true
+BIGSET=${BIGSET:-0}; BIGGET=${BIGGET:-0}; BIGMGET=${BIGMGET:-0}
 check_big() { [ "$2" = "$3" ] && ok "$1 ($2)" || bad "$1" "$2 of $3"; }
 check_big "two hundred 64 KiB values pipelined in are taken" "$BIGSET" 200
 check_big "six hundred GETs of them pipelined come back whole" "$BIGGET" 600
@@ -187,6 +200,7 @@ DOWN=$(grep -cE 'the link to shard .* is down' "$SOCKETLEY_DLOG" 2>/dev/null || 
 # The read buffer doubled to 256 KiB and the writer kept its largest batch, for the life of the set: twelve links of
 # four shards held what one burst grew for good.  Quiet five seconds, a link keeps its 16 KiB read and little else.
 HELD1=$(printf '%s\n' "$ST" | awk -F: '/^mesh_held:/ {s+=$2} END{print s+0}')
+[ "$HELDPEAK" -gt "$HELD1" ] && HELD1=$HELDPEAK
 
 # ── and a link still busy gives it back once the burst is over ────────────
 #
@@ -195,13 +209,13 @@ HELD1=$(printf '%s\n' "$ST" | awk -F: '/^mesh_held:/ {s+=$2} END{print s+0}')
 # random small keys measured 4-12% more CPU per operation after the burst than on a fresh daemon.  Under that traffic,
 # a second after the burst the links give back all but what small frames use.
 cat > "$SOCKETLEY_TMPD/busy.py" <<'PY'
-import random, socket, sys, time
-port, secs = int(sys.argv[1]), float(sys.argv[2])
+import os, random, socket, sys, time
+port, secs, stop = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
 def cmd(*a):
     return b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in (y.encode() for y in a))
 socks = [socket.create_connection(("127.0.0.1", port), timeout=10) for _ in range(16)]
 end = time.time() + secs
-while time.time() < end:
+while time.time() < end and not os.path.exists(stop):
     for s in socks:
         s.sendall(b"".join(cmd("GET", "small%d" % random.randrange(10000)) for _ in range(16)))
     for s in socks:
@@ -210,23 +224,29 @@ while time.time() < end:
             b += s.recv(1 << 16)
     time.sleep(0.002)
 PY
-timeout 30 python3 "$SOCKETLEY_TMPD/busy.py" "$PORT" 4.5 >/dev/null 2>&1 &
+# The small keys run until the links have been read, not for a fixed time: on a loaded machine the reads outlasted a
+# client that ran 4.5 s, and the check then could not tell the busy trim from the quiet one.
+BUSYSTOP="$SOCKETLEY_TMPD/busy.stop"; rm -f "$BUSYSTOP"
+timeout 60 python3 "$SOCKETLEY_TMPD/busy.py" "$PORT" 50 "$BUSYSTOP" >/dev/null 2>&1 &
 BUSYPID=$!
 D0=$(printf '%s\n' "$ST" | awk -F: '/^mesh_direct:/ {s+=$2} END{print s+0}')
 HELDB=$HELD1
-for _ in $(seq 1 14); do
+BUSYFROM=$SECONDS
+while [ $((SECONDS - BUSYFROM)) -lt 20 ]; do
     sleep 0.25
-    HELDB=$("$BIN" stats meshc 2>/dev/null | awk -F: '/^mesh_held:/ {s+=$2} END{print s+0}')
+    HELDB=$(held_now)
     [ "$HELDB" -lt $((4 << 20)) ] && break
 done
+BUSYSECS=$((SECONDS - BUSYFROM))
 BUSYUP=0; kill -0 "$BUSYPID" 2>/dev/null && BUSYUP=1
+touch "$BUSYSTOP"
 wait "$BUSYPID" 2>/dev/null
 sleep 1.5   # a worker publishes its figures on an interval
 D1=$("$BIN" stats meshc 2>/dev/null | awk -F: '/^mesh_direct:/ {s+=$2} END{print s+0}')
 [ "$BUSYUP" = 1 ] && [ "$D1" -gt "$D0" ] && ok "the small keys kept every link busy past the burst ($((D1 - D0)) crossings)" \
     || bad "the small keys kept the links busy, or this measures the quiet trim" "client up: $BUSYUP, crossings $D0 -> $D1"
 [ "$HELDB" -lt $((4 << 20)) ] && ok "busy, the links give back what the burst grew ($HELDB bytes over 12 links)" \
-    || bad "busy, the links give back what the burst grew" "$HELDB bytes over 12 links 3.5 s into the small keys"
+    || bad "busy, the links give back what the burst grew" "$HELDB bytes over 12 links ${BUSYSECS} s into the small keys"
 
 HELD2=$HELDB
 for _ in $(seq 1 40); do
