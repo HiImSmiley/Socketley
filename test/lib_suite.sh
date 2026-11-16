@@ -114,15 +114,22 @@ suite_ns_ok() {
 suite_ns_run() {   # root file [command] -> the exit of the file, or of the command named by it, run in namespaces of its own with its /tmp under root
     local dir="$1/$(basename "$2" .sh)"
     rm -rf "$dir" "$dir.hosts"; mkdir -p "$dir"
-    # The machine's name is its address beside the loopback, as the host's resolver, out of reach here, would say.
-    { cat /etc/hosts; echo "198.18.0.1 $(hostname)"; } > "$dir.hosts"
+    # The machine's name is its address beside the loopback, as the host's resolver, out of reach here, would say --
+    # and only that: a line of the host's own for it (a container's, a cloud image's) comes first and names an address
+    # this namespace does not have, so its name is taken out of every line that has it.
+    { awk -v h="$(hostname)" '/^[[:space:]]*(#|$)/ { print; next }
+          { o = $1; for (i = 2; i <= NF; i++) if ($i != h) o = o " " $i; if (o != $1) print o }' /etc/hosts
+      echo "198.18.0.1 $(hostname)"; } > "$dir.hosts"
     # The capabilities the namespace gives are kept for bringing the loopback up and mounting /tmp, and given up
     # before the file runs, so it is the user it would be on the host: a file of mode 000 is refused to it.
     unshare --user --map-current-user --keep-caps --net --mount --pid --fork --mount-proc --kill-child -- bash -c '
         ip link set lo up || exit 2
         # An address that is not loopback, which a test of what reaches this machine from elsewhere needs, in the
         # benchmarking range no test names: 192.0.2.x is what tests use for an address the host does not have.
-        ip link add sl0 type dummy 2>/dev/null && ip addr add 198.18.0.1/24 dev sl0 && ip link set sl0 up
+        # Without the dummy module, which a user namespace cannot load, it goes on the loopback device: the name of
+        # the machine resolves to it, and a daemon advertising that name is dialled there by the other daemons.
+        { ip link add sl0 type dummy 2>/dev/null && ip addr add 198.18.0.1/24 dev sl0 && ip link set sl0 up; } \
+            || ip addr add 198.18.0.1/32 dev lo || exit 2
         mount --bind "$1.hosts" /etc/hosts || exit 2
         mount --bind "$1" /tmp || exit 2
         export HOME=/tmp/home SOCKETLEY_SOCKET=/tmp/suite.sock
