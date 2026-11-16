@@ -1005,6 +1005,32 @@ TEST_CASE("sieve: a :matches pattern of many stars is charged its length on ever
     CHECK(took < std::chrono::seconds(1 * build_cpu_factor));
 }
 
+TEST_CASE("sieve: a :contains key longer than the value is no match without the searcher built for it")
+{
+    // 64 KiB put together from a variable, against 100,000 short values: each comparison built the searcher's tables
+    // over the whole key, through a folding hash map, for a value it could not be found in (fuzz_sieve_budget: 32 s
+    // of CPU in one run under the sanitizers).  The steps it is charged still end the run.
+    std::string script = "require \"variables\";\nset \"s\" \"abcdefghijklmnop\";\n";
+    for (int i = 0; i < 12; ++i)
+        script += "set \"s\" \"${s}${s}\";\n";
+    script += "if header :contains \"x\" \"${s}\" { discard; }\n";
+    std::string message;
+    for (int i = 0; i < 100000; ++i)
+        message += "X: abc\n";
+    message += "\nbody\n";
+    const auto start = thread_cpu_now();
+    const outcome o = run(script, message);
+    const auto took = thread_cpu_now() - start;
+    CHECK(summary(o) == "keep");
+    CHECK(took < std::chrono::seconds(1 * build_cpu_factor));
+    // A key that is there, folded, is still found, in a value of its own length and in a longer one.
+    CHECK(summary(run("if header :contains \"Subject\" \"HELLO\" { discard; }", "Subject: hello\n\nbody\n")) ==
+          "discard");
+    CHECK(summary(run("if header :contains \"Subject\" \"LO wO\" { discard; }", "Subject: Hello World\n\nbody\n")) ==
+          "discard");
+    CHECK(summary(run("if header :contains \"Subject\" \"hello!\" { discard; }", "Subject: hello\n\nbody\n")) == "keep");
+}
+
 TEST_CASE("sieve: a regex compiled again and again is charged each time")
 {
     // 65 expressions of 4 KiB, one more than the cache holds, against a value each: every one was compiled again for

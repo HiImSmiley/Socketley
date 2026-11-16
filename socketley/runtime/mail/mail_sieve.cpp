@@ -2188,6 +2188,12 @@ bool contains(std::string_view hay, std::string_view needle, cmp c)
 {
     if (needle.empty())
         return true;
+    // Folding keeps every byte where it was, so a needle longer than the text is in no fold of it either -- and the
+    // searcher's tables are made for each comparison, as long as the needle: a variable doubled into itself and held
+    // against every header built them over and over for comparisons that could not match (fuzz_sieve_budget: 32 s of
+    // CPU in one run under the sanitizers, its steps within the budget).
+    if (needle.size() > hay.size())
+        return false;
     if (c == cmp::octet)
         return hay.find(needle) != std::string_view::npos;
     // Boyer-Moore with its good-suffix rule, which finds the first match in time linear in both.
