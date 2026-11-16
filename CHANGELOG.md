@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-16
+
+A release of hardening, fixes and speed. It replaces 0.2.0 in place
+(`sudo socketley update`); four refusals are new, and a setup that relied on
+what they refuse needs a change:
+
+- metrics' `remote_write` needs a key or an admin's token;
+- only an admin may name a storage replication target;
+- an MCP tool's arguments are held to its input schema before its handler runs;
+- `--origins` takes origins as a browser writes them, and never `null`.
+
+### Security
+
+- **What a client sends costs what it touches.** Sieve (`:contains`, `:regex`,
+  `:matches`, duplicate IDs), IMAP SEARCH and FETCH, JMAP requests, DAV
+  REPORTs, MQTT subscriptions and retained messages, cache commands (LREM,
+  SDIFF, SCAN, leaving channels, DEL and shrinking of large values), metrics
+  queries, S3 Select, ZIP uploads, forms, tags and lifecycle rules, HTTP/2
+  header blocks and HTTP/3 heads are bounded, or run in time linear in their
+  input, where one request could hold a worker for seconds before.
+- **Sessions end with their sign-in.** MQTT and tunnel connections let in by a
+  token, mail and db sessions, JMAP connections, and idp sessions of a
+  disabled account end once their credentials no longer hold. A refresh token
+  or authorization code used twice revokes what the first use gave, and a code
+  verifier for a code asked without a challenge is refused.
+- **Strings a client chooses are hashed with a keyed hash** (NH under a
+  per-process key) in every table, not with a fixed seed.
+- **Sign-in is defended everywhere.** mcp, metrics, db and mqtt bar an address
+  that keeps giving wrong keys or passwords, as the other runtimes did.
+- **Proxy.** A 101 opens a byte relay only after an upgrade the request
+  offered; a request with a body offers no upgrade; a request line and its
+  fields are checked before they are forwarded; an idp's cookie goes only to
+  this daemon's runtimes; a script that closes its client ends the request.
+- **Mail.** Aliases, filters and vacations do not send on a stranger's message
+  that only names this domain (DMARC, SPF or DKIM must vouch for it); an
+  `smtp://` relay gets nothing in the clear when its STARTTLS is struck out;
+  POP3 forgets what was given before STLS; webmail cleans HTML by allowlist.
+- **Files.** A FIFO or a planted link under a served or backed-up folder no
+  longer stalls a runtime or redirects a write; storage indexes and bucket
+  configuration are the runtime's own (0600/0700).
+- **Dependencies.** ngtcp2 1.26.0 and nghttp3 1.19.0; OpenSSL 3.5.9 built
+  without CMS and the SIV modes.
+- `socketley update` takes a package name that is only a file name, and
+  follows no redirect off https.
+
+### Fixed
+
+- HTTP/2 and HTTP/3: flow-control windows, GOAWAY, critical streams, stream
+  lifetimes inside ngtcp2's callbacks, and backpressure on uploads through the
+  proxy.
+- Proxy: an answer is no longer cut short by the bytes behind its request or by
+  a closing client's drain; TCP mode's `--backend-timeout` bounds the connect.
+- Cache: LSET and COPY are admitted for what they really hold under
+  `--maxmemory`; a restarted shard gets new links to its siblings.
+- Mail: IMAP dates and OLDER/YOUNGER intervals, DKIM/ARC `h=` on a message
+  without the signed headers, Message-IDs from JMAP clients.
+- CLI: a password prompt turns echo off before it asks; a reply and a log line
+  each reach their stream in one write.
+
+### Performance
+
+- The proxy splices an HTTP 101 tunnel as it does TCP, sends an answer's first
+  read and its body in one send, and ends a closing client by its own FIN.
+- Cache GETs of 64 KiB or more are sent from the store; ZCOUNT, ZRANGEBYSCORE
+  pages and ZREMRANGEBYRANK cost log n.
+- A shell's `socketley send` goes straight to the worker after its first line.
+- TLS: a server connection's first records are a segment long, and client
+  ciphertext is not copied into a memory BIO.
+- `--congestion` on every runtime that sends on TCP.
+
 ## [0.2.0] - 2026-11-11
 
 The version numbers start over here: this is a far larger step than the 1.x

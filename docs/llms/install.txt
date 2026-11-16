@@ -22,8 +22,8 @@ A release has two packages, for Debian, Ubuntu and any other distribution with g
 
 | Package | Holds |
 |---|---|
-| `socketley_0.2.0_amd64.deb` | The binary, the manual, the interactive help and the systemd service. This is what `install.sh` installs. |
-| `socketley-dev_0.2.0_amd64.deb` | The [SDK](sdk.txt): `libsocketley.so`, `socketley/capi.h` and a pkg-config file. Only for programs that run runtimes themselves. |
+| `socketley_0.2.1_amd64.deb` | The binary, the manual, the interactive help and the systemd service. This is what `install.sh` installs. |
+| `socketley-dev_0.2.1_amd64.deb` | The [SDK](sdk.txt): `libsocketley.so`, `socketley/capi.h` and a pkg-config file. Only for programs that run runtimes themselves. |
 
 ## Updating
 
@@ -34,7 +34,7 @@ sudo socketley update         # installs the newest release and restarts the ser
 
 The package is checked against the SHA-256 GitHub keeps of it, installed with apt, and the service restarted, which brings back every runtime that was running. `--list` lists the releases, `--to VERSION` installs one, older or newer, and `--deb FILE` installs a package already on the machine.
 
-> The numbering started over at 0.2.0. Coming from a 1.x release, `socketley update` takes 1.x for the newer one: install 0.2.0 with `install.sh` or `sudo socketley update --to 0.2.0`.
+> The numbering started over at 0.2.0. Coming from a 1.x release, `socketley update` takes 1.x for the newer one: install 0.2.1 with `install.sh` or `sudo socketley update --to 0.2.1`.
 
 A socketley built from a clone is updated by the clone's `bash scripts/update.sh`: it pulls, builds, swaps the binary and restarts, and puts the old binary back if the new one does not come up.
 
@@ -88,8 +88,8 @@ Without installing, `./bin/Release/socketley daemon &` starts a development daem
 ## Debian packages of your own
 
 ```
-bash packaging/build-deb.sh 0.2.0
-sudo dpkg -i socketley_0.2.0_amd64.deb
+bash packaging/build-deb.sh 0.2.1
+sudo dpkg -i socketley_0.2.1_amd64.deb
 ```
 
 Run it in a tree prepared as above (`premake5 gmake2`): it builds Release from clean, for this machine's architecture, and writes `socketley-dev` beside it. A package built on a newer distribution can need a newer glibc than an older one has, so build on the oldest one you install to.

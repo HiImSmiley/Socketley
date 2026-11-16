@@ -12,15 +12,15 @@
 <p>A release has two packages, for Debian, Ubuntu and any other distribution with glibc 2.35 or newer: everything but the C library is linked in, so one build serves them all.</p>
 <table class="kv">
 <tr><th>Package</th><th>Holds</th></tr>
-<tr><td><code>socketley_0.2.0_amd64.deb</code></td><td>The binary, the manual, the interactive help and the systemd service. This is what <code>install.sh</code> installs.</td></tr>
-<tr><td><code>socketley-dev_0.2.0_amd64.deb</code></td><td>The <a href="#/sdk">SDK</a>: <code>libsocketley.so</code>, <code>socketley/capi.h</code> and a pkg-config file. Only for programs that run runtimes themselves.</td></tr>
+<tr><td><code>socketley_0.2.1_amd64.deb</code></td><td>The binary, the manual, the interactive help and the systemd service. This is what <code>install.sh</code> installs.</td></tr>
+<tr><td><code>socketley-dev_0.2.1_amd64.deb</code></td><td>The <a href="#/sdk">SDK</a>: <code>libsocketley.so</code>, <code>socketley/capi.h</code> and a pkg-config file. Only for programs that run runtimes themselves.</td></tr>
 </table>
 
 <h2>Updating</h2>
 <pre class="code">socketley update --check      <i># what is installed, and the newest release</i>
 sudo socketley update         <i># installs the newest release and restarts the service</i></pre>
 <p>The package is checked against the SHA-256 GitHub keeps of it, installed with apt, and the service restarted, which brings back every runtime that was running. <code>--list</code> lists the releases, <code>--to VERSION</code> installs one, older or newer, and <code>--deb FILE</code> installs a package already on the machine.</p>
-<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>The numbering started over at 0.2.0. Coming from a 1.x release, <code>socketley update</code> takes 1.x for the newer one: install 0.2.0 with <code>install.sh</code> or <code>sudo socketley update --to 0.2.0</code>.</div></div>
+<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>The numbering started over at 0.2.0. Coming from a 1.x release, <code>socketley update</code> takes 1.x for the newer one: install 0.2.1 with <code>install.sh</code> or <code>sudo socketley update --to 0.2.1</code>.</div></div>
 <p>A socketley built from a clone is updated by the clone's <code>bash scripts/update.sh</code>: it pulls, builds, swaps the binary and restarts, and puts the old binary back if the new one does not come up.</p>
 
 <h2>From source, in one step</h2>
@@ -52,8 +52,8 @@ make -C make config=release_x64 -j$(nproc)</pre></li>
 <p>Without installing, <code>./bin/Release/socketley daemon &amp;</code> starts a development daemon on <code>/tmp/socketley.sock</code> with state under your home directory; see <a href="#/env">environment &amp; files</a>.</p>
 
 <h2>Debian packages of your own</h2>
-<pre class="code">bash packaging/build-deb.sh 0.2.0
-sudo dpkg -i socketley_0.2.0_amd64.deb</pre>
+<pre class="code">bash packaging/build-deb.sh 0.2.1
+sudo dpkg -i socketley_0.2.1_amd64.deb</pre>
 <p>Run it in a tree prepared as above (<code>premake5 gmake2</code>): it builds Release from clean, for this machine's architecture, and writes <code>socketley-dev</code> beside it. A package built on a newer distribution can need a newer glibc than an older one has, so build on the oldest one you install to.</p>
 
 <h2>Join the socketley group</h2>

@@ -3303,8 +3303,8 @@ installation_help() {
     echo ""
 
     echo -e "${BOLD}Build Debian Package:${NC}"
-    echo -e "  ${CYAN}bash packaging/build-deb.sh 0.2.0${NC}"
-    echo -e "  ${CYAN}sudo dpkg -i socketley_0.2.0_amd64.deb${NC}"
+    echo -e "  ${CYAN}bash packaging/build-deb.sh 0.2.1${NC}"
+    echo -e "  ${CYAN}sudo dpkg -i socketley_0.2.1_amd64.deb${NC}"
     echo ""
 
     echo -e "${BOLD}Daemon Configuration (config.lua):${NC}"

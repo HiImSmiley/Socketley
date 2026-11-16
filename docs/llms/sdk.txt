@@ -16,7 +16,7 @@ Every runtime type also runs inside a program of your own, from C, Rust, Node or
 Each release has two packages for amd64: `socketley` is the daemon, `socketley-dev` the SDK. The SDK package holds `libsocketley.so`, the header `socketley/capi.h` and a pkg-config file. It needs no daemon on the machine.
 
 ```
-sudo apt install ./socketley-dev_0.2.0_amd64.deb      # from the release's assets
+sudo apt install ./socketley-dev_0.2.1_amd64.deb      # from the release's assets
 cc app.c $(pkg-config --cflags --libs socketley)
 ```
 

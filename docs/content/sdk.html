@@ -10,7 +10,7 @@
 
 <h2>The library</h2>
 <p>Each release has two packages for amd64: <code>socketley</code> is the daemon, <code>socketley-dev</code> the SDK. The SDK package holds <code>libsocketley.so</code>, the header <code>socketley/capi.h</code> and a pkg-config file. It needs no daemon on the machine.</p>
-<pre class="code">sudo apt install ./socketley-dev_0.2.0_amd64.deb      <i># from the release's assets</i>
+<pre class="code">sudo apt install ./socketley-dev_0.2.1_amd64.deb      <i># from the release's assets</i>
 cc app.c $(pkg-config --cflags --libs socketley)</pre>
 <p>From a checkout, build the <code>socketley_shared</code> target in <code>make/</code>; then <code>sdk/socketley-config --shared --cflags --libs</code> gives the flags.</p>
 
