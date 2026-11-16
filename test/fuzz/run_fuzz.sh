@@ -347,7 +347,8 @@ for target in "${TARGETS[@]}"; do
         continue
     fi
 
-    if [ -x "$LIBFUZZ_DIR/$target" ]; then
+    # libFuzzer reads -max_total_time=0 as no limit, so a replay-only run (0 seconds) skips it.
+    if [ -x "$LIBFUZZ_DIR/$target" ] && [ "$SECS" != "0" ]; then
         echo "--- $target (libFuzzer) ---"
         # -print_funcs=0 turns off the "NEW_FUNC: 0x... in <name>" lines.
         # They are cosmetic, and each one costs a round trip to llvm-symbolizer
