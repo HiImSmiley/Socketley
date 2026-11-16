@@ -23,7 +23,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: a share link's download is counted off the loop ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
+build_sanitized && sanitized=1
 daemon_isolate sharecount
 T=$SOCKETLEY_TMPD
 P=$((SL_PORT_BASE + 1963)); U="http://127.0.0.1:$P"
@@ -59,7 +59,7 @@ echo "  eight downloads at once of a link that allows five: $got"
     || bad "the link allows exactly five" "$got"
 [ "$(curl -s "$U/~share/$five?download" -o /dev/null -w '%{http_code}')" = 410 ] && ok || bad "and none after" "more"
 
-out=$(timeout 60 python3 - "$P" "$many" "$free" <<'PY'
+out=$(timeout 90 python3 - "$P" "$many" "$free" <<'PY'
 import socket, sys, threading, time
 port, many, free = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 def get(s, path):
@@ -69,27 +69,35 @@ def get(s, path):
     h, rest = buf.split(b"\r\n\r\n", 1)
     n = int([l.split(b":")[1] for l in h.split(b"\r\n") if l.lower().startswith(b"content-length")][0])
     while len(rest) < n: rest += s.recv(65536)
-stop, counted = [False], [0]
-def hammer():
+def beside(hammered):
+    """The median and worst of another request while one connection downloads `hammered` as fast as it can."""
+    stop, done = [False], [0]
+    def hammer():
+        s = socket.create_connection(("127.0.0.1", port), timeout=30)
+        while not stop[0]:
+            get(s, "/~share/%s?download" % hammered); done[0] += 1
+    th = threading.Thread(target=hammer); th.start()
     s = socket.create_connection(("127.0.0.1", port), timeout=30)
-    while not stop[0]:
-        get(s, "/~share/%s?download" % many); counted[0] += 1
-th = threading.Thread(target=hammer); th.start()
-s = socket.create_connection(("127.0.0.1", port), timeout=30)
-lat, end = [], time.time() + 6
-while time.time() < end:
-    t = time.perf_counter(); get(s, "/~share/%s?download" % free); lat.append((time.perf_counter() - t) * 1000)
-    time.sleep(0.002)
-stop[0] = True; th.join()
-lat.sort()
-print("%.2f %.2f %d" % (lat[len(lat) // 2], lat[-1], counted[0] // 6))
+    lat, end = [], time.time() + 6
+    while time.time() < end:
+        t = time.perf_counter(); get(s, "/~share/%s?download" % free); lat.append((time.perf_counter() - t) * 1000)
+        time.sleep(0.002)
+    stop[0] = True; th.join()
+    lat.sort()
+    return lat[len(lat) // 2], lat[-1], done[0] // 6
+# The same load of a link that counts nothing first, so what the build and the machine cost a request is the baseline.
+b50, bworst, brate = beside(free)
+p50, worst, rate = beside(many)
+print("%.2f %.2f %d %.2f %.2f %d" % (p50, worst, rate, b50, bworst, brate))
 PY
 )
-read -r p50 worst rate <<<"$out"
+read -r p50 worst rate b50 bworst brate <<<"$out"
 echo "  beside ${rate:-?} counted downloads a second: another request ${p50:-?} ms at the median, ${worst:-?} ms at worst"
+echo "  beside ${brate:-?} uncounted ones a second: ${b50:-?} ms at the median, ${bworst:-?} ms at worst"
+# The syncs under the lock added 7 ms to the median beside a hundred counts a second; what is left is the baseline's.
 if [ "$on_disk" = 0 ]; then echo "  SKIP [wait]: /var/tmp is a tmpfs, where a sync costs nothing"
 elif [ "$sanitized" = 1 ]; then echo "  SKIP [wait]: milliseconds measure the sanitizer, not the disk"
-elif awk -v m="${p50:-99}" 'BEGIN{exit !(m < 2)}'; then ok
+elif awk -v m="${p50:-99}" -v b="${b50:-0}" 'BEGIN{exit !(m < b + 2)}'; then ok
 else bad "another request does not wait for a count's syncs" "$out"; fi
 
 echo

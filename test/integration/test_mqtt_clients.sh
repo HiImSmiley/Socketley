@@ -72,22 +72,28 @@ if command -v mosquitto_sub >/dev/null 2>&1 && command -v mosquitto_pub >/dev/nu
     out=$(mosquitto_pub -h 127.0.0.1 -p "$P" -u dev -P wrong -t x -m y 2>&1); rc=$?
     case "$out" in *"ad user name or password"*) [ "$rc" -ne 0 ] && pass || fail "a wrong password exits non-zero" "rc $rc" ;;
         *) fail "a wrong password is refused, as mosquitto_pub reports it" "rc $rc: $out" ;; esac
+    # A client below is waited for until the broker has acknowledged its subscription, not for a time: its sign-in's
+    # hash costs some sixty times a Release one's under a sanitizer, and a holder killed before it was in had no will.
+    # Line-buffered, as its output goes to a file read while it runs.
+    subscribed() { for _ in $(seq 1 600); do grep -q 'received SUBACK' "$1" 2>/dev/null && return 0; sleep 0.05; done; return 1; }
     # A will: a subscriber that stays, and a client killed while holding one.
-    mosquitto_sub "${A[@]}" -t m/will -C 1 -W 10 > "$T/will" 2>&1 &
+    stdbuf -oL mosquitto_sub "${A[@]}" -d -t m/will -C 1 -W 60 > "$T/will" 2>&1 &
     sp=$!
-    sleep 0.4
-    mosquitto_sub "${A[@]}" -i will-holder -t nothing --will-topic m/will --will-payload "holder died" --will-qos 1 >/dev/null 2>&1 &
+    subscribed "$T/will"
+    stdbuf -oL mosquitto_sub "${A[@]}" -d -i will-holder -t nothing --will-topic m/will --will-payload "holder died" --will-qos 1 \
+        > "$T/holder" 2>&1 &
     hp=$!
-    sleep 0.6
+    subscribed "$T/holder"
     kill -9 "$hp" 2>/dev/null
     wait "$hp" 2>/dev/null
     wait "$sp"
-    expect "a client killed with a will set gets its will sent" "$(cat "$T/will")" "holder died"
+    expect "a client killed with a will set gets its will sent" "$(grep -vE '^(Client |Subscribed )' "$T/will")" "holder died"
     # A persistent session: -c with an id, the messages published while it was away delivered when it is back.
-    mosquitto_sub "${A[@]}" -i away -c -t m/away -q 1 -C 1 -W 3 >/dev/null 2>&1 &
-    sleep 0.5; kill "$!" 2>/dev/null; wait "$!" 2>/dev/null
+    stdbuf -oL mosquitto_sub "${A[@]}" -d -i away -c -t m/away -q 1 -C 1 -W 60 > "$T/away" 2>&1 &
+    ap=$!
+    subscribed "$T/away"; kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null
     for i in 1 2 3; do mosquitto_pub "${A[@]}" -t m/away -m "while away $i" -q 1; done
-    got=$(mosquitto_sub "${A[@]}" -i away -c -t m/away -q 1 -C 3 -W 5 2>&1 | tr '\n' '|')
+    got=$(mosquitto_sub "${A[@]}" -i away -c -t m/away -q 1 -C 3 -W 60 2>&1 | tr '\n' '|')
     expect "mosquitto_sub -c gets what was published while it was away" "$got" "while away 1|while away 2|while away 3|"
     got=$(mosquitto_sub "${A[@]}" -t '$SYS/broker/version' -C 1 -W 5 2>&1)
     case "$got" in "socketley "*) pass ;; *) fail "\$SYS/broker/version says the broker" "$got" ;; esac

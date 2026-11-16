@@ -21,6 +21,19 @@ ready_tcp() {
     return 1
 }
 
+# A listener on the port, seen in the socket table and never dialled: for a runtime whose script counts or answers
+# connections, where ready_tcp's probe is one more connection than the test made, and its on_connect may be logged
+# after the test has taken its count.
+ready_listening() {
+    local port=$1 timeout=${2:-8}
+    local deadline=$(( $(date +%s) + timeout ))
+    while [ "$(date +%s)" -le "$deadline" ]; do
+        [ -n "$(ss -Hltn "sport = :$port" 2>/dev/null)" ] && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
 # A complete HTTP response with a 2xx or 3xx status, which through a proxy
 # additionally proves at least one backend is in rotation and answering.
 ready_http() {

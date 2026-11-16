@@ -32,10 +32,10 @@ daemon_start "$BIN"
 ready_tcp 127.0.0.1 "$P" || bad "it listens" "$(tail -5 "$SOCKETLEY_DLOG")"
 
 run() {
-    PYTHONPATH="$HERE" python3 - "$P" "$BIN" 2>&1 <<'PY'
+    PYTHONPATH="$HERE" python3 - "$P" "$BIN" "$(build_cost)" 2>&1 <<'PY'
 
 import os, re, signal, socket, subprocess, sys, threading, time
-port, binary = int(sys.argv[1]), sys.argv[2]
+port, binary, cost = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 SIZE = 7 << 20
 
 def check(name, got, want):
@@ -166,15 +166,23 @@ try:
         chunk = cmd("APPEND", "big%d" % keys[0], b"Z" * (448 << 10))
         for c in more:
             c.sendall(chunk)
-        time.sleep(1)
-        for c in more:
             c.setblocking(False)
-            try:
-                d = c.recv(1 << 16)
-            except BlockingIOError:
-                d = None
-            if d:
-                answers.append(d)
+        # A second in Release, the same work's cost in a slower build; a refusal ends the wait, and with none the
+        # clients are still waiting on the stopped shard at its end.
+        end = time.monotonic() + cost
+        waiting = list(more)
+        while waiting and time.monotonic() < end:
+            time.sleep(0.05)
+            for c in list(waiting):
+                try:
+                    d = c.recv(1 << 16)
+                except BlockingIOError:
+                    continue
+                waiting.remove(c)
+                if d:
+                    answers.append(d)
+            if any(a.startswith(b"-") for a in answers):
+                break
     finally:
         os.kill(pids[held], signal.SIGCONT)
     refused = [a for a in answers if a.startswith(b"-")]

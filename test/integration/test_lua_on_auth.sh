@@ -169,8 +169,10 @@ create_ok "gated proxy created"     "$BIN" create proxy pa_gate \
 create_ok "ungated proxy created"   "$BIN" create proxy pa_open \
     -p "$PRX_OPEN_PORT" --backend "127.0.0.1:$BE_PORT" --lua "$POPEN_LUA" -s
 
+# Not ready_tcp: its probe is a connection on_auth admits and on_connect announces, whose line can land after a
+# case below has counted, which then reads one connection too many.
 for p in "$SRV_PORT" "$SRV_OPEN_PORT" "$PRX_PORT" "$PRX_OPEN_PORT"; do
-    ready_tcp 127.0.0.1 "$p" 10 || echo "  NOTE: nothing accepted on $p"
+    ready_listening "$p" 10 || echo "  NOTE: nothing listening on $p"
 done
 
 # stat NAME KEY — one figure out of `stats`, or the empty string.
