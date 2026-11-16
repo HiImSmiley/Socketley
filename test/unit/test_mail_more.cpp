@@ -756,7 +756,7 @@ TEST_CASE("mime: what a sender writes costs time linear in the message to parse,
     for (int i = 0; i < 50000; ++i)
         many += "; a" + std::to_string(i) + "*=";
     many += "\r\n\r\n";
-    CHECK(cpu([&] { (void)mime::parse(many); }) < 1.0);
+    CHECK(cpu([&] { (void)mime::parse(many); }) < 1.0 * build_cpu_factor);
     // RFC 2231 still joins a continued value, in place of a plain one of the same name.
     const mime::part joined = mime::parse("Content-Type: text/plain; name=plain; name*1=\"b\"; name*0=\"a\"; x=1\r\n\r\nhi");
     CHECK(mime::param(joined.params, "name") == "ab");
@@ -765,16 +765,16 @@ TEST_CASE("mime: what a sender writes costs time linear in the message to parse,
     // A boundary longer than RFC 2046's 70 made the search for it cost the body times itself.
     const std::string longb = "Content-Type: multipart/mixed; boundary=\"" + std::string(300000, '-') + "x\"\r\n\r\n" +
                               std::string(1000000, '-');
-    CHECK(cpu([&] { (void)mime::parse(longb); }) < 1.0);
+    CHECK(cpu([&] { (void)mime::parse(longb); }) < 1.0 * build_cpu_factor);
     CHECK(mime::parse(longb).children.empty());
     const std::string seventy = "Content-Type: multipart/mixed; boundary=\"" + std::string(69, '-') + "x\"\r\n\r\n" +
                                 std::string(2000000, '-') + "\r\n---" + std::string(68, '-') + "x\r\nhi\r\n";
-    CHECK(cpu([&] { (void)mime::parse(seventy); }) < 1.0);
+    CHECK(cpu([&] { (void)mime::parse(seventy); }) < 1.0 * build_cpu_factor);
 
     // A run of '<' with no '>' after it was searched to the end for each.
     const std::string lts = "Content-Type: text/html\r\n\r\n" + std::string(262144, '<');
     const mime::part lr = mime::parse(lts);
-    CHECK(cpu([&] { (void)mime::preview(lts, *mime::preview_part(lr)); }) < 1.0);
+    CHECK(cpu([&] { (void)mime::preview(lts, *mime::preview_part(lr)); }) < 1.0 * build_cpu_factor);
     const std::string quoted = "Content-Type: text/html\r\n\r\n<p>mine</p><div class=\"gmail_quote\">theirs</div>";
     CHECK(mime::preview(quoted, *mime::preview_part(mime::parse(quoted))) == "mine");
 
@@ -783,7 +783,7 @@ TEST_CASE("mime: what a sender writes costs time linear in the message to parse,
     for (int i = 0; i < 70000; ++i)
         styles += "<style></style>";
     styles += "<p>word</p>\r\n";
-    CHECK(cpu([&] { (void)spam_tokens(styles); }) < 1.0);
+    CHECK(cpu([&] { (void)spam_tokens(styles); }) < 1.0 * build_cpu_factor);
     CHECK(spam_tokens("Subject: x\r\nContent-Type: text/html\r\n\r\n<STYLE>.a{}</Style><p>word</p>\r\n") ==
           spam_tokens("Subject: x\r\nContent-Type: text/plain\r\n\r\nword\r\n"));
 }
