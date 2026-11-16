@@ -4,8 +4,6 @@
 #include <array>
 #include <deque>
 #include <functional>
-#include <ranges>
-#include <tuple>
 #include <unordered_map>
 
 #include "mail_compose.h"
@@ -3574,9 +3572,19 @@ struct runner
         }
         if (!ok() || !any)
             return;
-        auto rows = std::views::zip(headers, decoded, have_decoded);
-        const auto tail = std::ranges::remove_if(rows, [](const auto& r) { return std::get<2>(r) == gone; });
-        const auto left = static_cast<size_t>(tail.begin() - rows.begin());
+        size_t left = 0;
+        for (size_t r = 0; r < headers.size(); ++r)
+        {
+            if (have_decoded[r] == gone)
+                continue;
+            if (left != r)
+            {
+                headers[left] = std::move(headers[r]);
+                decoded[left] = std::move(decoded[r]);
+                have_decoded[left] = have_decoded[r];
+            }
+            ++left;
+        }
         headers.resize(left);
         decoded.resize(left);
         have_decoded.resize(left);
