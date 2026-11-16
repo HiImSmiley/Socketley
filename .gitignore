@@ -106,6 +106,9 @@ test/benchmark/bench_client
 !examples/**/README.md
 !man/README.md
 
+# plans for runtimes not yet built, local like the rest of the notes, whatever their extension.
+plans/
+
 # IDE and editor
 .vscode/
 .idea/
