@@ -978,9 +978,10 @@ bool cli_read_secret(const char* prompt, std::string& out)
         return false;
     termios quiet = before;
     quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
-    std::cerr << prompt << std::flush;
+    // Quiet before the prompt, since what is typed after the prompt and before the switch was shown, then flushed.
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet) != 0)
         return false;
+    std::cerr << prompt << std::flush;
     const bool got = static_cast<bool>(std::getline(std::cin, out));
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &before) != 0) {}
     std::cerr << "\n";
