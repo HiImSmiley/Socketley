@@ -20,7 +20,6 @@
 <pre class="code">socketley update --check      <i># what is installed, and the newest release</i>
 sudo socketley update         <i># installs the newest release and restarts the service</i></pre>
 <p>The package is checked against the SHA-256 GitHub keeps of it, installed with apt, and the service restarted, which brings back every runtime that was running. <code>--list</code> lists the releases, <code>--to VERSION</code> installs one, older or newer, and <code>--deb FILE</code> installs a package already on the machine.</p>
-<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>The numbering started over at 0.2.0. Coming from a 1.x release, <code>socketley update</code> takes 1.x for the newer one: install 0.2.1 with <code>install.sh</code> or <code>sudo socketley update --to 0.2.1</code>.</div></div>
 <p>A socketley built from a clone is updated by the clone's <code>bash scripts/update.sh</code>: it pulls, builds, swaps the binary and restarts, and puts the old binary back if the new one does not come up.</p>
 
 <h2>From source, in one step</h2>

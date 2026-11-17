@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-11-16
+## [0.2.1] - 2026-11-17
 
 A release of hardening, fixes and speed. It replaces 0.2.0 in place
 (`sudo socketley update`); four refusals are new, and a setup that relied on
@@ -65,6 +65,14 @@ what they refuse needs a change:
   without the signed headers, Message-IDs from JMAP clients.
 - CLI: a password prompt turns echo off before it asks; a reply and a log line
   each reach their stream in one write.
+- Event loop: a runtime waiting for room to write to a peer that has sent its
+  FIN no longer turns its loop until the peer reads (io_uring wakes such a
+  wait at once); a proxy relaying to a backend that half-closed and stopped
+  reading spent a whole core on it.
+- Daemon: a runtime's shared figures are attached under the lock a metrics
+  scrape reads them with, so a scrape never sees them half attached.
+- Proxy: a splice into a client that fails closes the client at once, as a
+  failed write does.
 
 ### Performance
 
@@ -2325,7 +2333,7 @@ numbers said, and 1.0 is kept for when the interfaces are settled.
 
 ## [1.1.0] - 2026-08-27
 
-Six months of work since v1.0.9, across 581 commits. The headline is that a
+Six months of work, across 581 commits. The headline is that a
 runtime is no longer confined to the daemon's process or to one core.
 
 ### Added
@@ -2445,8 +2453,6 @@ runtime is no longer confined to the daemon's process or to one core.
   `--daemon-process`. Neither old spelling is kept as a synonym.
 
 ---
-
-## [1.0.9] - 2026-03-02
 
 Earlier releases are recorded in the
 [GitHub releases](https://github.com/HiImSmiley/Socketley/releases).
