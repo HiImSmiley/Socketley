@@ -805,7 +805,9 @@ void check_imap_output(std::string_view r)
 
 void imap_case(std::string_view in, bool signed_in)
 {
-    world w;
+    // On the heap: ASan's fake stack, on by default in newer runtimes, aligns a local to 32 bytes, not 64.
+    const auto owned = std::make_unique<world>();
+    world& w = *owned;
     imap_hooks h;
     imap_config cfg;
     cfg.hostname = "mx.example.test";
@@ -924,7 +926,9 @@ void check_jmap_output(std::string_view r, bool streamed, bool api_only)
 
 void jmap_case(std::string_view in, bool api_body)
 {
-    world w;
+    // On the heap: ASan's fake stack, on by default in newer runtimes, aligns a local to 32 bytes, not 64.
+    const auto owned = std::make_unique<world>();
+    world& w = *owned;
     jmap_hooks h;
     jmap_config cfg;
     cfg.hostname = "mx.example.test";
